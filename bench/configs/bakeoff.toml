@@ -1,0 +1,88 @@
+# Step 3: engine bake-off. All configs use the step-2 winners where applicable
+# (no prompt, Silero VAD, forced English for multilingual models).
+#   src-tauri/target/release/wordfall bench --config bench/configs/bakeoff.toml --runs 3
+# model_path supports a leading "~". Quantized distil files are made with whisper.cpp's quantize tool.
+[defaults]
+prompt = "none"
+language = "en"
+
+[[config]]
+name = "distil-f16 (prod)"
+model = "distil-large-v3.5"
+prompt = "dictionary"
+
+[[config]]
+name = "distil-f16+vad"
+model = "distil-large-v3.5"
+vad = "silero"
+
+[[config]]
+name = "distil-q8+vad"
+model = "distil-large-v3.5"
+model_path = "~/Library/Application Support/com.wordfall.app/bench-models/ggml-distil-large-v3.5-q8_0.bin"
+vad = "silero"
+
+[[config]]
+name = "distil-q5+vad"
+model = "distil-large-v3.5"
+model_path = "~/Library/Application Support/com.wordfall.app/bench-models/ggml-distil-large-v3.5-q5_0.bin"
+vad = "silero"
+
+[[config]]
+name = "turbo-f16+vad"
+model = "large-v3-turbo"
+vad = "silero"
+
+[[config]]
+name = "turbo-q8+vad"
+model = "large-v3-turbo-q8_0"
+vad = "silero"
+
+[[config]]
+name = "turbo-q5+vad"
+model = "large-v3-turbo-q5_0"
+vad = "silero"
+
+[[config]]
+name = "turbo-q5+vad+dynctx"
+model = "large-v3-turbo-q5_0"
+vad = "silero"
+audio_ctx = "dynamic"
+audio_ctx_margin_ms = 1000
+
+[[config]]
+name = "medium.en+vad"
+model = "medium.en"
+vad = "silero"
+
+[[config]]
+name = "base.en+vad"
+model = "base.en"
+vad = "silero"
+
+[[config]]
+name = "apple-analyzer"
+engine = "external"
+command = ["bench/engines/apple-speech/run", "--api", "analyzer"]
+
+[[config]]
+name = "apple-dictation+hints"
+engine = "external"
+prompt = "projects"
+command = ["bench/engines/apple-speech/run", "--api", "dictation"]
+
+[[config]]
+name = "parakeet-v3-ggml-q8"
+engine = "external"
+command = ["bench/engines/parakeet/run", "--backend", "ggml", "--model", "parakeet-tdt-0.6b-v3", "--quant", "q8_0"]
+
+[[config]]
+name = "parakeet-v2-ggml-q8"
+engine = "external"
+command = ["bench/engines/parakeet/run", "--backend", "ggml", "--model", "parakeet-tdt-0.6b-v2", "--quant", "q8_0"]
+
+[[config]]
+name = "parakeet-v2-onnx-beam+hints"
+engine = "external"
+prompt = "projects"
+command = ["bench/engines/parakeet/run", "--backend", "onnx", "--model", "parakeet-tdt-0.6b-v2", "--decoding", "beam", "--vad", "energy"]

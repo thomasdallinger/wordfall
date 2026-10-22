@@ -1,0 +1,54 @@
+# Step 2: cheap wins, one knob at a time against the current production config.
+#   src-tauri/target/release/wordfall bench --config bench/configs/sweep.toml --runs 3
+[defaults]
+model = "distil-large-v3.5"
+prompt = "dictionary"
+
+[[config]]
+name = "baseline"
+
+[[config]]
+name = "threads-4"
+threads = 4
+
+[[config]]
+name = "no-timestamps"
+no_timestamps = true
+
+[[config]]
+name = "no-fallback"
+temperature_fallback = false
+
+[[config]]
+name = "dyn-ctx"
+audio_ctx = "dynamic"
+audio_ctx_margin_ms = 1000
+
+[[config]]
+name = "dyn-ctx-tight"
+audio_ctx = "dynamic"
+audio_ctx_margin_ms = 300
+
+[[config]]
+name = "vad-energy"
+vad = "energy"
+
+[[config]]
+name = "vad-silero"
+vad = "silero"
+
+[[config]]
+name = "beam-5"
+beam_size = 5
+
+[[config]]
+name = "prompt-none"
+prompt = "none"
+
+[[config]]
+name = "prompt-projects"
+prompt = "projects"
+
+[[config]]
+name = "prompt-glossary"
+prompt = "glossary"

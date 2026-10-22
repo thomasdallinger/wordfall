@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Entry point for the Wordfall bench (external engine protocol, see bench/README.md).
+# Builds the Swift package if needed (build output goes to stderr), then execs the engine.
+#   bench/engines/apple-speech/run [--api analyzer|dictation|legacy] [--locale en-US] ...
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bin="$here/.build/release/apple-speech-engine"
+
+sdk_major() { xcrun --show-sdk-version 2>/dev/null | cut -d. -f1; }
+
+needs_build() {
+  [[ ! -x "$bin" ]] && return 0
+  [[ -n "$(find "$here/Sources" "$here/Package.swift" "$here/Resources/Info.plist" -newer "$bin" 2>/dev/null | head -1)" ]]
+}
+
+if needs_build; then
+  # SpeechAnalyzer needs the macOS 26 SDK. Respect DEVELOPER_DIR; otherwise fall back to an
+  # installed Xcode if the selected toolchain is older.
+  if [[ "$(sdk_major)" -lt 26 ]]; then
+    for d in /Applications/Xcode.app/Contents/Developer /Applications/Xcode-beta.app/Contents/Developer; do
+      if [[ -d "$d" ]] && [[ "$(DEVELOPER_DIR="$d" sdk_major)" -ge 26 ]]; then export DEVELOPER_DIR="$d"; break; fi
+    done
+  fi
+  if [[ "$(sdk_major)" -lt 26 ]]; then
+    cat >&2 <<EOF
+[apple-speech] ERROR: building needs the macOS 26 SDK, but the active developer dir
+  ($(xcode-select -p 2>/dev/null)) has SDK $(xcrun --show-sdk-version 2>/dev/null || echo '?').
+  Install one of (needs an admin password):
+    softwareupdate --list            # look for "Command Line Tools for Xcode 26.x"
+    sudo softwareupdate -i "Command Line Tools for Xcode 26.5-26.5"
+  or Xcode 26 from the App Store, or point DEVELOPER_DIR at a 26.x CommandLineTools/Xcode.
+EOF
+    exit 2
+  fi
+  echo "[apple-speech] building (swift build -c release, SDK $(xcrun --show-sdk-version)) ..." >&2
+  (cd "$here" && swift build -c release 1>&2)
+fi
+
+export APPLE_SPEECH_WARMUP="${APPLE_SPEECH_WARMUP:-$here/Resources/warmup.wav}"
+exec "$bin" "$@"

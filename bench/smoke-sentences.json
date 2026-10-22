@@ -1,0 +1,276 @@
+{
+  "_comment": "Smoke corpus scripts. `terms` must appear verbatim in the transcript (jargon recall). Spoken with several macOS voices by make-corpus.mjs.",
+  "sentences": [
+    {
+      "id": "short-implement",
+      "text": "Implement it.",
+      "tags": [
+        "short"
+      ]
+    },
+    {
+      "id": "short-thanks",
+      "text": "Thanks, that works.",
+      "tags": [
+        "short"
+      ]
+    },
+    {
+      "id": "short-fix",
+      "text": "Fix the build.",
+      "tags": [
+        "short"
+      ]
+    },
+    {
+      "id": "short-yes",
+      "text": "Yes, ship it.",
+      "tags": [
+        "short"
+      ]
+    },
+    {
+      "id": "short-test",
+      "text": "Run the tests again.",
+      "tags": [
+        "short"
+      ]
+    },
+    {
+      "id": "short-zephyrix",
+      "text": "Open Zephyrix.",
+      "tags": [
+        "short",
+        "jargon"
+      ],
+      "terms": [
+        "Zephyrix"
+      ]
+    },
+    {
+      "id": "jargon-supabase",
+      "text": "Move the user table from Postgres to Supabase and keep the row level security policies.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "Postgres",
+        "Supabase"
+      ]
+    },
+    {
+      "id": "jargon-mcp",
+      "text": "Add an MCP server so Claude Code can read the Notion workspace.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "MCP",
+        "Claude Code",
+        "Notion"
+      ]
+    },
+    {
+      "id": "jargon-zephyrix",
+      "text": "In the Zephyrix repo, the calendar sync breaks when the time zone changes.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "Zephyrix"
+      ]
+    },
+    {
+      "id": "jargon-steinhauer",
+      "text": "Send the Steinhauer invoice as a PDF to the finance team.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "Steinhauer",
+        "PDF"
+      ]
+    },
+    {
+      "id": "jargon-orbitly",
+      "text": "The Orbitly worker crashes after the third retry, check the logs.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "Orbitly"
+      ]
+    },
+    {
+      "id": "jargon-sveltekit",
+      "text": "Rewrite the settings page in SvelteKit with Tailwind and shadcn components.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "SvelteKit",
+        "Tailwind",
+        "shadcn"
+      ]
+    },
+    {
+      "id": "jargon-tauri",
+      "text": "The Tauri app needs microphone entitlements for the hardened runtime.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "Tauri"
+      ]
+    },
+    {
+      "id": "jargon-cli",
+      "text": "Build a CLI that exports the API keys from the vault as JSON.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "CLI",
+        "API",
+        "JSON"
+      ]
+    },
+    {
+      "id": "jargon-github",
+      "text": "Open a pull request on GitHub and tag the reviewers from the TypeScript team.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "GitHub",
+        "TypeScript"
+      ]
+    },
+    {
+      "id": "jargon-gitlab",
+      "text": "Check the GitLab pipeline, the Playwright tests time out in CI.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "GitLab",
+        "Playwright",
+        "CI"
+      ]
+    },
+    {
+      "id": "jargon-whisper",
+      "text": "Benchmark Whisper against Parakeet on the M3 Pro.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "Whisper",
+        "Parakeet",
+        "M3 Pro"
+      ]
+    },
+    {
+      "id": "jargon-mailpulse",
+      "text": "MailPulse should track read receipts in Gmail without reloading the page.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "MailPulse",
+        "Gmail"
+      ]
+    },
+    {
+      "id": "jargon-erp",
+      "text": "Sync the orders from the ERP into the HTML dashboard every five minutes.",
+      "tags": [
+        "jargon"
+      ],
+      "terms": [
+        "ERP",
+        "HTML"
+      ]
+    },
+    {
+      "id": "numbers-1",
+      "text": "Set the timeout to 30 seconds and retry 3 times.",
+      "tags": [
+        "numbers"
+      ]
+    },
+    {
+      "id": "numbers-2",
+      "text": "The meeting is on October 21st at 2:30 PM.",
+      "tags": [
+        "numbers"
+      ]
+    },
+    {
+      "id": "prose-1",
+      "text": "I want you to investigate why the onboarding flow skips the permission step for new users, and then write a short summary of what you found.",
+      "tags": [
+        "prose"
+      ]
+    },
+    {
+      "id": "prose-2",
+      "text": "Please keep the changes small, don't refactor unrelated files, and verify the result in the browser before you tell me it's done.",
+      "tags": [
+        "prose"
+      ]
+    },
+    {
+      "id": "prose-3",
+      "text": "When the nightly job fails, it should retry once, then post a short message in the team channel with a link to the logs.",
+      "tags": [
+        "prose"
+      ]
+    },
+    {
+      "id": "long-1",
+      "text": "Okay, here is the plan for today. First, we fix the login bug in Zephyrix, because customers are locked out after the password reset. Then we look at the Supabase migration and make sure the row level security policies still work for the admin role. After that, I want a quick review of the GitLab pipeline, since the Playwright tests have been flaky all week. If there is time left, start on the PDF export for the Steinhauer invoices, but don't ship anything without running the full test suite first.",
+      "tags": [
+        "long",
+        "jargon"
+      ],
+      "terms": [
+        "Zephyrix",
+        "Supabase",
+        "GitLab",
+        "Playwright",
+        "PDF",
+        "Steinhauer"
+      ]
+    },
+    {
+      "id": "long-2",
+      "text": "Let me describe the onboarding flow we want. A new user signs up with their email address and gets a six digit code. After that, they choose a workspace name and invite up to three teammates. We skip the payment step during the trial, but we remind them a week before it ends. If they never invite anyone, we send one friendly email after two days and then leave them alone.",
+      "tags": [
+        "long",
+        "prose"
+      ]
+    }
+  ],
+  "voices": [
+    {
+      "name": "Samantha",
+      "accent": "en_US"
+    },
+    {
+      "name": "Daniel",
+      "accent": "en_GB"
+    },
+    {
+      "name": "Anna",
+      "accent": "de_DE"
+    },
+    {
+      "name": "Rishi",
+      "accent": "en_IN"
+    }
+  ],
+  "rates": [
+    185
+  ]
+}

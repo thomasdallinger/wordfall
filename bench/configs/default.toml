@@ -1,0 +1,9 @@
+# Production configuration (what Wordfall ships). Regression gate:
+#   src-tauri/target/release/wordfall bench
+# Chosen from bench/configs/bakeoff.toml on 2026-10-20 (see docs/benchmark-results.md).
+[[config]]
+name = "production"
+model = "large-v3-turbo-q8_0"
+language = "en"
+prompt = "none"
+vad = "silero"

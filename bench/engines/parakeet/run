@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Wordfall bench external engine: NVIDIA Parakeet TDT (see README.md, bench/README.md for the protocol).
+#
+#   run --backend mlx|onnx|ggml --model parakeet-tdt-0.6b-v2|parakeet-tdt-0.6b-v3 [backend options]
+#
+# mlx/onnx options : --decoding greedy|beam  --beam-size N  --dtype bf16|fp32 (mlx)
+#                    --threads N  --provider cpu|coreml  --hotwords-score F  --no-context (onnx)
+# ggml options     : --quant f16|q8_0|...  (or --model /abs/path/model.bin)  --threads N  --no-gpu
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+MODELS="${WORDFALL_BENCH_MODELS:-$HOME/Library/Application Support/com.wordfall.app/bench-models}"
+
+backend=""; model="parakeet-tdt-0.6b-v2"; quant="f16"; rest=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backend) backend="$2"; shift 2 ;;
+    --backend=*) backend="${1#*=}"; shift ;;
+    --model) model="$2"; shift 2 ;;
+    --model=*) model="${1#*=}"; shift ;;
+    --quant) quant="$2"; shift 2 ;;
+    --quant=*) quant="${1#*=}"; shift ;;
+    *) rest+=("$1"); shift ;;
+  esac
+done
+
+case "$backend" in
+  mlx|onnx)
+    PY="$HERE/.venv/bin/python"
+    [[ -x "$PY" ]] || { echo "missing $PY; run $HERE/setup.sh" >&2; exit 1; }
+    exec "$PY" -I "$HERE/engine.py" --backend "$backend" --model "$model" ${rest[@]+"${rest[@]}"}
+    ;;
+  ggml)
+    BIN="$MODELS/build/parakeet-ggml/parakeet-server"
+    [[ -x "$BIN" ]] || { echo "missing $BIN; run $HERE/ggml/build.sh" >&2; exit 1; }
+    if [[ "$model" == /* ]]; then file="$model"; name="$(basename "$model" .bin)"
+    else file="$MODELS/ggml/ggml-$model-$quant.bin"; name="$model ($quant)"; fi
+    [[ -f "$file" ]] || { echo "missing ggml model $file; run $HERE/setup.sh" >&2; exit 1; }
+    exec "$BIN" --model "$file" --name "$name" ${rest[@]+"${rest[@]}"}
+    ;;
+  *) echo "usage: $0 --backend mlx|onnx|ggml --model parakeet-tdt-0.6b-v2|parakeet-tdt-0.6b-v3 [...]" >&2; exit 2 ;;
+esac

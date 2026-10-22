@@ -1,0 +1,194 @@
+{
+  "_comment": "Voice Lab read-aloud prompts. Personalized prompts (project names, dictionary words) are added at runtime from templates.",
+  "prompts": [
+    {
+      "id": "cmd-1",
+      "category": "short",
+      "text": "Implement it."
+    },
+    {
+      "id": "cmd-2",
+      "category": "short",
+      "text": "Fix the build."
+    },
+    {
+      "id": "cmd-3",
+      "category": "short",
+      "text": "Run the tests again."
+    },
+    {
+      "id": "cmd-4",
+      "category": "short",
+      "text": "Yes, ship it."
+    },
+    {
+      "id": "cmd-5",
+      "category": "short",
+      "text": "Thanks, that works."
+    },
+    {
+      "id": "cmd-6",
+      "category": "short",
+      "text": "Revert that change."
+    },
+    {
+      "id": "cmd-7",
+      "category": "short",
+      "text": "Explain what this does."
+    },
+    {
+      "id": "cmd-8",
+      "category": "short",
+      "text": "Continue."
+    },
+    {
+      "id": "tech-1",
+      "category": "jargon",
+      "text": "Move the user table from Postgres to Supabase and keep the row level security policies.",
+      "terms": [
+        "Postgres",
+        "Supabase"
+      ]
+    },
+    {
+      "id": "tech-2",
+      "category": "jargon",
+      "text": "Add an MCP server so Claude Code can read the Notion workspace.",
+      "terms": [
+        "MCP",
+        "Claude Code",
+        "Notion"
+      ]
+    },
+    {
+      "id": "tech-3",
+      "category": "jargon",
+      "text": "Rewrite the settings page in SvelteKit with Tailwind and shadcn components.",
+      "terms": [
+        "SvelteKit",
+        "Tailwind",
+        "shadcn"
+      ]
+    },
+    {
+      "id": "tech-4",
+      "category": "jargon",
+      "text": "Build a CLI that exports the API keys as JSON.",
+      "terms": [
+        "CLI",
+        "API",
+        "JSON"
+      ]
+    },
+    {
+      "id": "tech-5",
+      "category": "jargon",
+      "text": "Open a pull request on GitHub and ask the TypeScript team for a review.",
+      "terms": [
+        "GitHub",
+        "TypeScript"
+      ]
+    },
+    {
+      "id": "tech-6",
+      "category": "jargon",
+      "text": "The GitLab pipeline fails because the Playwright tests time out in CI.",
+      "terms": [
+        "GitLab",
+        "Playwright",
+        "CI"
+      ]
+    },
+    {
+      "id": "tech-7",
+      "category": "jargon",
+      "text": "Export the invoices as a PDF and sync them into the ERP.",
+      "terms": [
+        "PDF",
+        "ERP"
+      ]
+    },
+    {
+      "id": "tech-8",
+      "category": "jargon",
+      "text": "The Tauri app needs the microphone entitlement for the hardened runtime on macOS.",
+      "terms": [
+        "Tauri",
+        "macOS"
+      ]
+    },
+    {
+      "id": "tech-9",
+      "category": "jargon",
+      "text": "Compare Whisper and Parakeet on the M3 Pro and keep the faster one.",
+      "terms": [
+        "Whisper",
+        "Parakeet",
+        "M3 Pro"
+      ]
+    },
+    {
+      "id": "tech-10",
+      "category": "jargon",
+      "text": "Store the IDs in local storage and render the list in the UI.",
+      "terms": [
+        "IDs",
+        "UI"
+      ]
+    },
+    {
+      "id": "num-1",
+      "category": "numbers",
+      "text": "Set the timeout to 30 seconds and retry 3 times."
+    },
+    {
+      "id": "num-2",
+      "category": "numbers",
+      "text": "The meeting is on October 21st at 2:30 PM."
+    },
+    {
+      "id": "num-3",
+      "category": "numbers",
+      "text": "We have 250 users, and about 12 percent are on the free plan."
+    },
+    {
+      "id": "prose-1",
+      "category": "prose",
+      "text": "I want you to investigate why the onboarding flow skips the permission step for new users, and then write a short summary of what you found."
+    },
+    {
+      "id": "prose-2",
+      "category": "prose",
+      "text": "Please keep the changes small, don't refactor unrelated files, and verify the result in the browser before you tell me it's done."
+    },
+    {
+      "id": "prose-3",
+      "category": "prose",
+      "text": "When the nightly job fails, it should retry once, then post a short message in the team channel with a link to the logs."
+    },
+    {
+      "id": "prose-4",
+      "category": "prose",
+      "text": "Before you build anything, check whether the standard library already has a function for this."
+    },
+    {
+      "id": "long-1",
+      "category": "long",
+      "text": "Okay, here is the plan for today. First, we fix the login bug, because customers are locked out after the password reset. Then we look at the database migration and make sure the security policies still work for the admin role. After that, I want a quick review of the pipeline, since the browser tests have been flaky all week. If there is time left, start on the export feature, but don't ship anything without running the full test suite first."
+    },
+    {
+      "id": "long-2",
+      "category": "long",
+      "text": "Let me describe the onboarding flow we want. A new user signs up with their email address and gets a six digit code. After that, they choose a workspace name and invite up to three teammates. We skip the payment step during the trial, but we remind them a week before it ends."
+    }
+  ],
+  "templates": {
+    "project": [
+      "Open the {term} repo and fix the failing tests.",
+      "Deploy {term} to staging after lunch."
+    ],
+    "word": [
+      "Please double check the {term} part before we ship."
+    ]
+  }
+}

@@ -1,0 +1,203 @@
+/* The floating pill (window label `widget`). The native window is transparent and sized to
+   the content plus --pill-margin, anchored bottom-centre by the core. */
+
+html.widget-transparent,
+html.widget-transparent body,
+html.widget-transparent #app {
+  background: transparent !important;
+}
+
+.pill-root {
+  --pill-margin: 10px;
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: var(--pill-margin);
+  pointer-events: none;
+}
+
+.pill-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+}
+.pill-stack > * {
+  pointer-events: auto;
+}
+
+.pill {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px 0 8px;
+  border-radius: 999px;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow:
+    0 0 0 1px var(--line),
+    0 1px 2px rgb(0 0 0 / 0.08),
+    0 3px 8px rgb(0 0 0 / 0.1);
+  cursor: grab;
+  transition:
+    height var(--dur) var(--ease),
+    padding var(--dur) var(--ease),
+    background-color var(--dur) var(--ease);
+}
+.pill:hover {
+  background: color-mix(in srgb, var(--surface) 94%, var(--ink));
+}
+.pill.locked {
+  cursor: pointer;
+}
+.pill:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Idle looks */
+.pill-name {
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.pill.mark-only {
+  width: 30px;
+  padding: 0;
+}
+.pill.dot-only {
+  height: 14px;
+  width: 30px;
+  padding: 0;
+}
+.pill-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--ink-3);
+}
+
+/* Live: listening and processing share one size so the window does not jump. */
+.pill.live {
+  height: 32px;
+  width: 116px;
+  padding: 0 6px;
+  justify-content: space-between;
+}
+
+.pill-slot {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+.pill-btn {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--dur) var(--ease),
+    background-color var(--dur) var(--ease);
+}
+.pill:hover .pill-btn,
+.pill:focus-within .pill-btn {
+  opacity: 1;
+}
+.pill-btn:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.pill-cancel {
+  color: var(--ink-2);
+  background: var(--press);
+}
+.pill-cancel:hover {
+  color: var(--ink);
+}
+.pill-stop {
+  color: var(--signal-ink);
+  background: var(--signal);
+}
+
+.pill-wave {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  height: 18px;
+  width: 58px;
+}
+.pill-wave span {
+  width: 2px;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--signal);
+  transform-origin: center;
+  transition: transform 70ms linear;
+  will-change: transform;
+}
+/* Processing: the waveform settles into a slow, staggered breath in neutral ink. */
+.pill-wave.settled span {
+  height: 4px;
+  background: var(--ink-2);
+  transform: none;
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+/* One short sentence above the pill */
+.pill-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 280px;
+  min-height: 24px;
+  padding: 4px 11px 4px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow:
+    0 0 0 1px var(--line),
+    0 1px 2px rgb(0 0 0 / 0.08),
+    0 3px 8px rgb(0 0 0 / 0.1);
+  cursor: pointer;
+  animation: appear var(--dur) var(--ease);
+}
+.pill-note-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pill-note-dot {
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: var(--ink-3);
+}
+.pill-note.warning .pill-note-dot {
+  background: var(--warn);
+}
+.pill-note.error .pill-note-dot {
+  background: var(--bad);
+}
+.pill-note.success .pill-note-dot {
+  background: var(--ok);
+}

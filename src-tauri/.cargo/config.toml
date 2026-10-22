@@ -1,0 +1,3 @@
+[env]
+# whisper.cpp's CPU-feature probes (try_run) can hang on Apple Silicon; Metal does the heavy lifting anyway.
+GGML_NATIVE = "OFF"
