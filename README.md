@@ -1,4 +1,4 @@
-<p align="center"><img src="app-icon.png" width="96" alt=""></p>
+<p align="center"><img src="app-icon.png" width="128" alt="Wordfall icon"></p>
 
 <h1 align="center">Wordfall</h1>
 
