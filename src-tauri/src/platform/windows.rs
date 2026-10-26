@@ -3,13 +3,9 @@
 //! Monitoring grants, so those always report as allowed.
 
 use std::{
-    f32::consts::TAU,
     os::windows::ffi::OsStrExt,
     path::Path,
-    sync::{
-        atomic::{AtomicIsize, Ordering},
-        LazyLock,
-    },
+    sync::atomic::{AtomicIsize, Ordering},
     thread,
     time::Duration,
 };
@@ -203,44 +199,9 @@ pub fn set_fn_do_nothing() -> FnUsage {
 
 // ---------- cues & muting ----------
 
-/// A short sine "tink" as an in-memory 16-bit mono WAV.
-fn tone_wav(freq: f32, ms: u32, volume: f32) -> Vec<u8> {
-    const RATE: u32 = 44_100;
-    let n = RATE * ms / 1000;
-    let samples: Vec<i16> = (0..n)
-        .map(|i| {
-            let t = i as f32 / RATE as f32;
-            let attack = (i as f32 / 220.0).min(1.0);
-            let decay = (-t * 1000.0 / (ms as f32 * 0.35)).exp();
-            ((TAU * freq * t).sin() * attack * decay * volume * i16::MAX as f32) as i16
-        })
-        .collect();
-    let data_len = samples.len() as u32 * 2;
-    let mut wav = Vec::with_capacity(44 + data_len as usize);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-    wav.extend_from_slice(&RATE.to_le_bytes());
-    wav.extend_from_slice(&(RATE * 2).to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes());
-    wav.extend_from_slice(&16u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    for s in samples {
-        wav.extend_from_slice(&s.to_le_bytes());
-    }
-    wav
-}
-
-// PlaySound with SND_ASYNC reads the buffer while playing, so the cues live for the whole process.
-static START_CUE: LazyLock<Vec<u8>> = LazyLock::new(|| tone_wav(1568.0, 90, 0.3));
-static STOP_CUE: LazyLock<Vec<u8>> = LazyLock::new(|| tone_wav(784.0, 110, 0.3));
-
 pub fn play_cue(start: bool) {
-    let wav = if start { &*START_CUE } else { &*STOP_CUE };
+    // SND_ASYNC keeps reading the buffer while playing; the cue lives for the whole process.
+    let wav = crate::cues::wav(start);
     unsafe {
         let _ = PlaySoundW(PCWSTR(wav.as_ptr().cast()), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
     }
@@ -279,17 +240,5 @@ pub fn unmute_output(was_muted: bool) {
                 let _ = unsafe { vol.SetMute(false, std::ptr::null()) };
             }
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tone_is_a_valid_wav() {
-        let wav = tone_wav(1000.0, 100, 0.3);
-        assert_eq!(&wav[..4], b"RIFF");
-        assert_eq!(wav.len(), 44 + 4410 * 2);
     }
 }

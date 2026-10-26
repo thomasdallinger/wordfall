@@ -193,8 +193,13 @@ pub fn set_fn_do_nothing() -> FnUsage {
 // ---------- cues & muting ----------
 
 pub fn play_cue(start: bool) {
-    let sound = if start { "/System/Library/Sounds/Tink.aiff" } else { "/System/Library/Sounds/Pop.aiff" };
-    let _ = Command::new("afplay").args(["-v", "0.35", sound]).spawn();
+    // afplay needs a file; write the cue once per process (and again if the temp folder was cleaned).
+    let wav = crate::cues::wav(start);
+    let path = std::env::temp_dir().join(if start { "wordfall-cue-start.wav" } else { "wordfall-cue-stop.wav" });
+    if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(wav.len() as u64) && std::fs::write(&path, wav).is_err() {
+        return;
+    }
+    let _ = Command::new("afplay").arg(&path).spawn();
 }
 
 fn osascript(script: &str) -> Option<String> {

@@ -2,6 +2,7 @@ mod audio;
 mod bench;
 mod bench_report;
 mod commands;
+mod cues;
 mod hotkey;
 mod lab;
 mod lists;
