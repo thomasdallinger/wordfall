@@ -1,3 +1,4 @@
+import { IS_WINDOWS } from './platform';
 import type { PttKey } from './types';
 
 const timeFmt = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
@@ -48,38 +49,71 @@ export function formatSize(mb: number): string {
 
 /** "~/Library/…/models" style: replaces the home folder with "~". */
 export function shortPath(path: string): string {
-  return path.replace(/^\/Users\/[^/]+/, '~');
+  return path.replace(/^\/Users\/[^/]+/, '~').replace(/^[A-Za-z]:\\Users\\[^\\]+/, '~');
 }
 
-export const PTT_KEYS: { value: PttKey; label: string; cap: string }[] = [
-  { value: 'fn', label: 'Fn (Globe)', cap: 'fn' },
-  { value: 'right_option', label: 'Right Option', cap: 'Right ⌥' },
-  { value: 'right_command', label: 'Right Command', cap: 'Right ⌘' },
-  { value: 'right_control', label: 'Right Control', cap: 'Right ⌃' },
-  { value: 'right_shift', label: 'Right Shift', cap: 'Right ⇧' },
-  { value: 'none', label: 'No key', cap: '' },
+/** Languages offered in Settings (ISO 639-1 code, English name), most requested first. */
+export const LANGUAGES: [string, string][] = [
+  ['en', 'English'], ['de', 'German'], ['fr', 'French'], ['es', 'Spanish'], ['it', 'Italian'],
+  ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'], ['sv', 'Swedish'], ['da', 'Danish'],
+  ['no', 'Norwegian'], ['fi', 'Finnish'], ['cs', 'Czech'], ['uk', 'Ukrainian'], ['ru', 'Russian'],
+  ['tr', 'Turkish'], ['el', 'Greek'], ['ja', 'Japanese'], ['zh', 'Chinese'], ['ko', 'Korean'],
+  ['hi', 'Hindi'], ['ar', 'Arabic'],
 ];
+
+/** "de" -> "German"; unknown codes fall back to the code. */
+export function languageName(code: string): string {
+  return LANGUAGES.find(([c]) => c === code)?.[1] ?? code;
+}
+
+/** Windows never sees the Fn key, and a lone Windows key opens Start. */
+export const PTT_KEYS: { value: PttKey; label: string; cap: string }[] = IS_WINDOWS
+  ? [
+      { value: 'right_control', label: 'Right Ctrl', cap: 'Right Ctrl' },
+      { value: 'right_option', label: 'Right Alt', cap: 'Right Alt' },
+      { value: 'right_shift', label: 'Right Shift', cap: 'Right Shift' },
+      { value: 'none', label: 'No key', cap: '' },
+    ]
+  : [
+      { value: 'fn', label: 'Fn (Globe)', cap: 'fn' },
+      { value: 'right_option', label: 'Right Option', cap: 'Right ⌥' },
+      { value: 'right_command', label: 'Right Command', cap: 'Right ⌘' },
+      { value: 'right_control', label: 'Right Control', cap: 'Right ⌃' },
+      { value: 'right_shift', label: 'Right Shift', cap: 'Right ⇧' },
+      { value: 'none', label: 'No key', cap: '' },
+    ];
 
 /** The key cap text for a push-to-talk key ("fn", "Right ⌥"); empty when none is set. */
 export function pttCap(key: PttKey | undefined | null): string {
   return PTT_KEYS.find((k) => k.value === key)?.cap ?? '';
 }
 
-const MOD_DISPLAY: Record<string, string> = {
-  commandorcontrol: '⌘',
-  cmdorctrl: '⌘',
-  command: '⌘',
-  cmd: '⌘',
-  super: '⌘',
-  meta: '⌘',
-  control: '⌃',
-  ctrl: '⌃',
-  alt: '⌥',
-  option: '⌥',
-  shift: '⇧',
-};
+const MOD_DISPLAY: Record<string, string> = IS_WINDOWS
+  ? {
+      commandorcontrol: 'Ctrl',
+      cmdorctrl: 'Ctrl',
+      control: 'Ctrl',
+      ctrl: 'Ctrl',
+      super: 'Win',
+      meta: 'Win',
+      alt: 'Alt',
+      shift: 'Shift',
+    }
+  : {
+      commandorcontrol: '⌘',
+      cmdorctrl: '⌘',
+      command: '⌘',
+      cmd: '⌘',
+      super: '⌘',
+      meta: '⌘',
+      control: '⌃',
+      ctrl: '⌃',
+      alt: '⌥',
+      option: '⌥',
+      shift: '⇧',
+    };
 
-/** "CommandOrControl+Shift+Space" -> ["⌘", "⇧", "Space"] */
+/** "CommandOrControl+Shift+Space" -> ["⌘", "⇧", "Space"] (["Ctrl", "Shift", "Space"] on Windows) */
 export function acceleratorParts(acc: string | null | undefined): string[] {
   if (!acc) return [];
   return acc.split('+').map((p) => MOD_DISPLAY[p.toLowerCase()] ?? p);
@@ -107,8 +141,13 @@ export function acceleratorFromEvent(e: KeyboardEvent): string | null {
   if (!key) return null;
 
   const mods: string[] = [];
-  if (e.metaKey) mods.push('CommandOrControl');
-  if (e.ctrlKey) mods.push('Control');
+  if (IS_WINDOWS) {
+    if (e.ctrlKey) mods.push('CommandOrControl');
+    if (e.metaKey) mods.push('Super');
+  } else {
+    if (e.metaKey) mods.push('CommandOrControl');
+    if (e.ctrlKey) mods.push('Control');
+  }
   if (e.altKey) mods.push('Alt');
   if (e.shiftKey) mods.push('Shift');
 

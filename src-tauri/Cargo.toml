@@ -1,7 +1,7 @@
 [package]
 name = "wordfall"
 version = "0.1.0"
-description = "Wordfall — local push-to-talk dictation for macOS"
+description = "Wordfall — local push-to-talk dictation for macOS and Windows"
 authors = ["Wordfall contributors"]
 edition = "2021"
 rust-version = "1.85"
@@ -9,6 +9,11 @@ rust-version = "1.85"
 [lib]
 name = "wordfall_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# GPU backends for whisper.cpp on Windows (macOS always uses Metal). Each needs its SDK at build time.
+vulkan = ["whisper-rs/vulkan"]
+cuda = ["whisper-rs/cuda"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -29,7 +34,8 @@ regex = "1"
 anyhow = "1"
 toml = "0.8"
 dirs = "6"
-whisper-rs = { version = "0.16", features = ["metal"] }
+whisper-rs = "0.16"
+sys-locale = "0.3"
 cpal = "0.15"
 arboard = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
@@ -44,6 +50,20 @@ objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", features = ["NSRunningApplication", "NSWorkspace", "NSApplication", "libc"] }
 objc2-av-foundation = { version = "0.3", features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
 block2 = "0.6"
+whisper-rs = { version = "0.16", features = ["metal"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 codegen-units = 1

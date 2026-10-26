@@ -4,8 +4,9 @@ mod bench_report;
 mod commands;
 mod hotkey;
 mod lab;
-mod macos;
+mod lists;
 mod metrics;
+mod platform;
 mod postprocess;
 mod session;
 mod settings;
@@ -28,7 +29,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    ActivationPolicy, AppHandle, Emitter, Manager, RunEvent, WindowEvent,
+    AppHandle, Emitter, Manager, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -67,8 +68,19 @@ pub struct Core {
 
 const DASHBOARD: &str = "dashboard";
 
+/// macOS: show or hide the Dock icon along with the dashboard. Windows keeps the tray icon only.
+fn set_dock_visible(app: &AppHandle, visible: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::ActivationPolicy;
+        let _ = app.set_activation_policy(if visible { ActivationPolicy::Regular } else { ActivationPolicy::Accessory });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, visible);
+}
+
 pub fn show_dashboard(app: &AppHandle) {
-    let _ = app.set_activation_policy(ActivationPolicy::Regular);
+    set_dock_visible(app, true);
     if let Some(w) = app.get_webview_window(DASHBOARD) {
         let _ = w.unminimize();
         let _ = w.show();
@@ -108,7 +120,10 @@ pub fn ensure_model_loaded(app: &AppHandle) -> bool {
             engine.unload();
         }
         match engine.load(entry, &path) {
-            Ok(()) => set_model_state(&app, ModelState::Ready, Some(entry.id.into()), None),
+            Ok(()) => {
+                prepare_language_detection(&app);
+                set_model_state(&app, ModelState::Ready, Some(entry.id.into()), None)
+            }
             Err(e) => {
                 log::error!("{e:#}");
                 set_model_state(&app, ModelState::Error, Some(entry.id.into()), Some(format!("{e:#}")));
@@ -121,6 +136,16 @@ pub fn ensure_model_loaded(app: &AppHandle) -> bool {
         }
     });
     true
+}
+
+/// With several languages each dictation starts with language detection; set it up off the hot path.
+pub fn prepare_language_detection(app: &AppHandle) {
+    let core = app.state::<Core>();
+    if core.settings.read().languages.len() > 1 {
+        if let Err(e) = core.engine.prepare_detection() {
+            log::warn!("{e:#}");
+        }
+    }
 }
 
 pub fn register_shortcuts(app: &AppHandle) {
@@ -168,12 +193,17 @@ pub fn apply_autostart(app: &AppHandle) {
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Wordfall", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "Start / Stop Dictation", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit Wordfall", true, Some("Cmd+Q"))?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Wordfall", true, Some("CmdOrCtrl+Q"))?;
     let menu = Menu::with_items(app, &[&open, &toggle, &PredefinedMenuItem::separator(app)?, &quit])?;
-    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+    // macOS tints the monochrome template to the menu bar; the Windows tray wants the colour icon.
+    let icon = if cfg!(target_os = "macos") {
+        tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?
+    } else {
+        app.default_window_icon().cloned().ok_or_else(|| tauri::Error::AssetNotFound("window icon".into()))?
+    };
     TrayIconBuilder::with_id("wordfall")
         .icon(icon)
-        .icon_as_template(true)
+        .icon_as_template(cfg!(target_os = "macos"))
         .tooltip("Wordfall")
         .menu(&menu)
         .on_menu_event(|app, e| match e.id().as_ref() {
@@ -209,7 +239,7 @@ fn init_logging(dir: &std::path::Path) {
     }
 }
 
-/// `wordfall --transcribe <file.wav> [--model <id>]`: headless pipeline check that prints JSON.
+/// `wordfall --transcribe <file.wav> [--model <id>] [--languages en,de]`: headless pipeline check that prints JSON.
 fn cli_transcribe(args: &[String]) -> anyhow::Result<()> {
     let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let wav = arg("--transcribe").ok_or_else(|| anyhow::anyhow!("missing WAV path"))?;
@@ -226,12 +256,28 @@ fn cli_transcribe(args: &[String]) -> anyhow::Result<()> {
     engine.load(entry, &path)?;
     let load_ms = load_started.elapsed().as_millis();
     let dictionary = Store::load(&data_dir).dictionary;
-    let t = engine.transcribe(&audio, settings.language.as_deref(), None, &settings.decode)?;
-    let cleaned = postprocess::clean(&t.text, settings.remove_fillers, Some(&dictionary), false);
+    let languages: Vec<String> = match arg("--languages") {
+        Some(list) => list.split(',').map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        None => settings.languages.clone(),
+    };
+    if languages.len() > 1 {
+        engine.prepare_detection()?;
+    }
+    let t = engine.transcribe(&audio, &languages, None, &settings.decode)?;
+    let cleaned = postprocess::clean(
+        &t.text,
+        &postprocess::Options {
+            remove_fillers: settings.remove_fillers,
+            format_lists: settings.format_lists,
+            language: t.language.as_deref(),
+            dictionary: Some(&dictionary),
+            quiet_input: false,
+        },
+    );
     println!(
         "{}",
         json!({ "model": model_id, "source": source, "loadMs": load_ms, "transcribeMs": t.elapsed_ms,
-                "audioSeconds": audio.len() as f32 / 16_000.0, "raw": t.text, "text": cleaned.text })
+                "audioSeconds": audio.len() as f32 / 16_000.0, "language": t.language, "raw": t.text, "text": cleaned.text })
     );
     Ok(())
 }
@@ -269,7 +315,7 @@ pub fn run() {
             let dir = app.path().app_data_dir()?;
             init_logging(&dir);
             log::info!("Wordfall {} starting (autostart: {autostarted})", app.package_info().version);
-            log::info!("permissions: {:?}, fn key: {:?}", macos::permissions(), macos::fn_usage());
+            log::info!("permissions: {:?}, fn key: {:?}", platform::permissions(), platform::fn_usage());
 
             let settings = Settings::load(&dir);
             let store = Store::load(&dir);
@@ -315,7 +361,7 @@ pub fn run() {
             );
             let _ = app.state::<Core>().listener.set(listener);
 
-            macos::spawn_focus_tracker();
+            platform::spawn_focus_tracker();
             widget::create(&handle)?;
             widget::spawn_follow_cursor(handle.clone());
             session::widget_visibility_changed(&handle, settings.widget_visibility);
@@ -327,7 +373,7 @@ pub fn run() {
             commands::spawn_permission_watch(handle.clone());
 
             if autostarted && settings.onboarding_done {
-                let _ = handle.set_activation_policy(ActivationPolicy::Accessory);
+                set_dock_visible(&handle, false);
             } else {
                 show_dashboard(&handle);
             }
@@ -338,7 +384,7 @@ pub fn run() {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
-                    let _ = window.app_handle().set_activation_policy(ActivationPolicy::Accessory);
+                    set_dock_visible(window.app_handle(), false);
                 }
             }
         })
@@ -389,9 +435,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Wordfall");
 
-    app.run(|app, event| {
-        if let RunEvent::Reopen { .. } = event {
-            show_dashboard(app);
+    app.run(|_app, _event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = _event {
+            show_dashboard(_app);
         }
     });
 }

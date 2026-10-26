@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm run check
+      - name: Static C/C++ runtime flags for whisper.cpp (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" >> "$GITHUB_ENV"
+          echo "CMAKE_C_FLAGS_RELEASE=/MT /O2 /Ob2 /DNDEBUG" >> "$GITHUB_ENV"
+          echo "CMAKE_CXX_FLAGS_RELEASE=/MT /O2 /Ob2 /DNDEBUG" >> "$GITHUB_ENV"
+          # `cargo test` builds whisper.cpp as RelWithDebInfo.
+          echo "CMAKE_C_FLAGS_RELWITHDEBINFO=/MT /Zi /O2 /Ob1 /DNDEBUG" >> "$GITHUB_ENV"
+          echo "CMAKE_CXX_FLAGS_RELWITHDEBINFO=/MT /Zi /O2 /Ob1 /DNDEBUG" >> "$GITHUB_ENV"
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+      - name: Bundle (unsigned)
+        # macOS signing uses a local identity; CI builds an unsigned bundle.
+        run: npm run tauri build -- --no-sign
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wordfall-${{ matrix.os }}
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/macos/*.app

@@ -6,6 +6,7 @@
   import Segmented from '../../lib/components/Segmented.svelte';
   import { PRODUCT } from '../../lib/brand';
   import { PTT_KEYS, acceleratorFromEvent, acceleratorParts, pttCap } from '../../lib/format';
+  import { IS_WINDOWS } from '../../lib/platform';
   import { app } from '../../lib/state.svelte';
   import type { PermissionKind, PttKey } from '../../lib/types';
 
@@ -38,11 +39,12 @@
     setTimeout(() => (spinning = false), 400);
   }
 
+  // Windows only asks for the microphone; typing and key listening need no grant there.
   const PERMISSIONS: { kind: PermissionKind; label: string; help: string }[] = [
     { kind: 'microphone', label: 'Microphone', help: 'To hear you while the key is held.' },
     { kind: 'accessibility', label: 'Accessibility', help: 'To type the text into other apps.' },
     { kind: 'inputMonitoring', label: 'Input Monitoring', help: 'To notice when you press your dictation key.' },
-  ];
+  ].filter((p) => !IS_WINDOWS || p.kind === 'microphone') as { kind: PermissionKind; label: string; help: string }[];
 
   function granted(kind: PermissionKind) {
     const p = snap?.permissions;
@@ -109,7 +111,7 @@
         value={s.inputDevice ?? ''}
         onchange={(e) => app.updateSettings({ inputDevice: e.currentTarget.value || null })}
       >
-        <option value="">Same as macOS</option>
+        <option value="">{IS_WINDOWS ? 'System default' : 'Same as macOS'}</option>
         {#each app.devices as d (d.name)}
           <option value={d.name}>{d.name}</option>
         {/each}

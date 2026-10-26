@@ -16,9 +16,12 @@ type PillStyle = 'logo-and-text' | 'logo-only' | 'logo-only-monochrome';
 
 interface Settings {
   model: string;                 // e.g. "distil-large-v3.5"
-  language: string | null;       // null = auto (English-only models ignore it)
-  removeFillers: boolean;
-  pttKey: PttKey;                // default "fn"
+  languages: string[];           // ISO 639-1 codes the user speaks; [] = any, one = forced,
+                                 // several = detected per dictation among them (English-only models ignore it).
+                                 // Default: ["en"] + the system language. Replaces `language` (migrated on load).
+  removeFillers: boolean;        // um/uh/ähm…; "um" is kept when the text is German or Portuguese
+  formatLists: boolean;          // "first … second …" / "bullet point …" become "1. …" / "- …" lines
+  pttKey: PttKey;                // default "fn" (macOS), "right_control" (Windows; no "fn" there)
   toggleShortcut: string | null; // Tauri accelerator, e.g. "Alt+Space"
   showWidgetShortcut: string;    // fixed: "CommandOrControl+Shift+Space"
   inputDevice: string | null;    // null = system default
@@ -42,6 +45,7 @@ interface Settings {
 interface HistoryRecord {
   id: string; text: string; raw_text: string | null; model: string | null;
   word_count: number; duration_seconds: number; transcription_ms: number | null;
+  language?: string | null; // ISO 639-1 the dictation was decoded as; omitted for older records
   timestamp: string; // RFC3339
   reference?: string | null; // set once the user corrected/verified it (benchmark ground truth)
   has_audio: boolean;        // a WAV of this dictation is kept
@@ -69,9 +73,10 @@ interface ModelInfo {
 }
 type ModelState = 'unloaded' | 'loading' | 'ready' | 'error';
 
+// On Windows, accessibility and inputMonitoring are always true; microphone reflects the privacy setting.
 interface Permissions { microphone: 'granted' | 'denied' | 'undetermined'; accessibility: boolean; inputMonitoring: boolean }
 interface AudioDevice { name: string; isDefault: boolean }
-interface FnUsage { value: number | null; label: string; ok: boolean } // ok = Fn/Globe set to "Do Nothing"
+interface FnUsage { value: number | null; label: string; ok: boolean } // ok = Fn/Globe set to "Do Nothing"; always ok on Windows
 
 interface Snapshot {
   settings: Settings; stats: Stats; recState: RecState; recMode: RecMode;

@@ -4,6 +4,7 @@
   import Section from '../../lib/components/Section.svelte';
   import { api, pickFolder } from '../../lib/api';
   import { plural, shortPath } from '../../lib/format';
+  import { THIS_DEVICE } from '../../lib/platform';
   import { app } from '../../lib/state.svelte';
 
   let importing = $state(false);
@@ -50,7 +51,7 @@
   }
 </script>
 
-<Section id="data" title="Data" intro="Everything stays on this Mac unless you export it.">
+<Section id="data" title="Data" intro="Everything stays on {THIS_DEVICE} unless you export it.">
   <Row
     label="Import from a folder"
     help="Reads transcripts, dictionary entries and suggestions from JSON files in a folder you pick. Any Whisper models inside are used from there."
@@ -68,7 +69,7 @@
 <ConfirmDialog
   bind:this={confirm}
   title="Delete every transcript?"
-  message="This removes all transcripts and kept recordings from this Mac. It can't be undone."
+  message="This removes all transcripts and kept recordings from {THIS_DEVICE}. It can't be undone."
   confirmLabel="Delete all"
   onconfirm={clearAll}
 />

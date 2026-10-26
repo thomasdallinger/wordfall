@@ -4,19 +4,31 @@
   import Row from '../../lib/components/Row.svelte';
   import Section from '../../lib/components/Section.svelte';
   import { pickFolder } from '../../lib/api';
-  import { formatSize, plural, shortPath } from '../../lib/format';
+  import { PRODUCT } from '../../lib/brand';
+  import { LANGUAGES, formatSize, languageName, plural, shortPath } from '../../lib/format';
+  import { THIS_DEVICE } from '../../lib/platform';
   import { app } from '../../lib/state.svelte';
-
-  const LANGUAGES: [string, string][] = [
-    ['en', 'English'], ['de', 'German'], ['fr', 'French'], ['es', 'Spanish'], ['it', 'Italian'],
-    ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'], ['sv', 'Swedish'], ['da', 'Danish'],
-    ['no', 'Norwegian'], ['fi', 'Finnish'], ['cs', 'Czech'], ['uk', 'Ukrainian'], ['ru', 'Russian'],
-    ['tr', 'Turkish'], ['el', 'Greek'], ['ja', 'Japanese'], ['zh', 'Chinese'], ['ko', 'Korean'],
-    ['hi', 'Hindi'], ['ar', 'Arabic'],
-  ];
 
   const s = $derived(app.settings);
   const englishOnly = $derived(app.activeModelInfo?.englishOnly ?? false);
+  const addable = $derived(LANGUAGES.filter(([code]) => !s?.languages.includes(code)));
+  const languageHelp = $derived.by(() => {
+    const langs = s?.languages ?? [];
+    if (englishOnly) return 'The current model only understands English. Pick a multilingual model to dictate in other languages.';
+    if (langs.length === 0) return 'Any language. Add the ones you speak so short phrases aren’t mistaken for another language.';
+    if (langs.length === 1) return `Everything is written in ${languageName(langs[0])}. Add another and ${PRODUCT} follows whichever you speak.`;
+    return `Speak any of these and ${PRODUCT} writes in the one you used. Nothing to switch.`;
+  });
+
+  function addLanguage(code: string) {
+    if (!s || !code || s.languages.includes(code)) return;
+    void app.updateSettings({ languages: [...s.languages, code] });
+  }
+
+  function removeLanguage(code: string) {
+    if (!s) return;
+    void app.updateSettings({ languages: s.languages.filter((l) => l !== code) });
+  }
   const onDisk = $derived(app.models.filter((m) => m.downloaded && m.source === 'app'));
   const diskMb = $derived(onDisk.reduce((n, m) => n + m.sizeMb, 0));
 
@@ -36,23 +48,40 @@
 </script>
 
 {#if s}
-  <Section id="model" title="Model" intro="Speech is turned into text on this Mac. Bigger models make fewer mistakes and take a little longer.">
+  <Section id="model" title="Model" intro="Speech is turned into text on {THIS_DEVICE}. Bigger models make fewer mistakes and take a little longer.">
     <ModelList />
     <p class="disk">{plural(onDisk.length, 'model')} downloaded, using {formatSize(diskMb)}.</p>
 
-    <Row id="model-lang" label="Language" help={englishOnly ? 'The current model only understands English.' : 'Automatic works for most people. Pick one if it keeps guessing wrong.'}>
+    <Row id="model-lang" label="Languages" help={languageHelp}>
       <select
         class="field lang"
         aria-labelledby="model-lang"
         disabled={englishOnly}
-        value={englishOnly ? 'en' : (s.language ?? '')}
-        onchange={(e) => app.updateSettings({ language: e.currentTarget.value || null })}
+        value=""
+        onchange={(e) => {
+          addLanguage(e.currentTarget.value);
+          e.currentTarget.value = '';
+        }}
       >
-        <option value="">Automatic</option>
-        {#each LANGUAGES as [code, name] (code)}
+        <option value="">Add a language…</option>
+        {#each addable as [code, name] (code)}
           <option value={code}>{name}</option>
         {/each}
       </select>
+      {#snippet below()}
+        {#if !englishOnly && s.languages.length > 0}
+          <ul class="folders" aria-label="Languages you dictate in">
+            {#each s.languages as code (code)}
+              <li>
+                <span class="path">{languageName(code)}</span>
+                <button class="icon-btn" title="Remove" aria-label="Remove {languageName(code)}" onclick={() => removeLanguage(code)}>
+                  <XIcon size={14} strokeWidth={1.5} />
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {/snippet}
     </Row>
 
     <Row label="Model folders" help="Other places to look for Whisper models in ggml format. Models there are used where they are, not copied.">

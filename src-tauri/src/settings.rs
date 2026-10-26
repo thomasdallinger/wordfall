@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
     storage,
@@ -30,8 +30,12 @@ pub enum WidgetVisibility {
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     pub model: String,
-    pub language: Option<String>,
+    /// Languages the user dictates in (ISO 639-1). Empty = any language whisper knows;
+    /// several = each dictation is decoded in whichever of them it sounds like.
+    pub languages: Vec<String>,
     pub remove_fillers: bool,
+    /// Turn spoken enumerations ("first … second …", "bullet point …") into lists.
+    pub format_lists: bool,
     pub ptt_key: PttKey,
     pub toggle_shortcut: Option<String>,
     pub show_widget_shortcut: String,
@@ -64,9 +68,11 @@ impl Default for Settings {
         Self {
             // Defaults chosen with `wordfall bench` (bench/configs/bakeoff.toml, 2026-10-20).
             model: "large-v3-turbo-q8_0".into(),
-            language: Some("en".into()),
+            languages: default_languages(),
             remove_fillers: true,
-            ptt_key: PttKey::Fn,
+            format_lists: true,
+            // Windows never sees the Fn key; Right Ctrl has no other job there (Right Alt is AltGr).
+            ptt_key: if cfg!(windows) { PttKey::RightControl } else { PttKey::Fn },
             toggle_shortcut: None,
             show_widget_shortcut: "CommandOrControl+Shift+Space".into(),
             input_device: None,
@@ -93,13 +99,20 @@ impl Default for Settings {
 impl Settings {
     pub fn model_dirs(&self, data_dir: &Path) -> crate::transcribe::ModelDirs {
         crate::transcribe::ModelDirs {
-            own: data_dir.join("models"),
-            extra: self.model_folders.iter().map(std::path::PathBuf::from).collect(),
+            own: own_models_dir(data_dir),
+            extra: self.model_folders.iter().map(PathBuf::from).collect(),
         }
     }
 
     pub fn load(dir: &Path) -> Self {
-        storage::read_json(&dir.join("settings.json")).unwrap_or_default()
+        let Some(mut raw) = storage::read_json::<serde_json::Value>(&dir.join("settings.json")) else {
+            return Self::default();
+        };
+        migrate(&mut raw);
+        serde_json::from_value(raw).unwrap_or_else(|e| {
+            log::warn!("could not read settings: {e}");
+            Self::default()
+        })
     }
 
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
@@ -116,6 +129,81 @@ impl Settings {
         }
         let mut next: Settings = serde_json::from_value(current)?;
         next.input_gain = next.input_gain.clamp(0.5, 4.0);
+        let mut seen = std::collections::HashSet::new();
+        next.languages.retain(|l| whisper_rs::get_lang_id(l).is_some() && seen.insert(l.clone()));
         Ok(next)
+    }
+}
+
+/// English plus the system language, if whisper knows it (e.g. ["en", "de"] on a German Mac).
+fn default_languages() -> Vec<String> {
+    let mut langs = vec!["en".to_string()];
+    let system = sys_locale::get_locale().and_then(|l| l.split(['-', '_']).next().map(str::to_lowercase));
+    if let Some(code) = system.filter(|c| c != "en" && whisper_rs::get_lang_id(c).is_some()) {
+        langs.push(code);
+    }
+    langs
+}
+
+/// Upgrades settings written by older versions.
+fn migrate(raw: &mut serde_json::Value) {
+    let Some(obj) = raw.as_object_mut() else { return };
+    // `language` (one code, or null for automatic) became `languages`. "en" was the old
+    // default rather than a choice, so it gets the new default that includes the system language.
+    if let Some(old) = obj.remove("language") {
+        if !obj.contains_key("languages") {
+            match old.as_str() {
+                Some("en") => {}
+                Some(code) => {
+                    obj.insert("languages".into(), serde_json::json!([code]));
+                }
+                None => {
+                    obj.insert("languages".into(), serde_json::json!([]));
+                }
+            }
+        }
+    }
+}
+
+/// Models are large; on Windows they belong in the local (not roaming) app data folder.
+fn own_models_dir(data_dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let (Some(roaming), Some(local)) = (dirs::data_dir(), dirs::data_local_dir()) {
+        if let Ok(rel) = data_dir.strip_prefix(&roaming) {
+            return local.join(rel).join("models");
+        }
+    }
+    data_dir.join("models")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn migrated(v: serde_json::Value) -> Settings {
+        let mut v = v;
+        migrate(&mut v);
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn migrates_single_language() {
+        assert_eq!(migrated(json!({ "language": "de" })).languages, ["de"]);
+    }
+
+    #[test]
+    fn migrates_automatic_language() {
+        assert!(migrated(json!({ "language": null })).languages.is_empty());
+    }
+
+    #[test]
+    fn old_english_default_gets_new_default() {
+        assert_eq!(migrated(json!({ "language": "en" })).languages, default_languages());
+    }
+
+    #[test]
+    fn keeps_new_languages_field() {
+        assert_eq!(migrated(json!({ "language": "fr", "languages": ["en", "de"] })).languages, ["en", "de"]);
     }
 }

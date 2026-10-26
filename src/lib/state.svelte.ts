@@ -2,6 +2,7 @@
 // lazily-loaded collections, and keeps them fresh by listening to IPC events.
 import { api, on, type Unlisten } from './api';
 import { SILENT_LEVELS } from './levels';
+import { SYSTEM_SETTINGS } from './platform';
 import type {
   AudioDevice,
   DictEntry,
@@ -257,7 +258,7 @@ class AppState {
     try {
       await api.requestPermission(kind);
     } catch (e) {
-      this.error('System Settings did not open', e);
+      this.error(`${SYSTEM_SETTINGS} did not open`, e);
     }
   }
 

@@ -517,7 +517,7 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
                 let mut times = Vec::new();
                 let mut first = None;
                 for _ in 0..a.runs {
-                    let t = engine.transcribe(&clip.samples, cfg.language.as_deref(), prompt.as_deref(), &cfg.decode)?;
+                    let t = engine.transcribe(&clip.samples, cfg.language.as_slice(), prompt.as_deref(), &cfg.decode)?;
                     times.push(t.elapsed_ms);
                     first.get_or_insert(t);
                 }
@@ -528,7 +528,16 @@ pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
             let post_started = Instant::now();
             let rms = (clip.samples.iter().map(|s| s * s).sum::<f32>() / clip.samples.len().max(1) as f32).sqrt();
             let hypothesis = if cfg.postprocess {
-                postprocess::clean(&raw, true, Some(&dictionary), rms < 0.01).text
+                postprocess::clean(
+                    &raw,
+                    &postprocess::Options {
+                        remove_fillers: true,
+                        dictionary: Some(&dictionary),
+                        quiet_input: rms < 0.01,
+                        ..Default::default()
+                    },
+                )
+                .text
             } else {
                 raw.clone()
             };

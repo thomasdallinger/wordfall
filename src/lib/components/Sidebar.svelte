@@ -164,6 +164,7 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
+    white-space: nowrap;
   }
   .mark {
     display: inline-flex;

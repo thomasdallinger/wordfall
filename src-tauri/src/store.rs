@@ -23,6 +23,9 @@ pub struct HistoryRecord {
     pub duration_seconds: u64,
     #[serde(default)]
     pub transcription_ms: Option<u64>,
+    /// Language the dictation was recognised as (ISO 639-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     pub timestamp: String,
     /// Ground-truth transcript the user corrected or verified (benchmark "history" tier).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -469,6 +472,7 @@ pub fn make_record(text: String, raw: String, model: &str, duration_ms: u64, tra
         model: Some(model.to_string()),
         duration_seconds: ((duration_ms + 500) / 1000).max(1),
         transcription_ms: Some(transcription_ms),
+        language: None,
         timestamp: now(),
         reference: None,
         has_audio: false,

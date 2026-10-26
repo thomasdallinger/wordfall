@@ -1,3 +1,8 @@
 [env]
 # whisper.cpp's CPU-feature probes (try_run) can hang on Apple Silicon; Metal does the heavy lifting anyway.
 GGML_NATIVE = "OFF"
+
+[target.x86_64-pc-windows-msvc]
+# Link the C and C++ runtimes statically: whisper.cpp needs MSVCP140.dll, which clean Windows installs
+# lack. Tauri's own partial static runtime is switched off in tauri.windows.conf.json so the two don't clash.
+rustflags = ["-C", "target-feature=+crt-static"]

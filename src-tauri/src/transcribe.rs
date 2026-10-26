@@ -294,7 +294,37 @@ struct Loaded {
     /// Encoder context the state was last used with. whisper.cpp keeps buffers sized for it,
     /// and switching sizes on a live state corrupts later runs, so a change means a new state.
     state_audio_ctx: i32,
+    /// Separate state for language detection, pinned to a short encoder window (created on first use).
+    detect: Option<WhisperState>,
     ctx: WhisperContext,
+}
+
+/// Encoder frames used for language detection: about 5 s of audio, a sixth of the full window.
+const DETECT_AUDIO_CTX: i32 = 256;
+
+impl Loaded {
+    /// Probability per language id for the start of `audio`.
+    fn ensure_detect_state(&mut self) -> anyhow::Result<()> {
+        if self.detect.is_none() {
+            // A fresh state takes its encoder size from its first full run and keeps it, because
+            // `lang_detect` never changes it. One short silent run pins it to the small window.
+            let mut state = self.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
+            let mut warm = full_params(&DecodeOptions::default(), Some("en"), None, DETECT_AUDIO_CTX);
+            warm.set_no_speech_thold(1.0);
+            warm.set_max_len(1);
+            state.full(warm, &vec![0.0f32; 16_000]).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
+            self.detect = Some(state);
+        }
+        Ok(())
+    }
+
+    fn language_probs(&mut self, audio: &[f32], threads: usize) -> anyhow::Result<Vec<f32>> {
+        self.ensure_detect_state()?;
+        let state = self.detect.as_mut().expect("created above");
+        state.pcm_to_mel(audio, threads).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
+        let (_, probs) = state.lang_detect(0, threads).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
+        Ok(probs)
+    }
 }
 
 #[derive(Default)]
@@ -303,6 +333,8 @@ pub struct Engine {
     /// Path to the Silero VAD model, used when `DecodeOptions::vad == Silero`.
     pub silero_path: Mutex<Option<PathBuf>>,
     silero: Mutex<Option<whisper_rs::WhisperVadContext>>,
+    /// Language of the previous dictation; ambiguous clips stay in it.
+    last_language: Mutex<Option<String>>,
 }
 
 pub struct Transcript {
@@ -312,6 +344,14 @@ pub struct Transcript {
     pub confidence: f32,
     /// Audio actually sent to whisper after VAD trimming, in ms.
     pub decoded_audio_ms: u64,
+    /// Language the audio was decoded as (ISO 639-1, e.g. "de"); `None` when nothing was decoded.
+    pub language: Option<String>,
+}
+
+impl Transcript {
+    fn empty(started: Instant) -> Self {
+        Self { text: String::new(), elapsed_ms: started.elapsed().as_millis() as u64, confidence: 0.0, decoded_audio_ms: 0, language: None }
+    }
 }
 
 impl Engine {
@@ -321,6 +361,14 @@ impl Engine {
 
     pub fn unload(&self) {
         *self.loaded.lock() = None;
+    }
+
+    /// Sets up language detection ahead of the first multi-language dictation (no-op if done).
+    pub fn prepare_detection(&self) -> anyhow::Result<()> {
+        match self.loaded.lock().as_mut() {
+            Some(l) if !l.english_only => l.ensure_detect_state(),
+            _ => Ok(()),
+        }
     }
 
     pub fn load(&self, entry: &CatalogEntry, path: &Path) -> anyhow::Result<()> {
@@ -345,15 +393,17 @@ impl Engine {
         let mut warm = full_params(&opts, Some("en"), None, 0);
         warm.set_no_speech_thold(1.0);
         let _ = state.full(warm, &silence);
-        *self.loaded.lock() = Some(Loaded { id: id.to_string(), english_only, state, state_audio_ctx: 0, ctx });
+        *self.loaded.lock() = Some(Loaded { id: id.to_string(), english_only, state, state_audio_ctx: 0, detect: None, ctx });
         log::info!("loaded {id} in {:?}", started.elapsed());
         Ok(())
     }
 
+    /// `languages` are the ones the user speaks: empty = any (whisper detects), one = forced,
+    /// several = whichever of them the audio sounds most like.
     pub fn transcribe(
         &self,
         audio: &[f32],
-        language: Option<&str>,
+        languages: &[String],
         prompt: Option<&str>,
         opts: &DecodeOptions,
     ) -> anyhow::Result<Transcript> {
@@ -371,18 +421,14 @@ impl Engine {
                     speech = s;
                     &speech[..]
                 }
-                None => {
-                    return Ok(Transcript { text: String::new(), elapsed_ms: started.elapsed().as_millis() as u64, confidence: 0.0, decoded_audio_ms: 0 })
-                }
+                None => return Ok(Transcript::empty(started)),
             },
             Vad::Energy => match crate::vad::trim(audio) {
                 Some(range) => {
                     trimmed = audio[range].to_vec();
                     &trimmed[..]
                 }
-                None => {
-                    return Ok(Transcript { text: String::new(), elapsed_ms: started.elapsed().as_millis() as u64, confidence: 0.0, decoded_audio_ms: 0 })
-                }
+                None => return Ok(Transcript::empty(started)),
             },
             _ => audio,
         };
@@ -396,14 +442,38 @@ impl Engine {
             audio
         };
 
-        let lang = if loaded.english_only { Some("en") } else { language.or(Some("auto")) };
         let audio_ctx = audio_ctx_for(opts, audio.len());
         if audio_ctx != loaded.state_audio_ctx {
             loaded.state = loaded.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
             loaded.state_audio_ctx = audio_ctx;
         }
-        let params = full_params(opts, lang, prompt, audio_ctx);
+        let lang: String = match languages {
+            _ if loaded.english_only => "en".into(),
+            [] => "auto".into(),
+            [one] => one.clone(),
+            several => {
+                // Like whisper's own "auto", but on a short window and only the user's languages compete.
+                let probs = loaded.language_probs(audio, thread_count(opts) as usize)?;
+                let prob = |code: &str| whisper_rs::get_lang_id(code).and_then(|id| probs.get(id as usize).copied()).unwrap_or(0.0);
+                let previous = self.last_language.lock().clone();
+                let chosen = pick_language(several, previous.as_deref(), prob).to_string();
+                log::info!(
+                    "language {chosen} ({})",
+                    several.iter().map(|l| format!("{l} {:.2}", prob(l))).collect::<Vec<_>>().join(", ")
+                );
+                chosen
+            }
+        };
+        let params = full_params(opts, Some(lang.as_str()), prompt, audio_ctx);
         loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
+        let language = if lang == "auto" {
+            whisper_rs::get_lang_str(loaded.state.full_lang_id_from_state()).map(str::to_string)
+        } else {
+            Some(lang)
+        };
+        if language.is_some() {
+            self.last_language.lock().clone_from(&language);
+        }
 
         let mut text = String::new();
         let (mut prob_sum, mut prob_n) = (0.0f32, 0usize);
@@ -430,6 +500,7 @@ impl Engine {
             elapsed_ms: started.elapsed().as_millis() as u64,
             confidence: if prob_n > 0 { prob_sum / prob_n as f32 } else { 0.0 },
             decoded_audio_ms: (audio.len() / 16) as u64,
+            language,
         })
     }
 }
@@ -485,6 +556,28 @@ fn audio_ctx_for(opts: &DecodeOptions, samples: usize) -> i32 {
     ((frames / 64.0).ceil() * 64.0).clamp(128.0, 1500.0) as i32
 }
 
+fn thread_count(opts: &DecodeOptions) -> i32 {
+    if opts.threads > 0 {
+        opts.threads
+    } else {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(4) as i32
+    }
+}
+
+/// The most likely of `allowed`, except that an ambiguous clip (e.g. a one-word "OK")
+/// stays in the previous dictation's language: switching needs twice its probability.
+pub fn pick_language<'a>(allowed: &'a [String], previous: Option<&str>, prob: impl Fn(&str) -> f32) -> &'a str {
+    let best = allowed
+        .iter()
+        .max_by(|a, b| prob(a).total_cmp(&prob(b)))
+        .map(String::as_str)
+        .unwrap_or("en");
+    match previous.and_then(|p| allowed.iter().find(|l| *l == p)) {
+        Some(prev) if prob(prev) * 2.0 >= prob(best) => prev,
+        _ => best,
+    }
+}
+
 fn full_params<'a, 'b>(opts: &DecodeOptions, lang: Option<&'a str>, prompt: Option<&str>, audio_ctx: i32) -> FullParams<'a, 'b> {
     let strategy = if opts.beam_size > 1 {
         SamplingStrategy::BeamSearch { beam_size: opts.beam_size, patience: -1.0 }
@@ -492,12 +585,7 @@ fn full_params<'a, 'b>(opts: &DecodeOptions, lang: Option<&'a str>, prompt: Opti
         SamplingStrategy::Greedy { best_of: 1 }
     };
     let mut p = FullParams::new(strategy);
-    let threads = if opts.threads > 0 {
-        opts.threads
-    } else {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(4) as i32
-    };
-    p.set_n_threads(threads);
+    p.set_n_threads(thread_count(opts));
     p.set_translate(false);
     p.set_language(lang);
     p.set_no_context(true);
@@ -518,4 +606,42 @@ fn full_params<'a, 'b>(opts: &DecodeOptions, lang: Option<&'a str>, prompt: Opti
         p.set_initial_prompt(prompt);
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn langs(codes: &[&str]) -> Vec<String> {
+        codes.iter().map(|c| c.to_string()).collect()
+    }
+
+    fn probs(pairs: &'static [(&'static str, f32)]) -> impl Fn(&str) -> f32 {
+        move |code| pairs.iter().find(|(c, _)| *c == code).map(|(_, p)| *p).unwrap_or(0.0)
+    }
+
+    #[test]
+    fn picks_most_likely_allowed_language() {
+        // Dutch scores highest but isn't one of the user's languages.
+        let allowed = langs(&["en", "de"]);
+        assert_eq!(pick_language(&allowed, None, probs(&[("nl", 0.6), ("de", 0.3), ("en", 0.1)])), "de");
+    }
+
+    #[test]
+    fn clear_switch_leaves_previous_language() {
+        let allowed = langs(&["en", "de"]);
+        assert_eq!(pick_language(&allowed, Some("en"), probs(&[("de", 0.95), ("en", 0.03)])), "de");
+    }
+
+    #[test]
+    fn ambiguous_clip_keeps_previous_language() {
+        let allowed = langs(&["en", "de"]);
+        assert_eq!(pick_language(&allowed, Some("de"), probs(&[("en", 0.5), ("de", 0.3)])), "de");
+    }
+
+    #[test]
+    fn previous_language_outside_the_set_is_ignored() {
+        let allowed = langs(&["en", "de"]);
+        assert_eq!(pick_language(&allowed, Some("fr"), probs(&[("en", 0.4), ("de", 0.5)])), "de");
+    }
 }

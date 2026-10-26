@@ -1,16 +1,10 @@
-//! Push-to-talk listener: a listen-only CGEventTap on its own run loop thread feeds
+//! Push-to-talk listener: a platform key listener (see `platform::run_key_listener`) feeds
 //! key transitions into a small state machine (hold, tap, double-tap latch, combos).
 
-use core_foundation::{
-    base::TCFType,
-    mach_port::{CFMachPort, CFMachPortRef},
-    runloop::{kCFRunLoopCommonModes, CFRunLoop},
-};
 use parking_lot::Mutex;
 use std::{
-    ffi::c_void,
     sync::{
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc,
     },
@@ -18,50 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::settings::PttKey;
-
-type CGEventRef = *mut c_void;
-type CGEventTapProxy = *mut c_void;
-type TapCallback = extern "C" fn(CGEventTapProxy, u32, CGEventRef, *mut c_void) -> CGEventRef;
-
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, cb: TapCallback, info: *mut c_void) -> CFMachPortRef;
-    fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
-    fn CGEventGetFlags(event: CGEventRef) -> u64;
-    fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
-    fn CGPreflightListenEventAccess() -> bool;
-}
-
-const SESSION_TAP: u32 = 1;
-const HEAD_INSERT: u32 = 0;
-const LISTEN_ONLY: u32 = 1;
-const KEY_DOWN: u32 = 10;
-const KEY_UP: u32 = 11;
-const FLAGS_CHANGED: u32 = 12;
-const TAP_DISABLED_TIMEOUT: u32 = 0xFFFF_FFFE;
-const TAP_DISABLED_INPUT: u32 = 0xFFFF_FFFF;
-const FIELD_KEYCODE: u32 = 9;
-const FIELD_AUTOREPEAT: u32 = 8;
-const KEYCODE_ESCAPE: i64 = 53;
+use crate::{platform, settings::PttKey};
 
 const TAP_MAX: Duration = Duration::from_millis(250);
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 const COMBO_WINDOW: Duration = Duration::from_millis(1000);
 
-/// (keycodes, flag mask that is set while the key is down)
-fn key_spec(key: PttKey) -> Option<(&'static [i64], u64)> {
-    match key {
-        PttKey::Fn => Some((&[63, 179], 0x0080_0000)),
-        PttKey::RightOption => Some((&[61], 0x0000_0040)),
-        PttKey::RightCommand => Some((&[54], 0x0000_0010)),
-        PttKey::RightControl => Some((&[62], 0x0000_2000)),
-        PttKey::RightShift => Some((&[60], 0x0000_0004)),
-        PttKey::None => None,
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Input {
     PttDown,
     PttUp,
@@ -79,48 +36,39 @@ pub enum Action {
     Escape,
 }
 
-struct TapContext {
-    tx: Sender<Input>,
+/// The sink a platform key listener reports into. Lives for the whole process.
+pub struct KeyEvents {
+    tx: Mutex<Sender<Input>>,
     key: Arc<Mutex<PttKey>>,
     held: AtomicBool,
-    port: AtomicPtr<c_void>,
 }
 
-extern "C" fn tap_callback(_proxy: CGEventTapProxy, etype: u32, event: CGEventRef, info: *mut c_void) -> CGEventRef {
-    let ctx = unsafe { &*(info as *const TapContext) };
-    match etype {
-        TAP_DISABLED_TIMEOUT | TAP_DISABLED_INPUT => {
-            let port = ctx.port.load(Ordering::Relaxed);
-            if !port.is_null() {
-                unsafe { CGEventTapEnable(port as CFMachPortRef, true) };
-            }
-        }
-        FLAGS_CHANGED => {
-            let Some((codes, mask)) = key_spec(*ctx.key.lock()) else { return event };
-            let code = unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) };
-            let flags = unsafe { CGEventGetFlags(event) };
-            if codes.contains(&code) {
-                let down = flags & mask != 0;
-                let was = ctx.held.swap(down, Ordering::Relaxed);
-                if down != was {
-                    let _ = ctx.tx.send(if down { Input::PttDown } else { Input::PttUp });
-                }
-            } else if ctx.held.load(Ordering::Relaxed) {
-                let _ = ctx.tx.send(Input::OtherKey);
-            }
-        }
-        KEY_DOWN => {
-            let code = unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) };
-            let repeat = unsafe { CGEventGetIntegerValueField(event, FIELD_AUTOREPEAT) } != 0;
-            if code == KEYCODE_ESCAPE {
-                let _ = ctx.tx.send(Input::Escape);
-            } else if !repeat && ctx.held.load(Ordering::Relaxed) {
-                let _ = ctx.tx.send(Input::OtherKey);
-            }
-        }
-        _ => {}
+impl KeyEvents {
+    pub fn key(&self) -> PttKey {
+        *self.key.lock()
     }
-    event
+
+    /// The push-to-talk key went down or up (repeats are ignored).
+    pub fn ptt(&self, down: bool) {
+        if self.held.swap(down, Ordering::Relaxed) != down {
+            self.send(if down { Input::PttDown } else { Input::PttUp });
+        }
+    }
+
+    /// Any other key went down; only matters while the push-to-talk key is held.
+    pub fn other_key(&self) {
+        if self.held.load(Ordering::Relaxed) {
+            self.send(Input::OtherKey);
+        }
+    }
+
+    pub fn escape(&self) {
+        self.send(Input::Escape);
+    }
+
+    fn send(&self, input: Input) {
+        let _ = self.tx.lock().send(input);
+    }
 }
 
 pub struct Listener {
@@ -134,10 +82,9 @@ impl Listener {
     }
 }
 
-/// Starts the tap thread (retrying until Input Monitoring is granted) and the state
-/// machine thread. `is_active` reports whether a recording session is running (so the
-/// machine resyncs after the widget or a shortcut ended it); `on_action` runs on the
-/// state machine thread.
+/// Starts the platform key listener thread and the state machine thread. `is_active`
+/// reports whether a recording session is running (so the machine resyncs after the
+/// widget or a shortcut ended it); `on_action` runs on the state machine thread.
 pub fn spawn(
     initial: PttKey,
     is_active: impl Fn() -> bool + Send + 'static,
@@ -147,18 +94,13 @@ pub fn spawn(
     let installed = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
 
-    let ctx = Box::leak(Box::new(TapContext {
-        tx,
-        key: key.clone(),
-        held: AtomicBool::new(false),
-        port: AtomicPtr::new(std::ptr::null_mut()),
-    }));
-    let ctx_addr = ctx as *const TapContext as usize;
+    let events: &'static KeyEvents =
+        Box::leak(Box::new(KeyEvents { tx: Mutex::new(tx), key: key.clone(), held: AtomicBool::new(false) }));
     let inst = installed.clone();
     thread::Builder::new()
-        .name("wordfall-event-tap".into())
-        .spawn(move || run_tap(ctx_addr, inst))
-        .expect("spawn event tap thread");
+        .name("wordfall-key-listener".into())
+        .spawn(move || platform::run_key_listener(events, inst))
+        .expect("spawn key listener thread");
 
     thread::Builder::new()
         .name("wordfall-ptt".into())
@@ -166,37 +108,6 @@ pub fn spawn(
         .expect("spawn ptt thread");
 
     Listener { key, installed }
-}
-
-fn run_tap(ctx_addr: usize, installed: Arc<AtomicBool>) {
-    let ctx = unsafe { &*(ctx_addr as *const TapContext) };
-    let mask = (1u64 << KEY_DOWN) | (1u64 << KEY_UP) | (1u64 << FLAGS_CHANGED);
-    loop {
-        // Without Input Monitoring the tap is created but silently receives nothing,
-        // so wait for the grant (the onboarding asks for it) before installing.
-        if !unsafe { CGPreflightListenEventAccess() } {
-            thread::sleep(Duration::from_secs(1));
-            continue;
-        }
-        let port = unsafe { CGEventTapCreate(SESSION_TAP, HEAD_INSERT, LISTEN_ONLY, mask, tap_callback, ctx_addr as *mut c_void) };
-        if port.is_null() {
-            // Input Monitoring not granted yet; try again shortly.
-            thread::sleep(Duration::from_secs(2));
-            continue;
-        }
-        ctx.port.store(port as *mut c_void, Ordering::Relaxed);
-        let mach = unsafe { CFMachPort::wrap_under_create_rule(port) };
-        let source = mach.create_runloop_source(0).expect("run loop source");
-        let run_loop = CFRunLoop::get_current();
-        run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
-        unsafe { CGEventTapEnable(port, true) };
-        installed.store(true, Ordering::Relaxed);
-        log::info!("push-to-talk listener installed");
-        CFRunLoop::run_current();
-        installed.store(false, Ordering::Relaxed);
-        log::warn!("event tap run loop exited; reinstalling");
-        thread::sleep(Duration::from_secs(1));
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -210,23 +121,24 @@ enum Phase {
     StopOnRelease,
 }
 
-fn state_machine(rx: Receiver<Input>, is_active: impl Fn() -> bool, on_action: impl Fn(Action)) {
-    let mut phase = Phase::Idle;
-    let mut last_tap_up: Option<Instant> = None;
-    loop {
-        let input = match rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(i) => i,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return,
-        };
-        let now = Instant::now();
-        if matches!(phase, Phase::Latched) && !is_active() {
-            phase = Phase::Idle;
+struct Machine {
+    phase: Phase,
+    last_tap_up: Option<Instant>,
+}
+
+impl Machine {
+    fn new() -> Self {
+        Self { phase: Phase::Idle, last_tap_up: None }
+    }
+
+    fn step(&mut self, input: Input, now: Instant, active: bool, on_action: &impl Fn(Action)) {
+        if matches!(self.phase, Phase::Latched) && !active {
+            self.phase = Phase::Idle;
         }
-        phase = match (phase, input) {
+        self.phase = match (self.phase, input) {
             (Phase::Idle, Input::PttDown) => {
-                let double = last_tap_up.is_some_and(|t| now.duration_since(t) <= DOUBLE_TAP_WINDOW);
-                last_tap_up = None;
+                let double = self.last_tap_up.is_some_and(|t| now.duration_since(t) <= DOUBLE_TAP_WINDOW);
+                self.last_tap_up = None;
                 on_action(if double { Action::Latch } else { Action::StartHold });
                 Phase::Holding { since: now, latch: double }
             }
@@ -234,14 +146,14 @@ fn state_machine(rx: Receiver<Input>, is_active: impl Fn() -> bool, on_action: i
             (Phase::Holding { since, latch: false }, Input::PttUp) => {
                 if now.duration_since(since) < TAP_MAX {
                     on_action(Action::Cancel);
-                    last_tap_up = Some(now);
+                    self.last_tap_up = Some(now);
                 } else {
                     on_action(Action::Stop);
                 }
                 Phase::Idle
             }
             (Phase::Holding { since, .. }, Input::OtherKey) if now.duration_since(since) < COMBO_WINDOW => {
-                // Fn+key shortcut (brightness, arrows, …), not dictation.
+                // Modifier+key shortcut (brightness, arrows, copy, …), not dictation.
                 on_action(Action::Cancel);
                 Phase::Idle
             }
@@ -256,5 +168,78 @@ fn state_machine(rx: Receiver<Input>, is_active: impl Fn() -> bool, on_action: i
             }
             (p, _) => p,
         };
+    }
+}
+
+fn state_machine(rx: Receiver<Input>, is_active: impl Fn() -> bool, on_action: impl Fn(Action)) {
+    let mut machine = Machine::new();
+    loop {
+        let input = match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(i) => i,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        machine.step(input, Instant::now(), is_active(), &on_action);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Feeds (input, ms since start) pairs and returns the actions fired.
+    fn run(inputs: &[(Input, u64)]) -> Vec<Action> {
+        let t0 = Instant::now();
+        let fired = RefCell::new(Vec::new());
+        let mut m = Machine::new();
+        for &(input, ms) in inputs {
+            m.step(input, t0 + Duration::from_millis(ms), true, &|a| fired.borrow_mut().push(a));
+        }
+        fired.into_inner()
+    }
+
+    #[test]
+    fn hold_starts_and_release_stops() {
+        assert_eq!(run(&[(Input::PttDown, 0), (Input::PttUp, 900)]), vec![Action::StartHold, Action::Stop]);
+    }
+
+    #[test]
+    fn quick_tap_cancels() {
+        assert_eq!(run(&[(Input::PttDown, 0), (Input::PttUp, 100)]), vec![Action::StartHold, Action::Cancel]);
+    }
+
+    #[test]
+    fn double_tap_latches_until_next_press() {
+        let actions = run(&[
+            (Input::PttDown, 0),
+            (Input::PttUp, 100),
+            (Input::PttDown, 300),
+            (Input::PttUp, 400),
+            (Input::PttDown, 5000),
+            (Input::PttUp, 5100),
+        ]);
+        assert_eq!(actions, vec![Action::StartHold, Action::Cancel, Action::Latch, Action::Stop]);
+    }
+
+    #[test]
+    fn combo_with_other_key_cancels() {
+        assert_eq!(
+            run(&[(Input::PttDown, 0), (Input::OtherKey, 200), (Input::PttUp, 600)]),
+            vec![Action::StartHold, Action::Cancel]
+        );
+    }
+
+    #[test]
+    fn key_events_ignore_repeats_and_unheld_keys() {
+        let (tx, rx) = mpsc::channel();
+        let ev = KeyEvents { tx: Mutex::new(tx), key: Arc::new(Mutex::new(PttKey::RightControl)), held: AtomicBool::new(false) };
+        ev.other_key();
+        ev.ptt(true);
+        ev.ptt(true);
+        ev.other_key();
+        ev.ptt(false);
+        let got: Vec<String> = rx.try_iter().map(|i| format!("{i:?}")).collect();
+        assert_eq!(got, ["PttDown", "OtherKey", "PttUp"]);
     }
 }

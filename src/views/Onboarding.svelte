@@ -8,6 +8,7 @@
   import { api, on } from '../lib/api';
   import { PRODUCT } from '../lib/brand';
   import { acceleratorParts, pttCap } from '../lib/format';
+  import { IS_WINDOWS, SYSTEM_SETTINGS, THIS_DEVICE } from '../lib/platform';
   import { app } from '../lib/state.svelte';
   import type { HistoryRecord, PermissionKind } from '../lib/types';
 
@@ -15,11 +16,12 @@
   let step = $state(0);
   let heading: HTMLHeadingElement | undefined = $state();
 
+  // Windows only asks for the microphone; typing and key listening need no grant there.
   const PERMISSIONS: { kind: PermissionKind; label: string; help: string }[] = [
     { kind: 'microphone', label: 'Microphone', help: 'Hears you while you hold the key.' },
     { kind: 'accessibility', label: 'Accessibility', help: 'Types the text where your cursor is.' },
     { kind: 'inputMonitoring', label: 'Input Monitoring', help: 'Notices the dictation key from any app.' },
-  ];
+  ].filter((p) => !IS_WINDOWS || p.kind === 'microphone') as { kind: PermissionKind; label: string; help: string }[];
 
   function granted(kind: PermissionKind) {
     const p = app.snapshot?.permissions;
@@ -94,11 +96,19 @@
 
     <section class="body" aria-labelledby="setup-heading">
       {#if step === 0}
-        <h1 id="setup-heading" tabindex="-1" bind:this={heading}>Three switches in System Settings</h1>
-        <p class="lead">
-          Each button opens the right page in System Settings. Turn {PRODUCT} on there and come back; this page notices
-          by itself.
-        </p>
+        {#if IS_WINDOWS}
+          <h1 id="setup-heading" tabindex="-1" bind:this={heading}>Microphone access</h1>
+          <p class="lead">
+            {PRODUCT} needs the microphone. If it's turned off, the button opens {SYSTEM_SETTINGS}; turn microphone access
+            on for desktop apps and come back. This page notices by itself.
+          </p>
+        {:else}
+          <h1 id="setup-heading" tabindex="-1" bind:this={heading}>Three switches in System Settings</h1>
+          <p class="lead">
+            Each button opens the right page in System Settings. Turn {PRODUCT} on there and come back; this page notices
+            by itself.
+          </p>
+        {/if}
         <ul class="list">
           {#each PERMISSIONS as p (p.kind)}
             {@const ok = granted(p.kind)}
@@ -117,7 +127,7 @@
         </ul>
       {:else if step === 1}
         <h1 id="setup-heading" tabindex="-1" bind:this={heading}>Pick a speech model</h1>
-        <p class="lead">It runs on this Mac, so it needs a one-time download. You can switch any time in Settings.</p>
+        <p class="lead">It runs on {THIS_DEVICE}, so it needs a one-time download. You can switch any time in Settings.</p>
         <div class="models"><ModelList /></div>
       {:else}
         <h1 id="setup-heading" tabindex="-1" bind:this={heading}>Try it</h1>

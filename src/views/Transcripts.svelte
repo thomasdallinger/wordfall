@@ -5,6 +5,7 @@
   import Menu from '../lib/components/Menu.svelte';
   import Page from '../lib/components/Page.svelte';
   import TranscriptEntry from '../lib/components/TranscriptEntry.svelte';
+  import { primaryMod } from '../lib/platform';
   import { api } from '../lib/api';
   import { dayKey, dayLabel, formatNumber, plural, pttCap } from '../lib/format';
   import { app } from '../lib/state.svelte';
@@ -160,7 +161,7 @@
 
 <svelte:window
   onkeydown={(e) => {
-    if (e.metaKey && e.key === 'f') {
+    if (primaryMod(e) && e.key === 'f') {
       e.preventDefault();
       search?.focus();
       search?.select();

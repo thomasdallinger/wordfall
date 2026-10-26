@@ -6,6 +6,7 @@
   import Switch from '../../lib/components/Switch.svelte';
   import { api } from '../../lib/api';
   import { formatNumber, plural } from '../../lib/format';
+  import { THIS_DEVICE } from '../../lib/platform';
   import { app } from '../../lib/state.svelte';
   import type { BenchInfo, PromptMode } from '../../lib/types';
 
@@ -48,7 +49,7 @@
     <Row
       id="acc-keep"
       label="Keep recordings"
-      help="Saves the audio of each dictation on this Mac, so a corrected transcript can be used to measure accuracy. The newest 1,000 are kept."
+      help="Saves the audio of each dictation on {THIS_DEVICE}, so a corrected transcript can be used to measure accuracy. The newest 1,000 are kept."
     >
       <Switch labelledby="acc-keep" checked={s.keepAudio} onchange={(v) => app.updateSettings({ keepAudio: v })} />
       {#snippet below()}

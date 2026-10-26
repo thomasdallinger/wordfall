@@ -3,7 +3,9 @@
 // download and permission flows so every screen can be exercised.
 //
 // URL flags (dev only): ?perm=missing  ?mic=denied  ?fn=bad  ?onboarding=1  ?model=loading  ?ptt=unavailable  ?empty=1
+//                       ?platform=windows (see platform.ts)
 import { PRODUCT } from './brand';
+import { IS_WINDOWS } from './platform';
 import type {
   AudioDevice,
   BenchInfo,
@@ -49,9 +51,10 @@ const empty = params.get('empty') === '1';
 
 const settings: Settings = {
   model: 'distil-large-v3.5',
-  language: null,
+  languages: ['en', 'de'],
   removeFillers: true,
-  pttKey: 'fn',
+  formatLists: true,
+  pttKey: IS_WINDOWS ? 'right_control' : 'fn',
   toggleShortcut: 'Alt+Space',
   showWidgetShortcut: 'CommandOrControl+Shift+Space',
   inputDevice: null,
@@ -114,7 +117,13 @@ const models: ModelInfo[] = [
   },
 ];
 
+/** Rough stand-in for whisper's language detection, so mock records carry a language. */
+const guessLanguage = (text: string) => (/[äöüß]|\b(?:ich|und|wir|nicht|bitte)\b/i.test(text) ? 'de' : 'en');
+
 const SAMPLE_TEXTS = [
+  'Für morgen:\n1. Die Präsentation fertig machen\n2. Anna anrufen\n3. Milch kaufen',
+  'Kannst du mir bitte bis Freitag die Zahlen für das dritte Quartal schicken?',
+  'Release checklist:\n- Bump the version\n- Update the changelog\n- Tag the build',
   "Let's move the retry logic into its own module so the upload worker and the sync worker can share it, and add a test for the backoff.",
   'Thanks, that works.',
   'Can you check why the build takes four minutes now? It was under ninety seconds last week, so something in the dependency cache must have changed.',
@@ -157,6 +166,7 @@ function makeHistory(): HistoryRecord[] {
       text,
       raw_text: text,
       model: 'distil-large-v3.5',
+      language: guessLanguage(text),
       word_count: wc,
       duration_seconds: Math.max(1, Math.round(wc / 2.2)),
       transcription_ms: 300 + ((i * 97) % 900),
@@ -422,7 +432,7 @@ function stop() {
     }
     const text = SAMPLE_TEXTS[Math.floor(Math.random() * SAMPLE_TEXTS.length)];
     const record: HistoryRecord = {
-      id: uid(), text, raw_text: text, model: settings.model, word_count: words(text),
+      id: uid(), text, raw_text: text, model: settings.model, language: guessLanguage(text), word_count: words(text),
       duration_seconds: Math.max(1, Math.round(secs)), transcription_ms: 640,
       timestamp: new Date().toISOString(),
       has_audio: settings.keepAudio,

@@ -3,6 +3,7 @@
   import Row from '../../lib/components/Row.svelte';
   import Section from '../../lib/components/Section.svelte';
   import { PRODUCT } from '../../lib/brand';
+  import { IS_WINDOWS, THIS_DEVICE } from '../../lib/platform';
   import { app } from '../../lib/state.svelte';
 </script>
 
@@ -15,7 +16,7 @@
     </div>
   </div>
   <p class="blurb">
-    Push-to-talk dictation for macOS. Your voice is turned into text on this Mac and is never uploaded.
+    Push-to-talk dictation for {IS_WINDOWS ? 'Windows' : 'macOS'}. Your voice is turned into text on {THIS_DEVICE} and is never uploaded.
   </p>
   <Row label="Setup" help="Go through permissions, the model and a practice run again.">
     <button class="btn" onclick={() => app.updateSettings({ onboardingDone: false })}>Run setup again</button>

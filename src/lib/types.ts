@@ -10,8 +10,11 @@ export type PromptMode = 'none' | 'dictionary' | 'projects' | 'glossary';
 
 export interface Settings {
   model: string;
-  language: string | null;
+  /** Languages the user dictates in (ISO 639-1). Empty = any; several = detected per dictation among them. */
+  languages: string[];
   removeFillers: boolean;
+  /** Turn spoken enumerations ("first … second …", "bullet point …") into lists. */
+  formatLists: boolean;
   pttKey: PttKey;
   toggleShortcut: string | null;
   showWidgetShortcut: string;
@@ -44,6 +47,8 @@ export interface HistoryRecord {
   word_count: number;
   duration_seconds: number;
   transcription_ms: number | null;
+  /** Language the dictation was recognised as (ISO 639-1). Omitted for older records. */
+  language?: string | null;
   timestamp: string;
   /** Benchmark ground truth, set once the user corrected or verified it. Omitted when unset. */
   reference?: string | null;

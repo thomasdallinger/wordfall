@@ -1,6 +1,7 @@
 <script lang="ts">
   import { PRODUCT } from '../brand';
   import { pttCap } from '../format';
+  import { SYSTEM_SETTINGS } from '../platform';
   import { app } from '../state.svelte';
   import type { PermissionKind } from '../types';
 
@@ -44,7 +45,7 @@
         tone: kind === 'microphone' ? 'bad' : 'warn',
         text,
         action: {
-          label: waiting === kind ? 'Waiting for System Settings…' : `Allow ${kind === 'microphone' ? 'microphone' : PERMISSION_NAMES[kind]}`,
+          label: waiting === kind ? `Waiting for ${SYSTEM_SETTINGS}…` : `Allow ${kind === 'microphone' ? 'microphone' : PERMISSION_NAMES[kind]}`,
           run: () => allow(kind),
         },
       };

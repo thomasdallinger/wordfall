@@ -1,4 +1,4 @@
-//! Transcript cleanup: whisper artifacts, hallucinations, filler words, dictionary.
+//! Transcript cleanup: whisper artifacts, hallucinations, filler words, dictionary, lists.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -7,7 +7,15 @@ use crate::store::DictEntry;
 
 static ANNOTATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\[(?:blank_audio|music|silence|inaudible|no speech)[^\]]*\]|\((?:music|silence|inaudible|laughs|applause)[^)]*\)|\*[^*]{0,30}\*").unwrap());
-static FILLER_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:u+m+|u+h+|e+r+m+|a+h+|h+m+|m+h*m+)$").unwrap());
+/// Hesitations in any language: uh, hmm, mhm, ähm, äh, öhm, ehm.
+static FILLER_WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(?:u+h+|a+h+|h+m+|m+h*m+|ä+h+m*|ö+h*m+|ö+h+|e+h+m+)$").unwrap());
+/// Hesitations that are real words elsewhere ("um" is German for "at"/"around", Portuguese "a").
+static FILLER_WORD_EN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:u+m+|e+r+m+)$").unwrap());
+/// Credits Whisper invents from subtitled training data, mostly at the end of German clips.
+static SUBTITLE_CREDIT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\s*\b(?:untertitel(?:ung)?\b[^.!?]*\b(?:zdf|amara\.org|swr|ard)\b[^.!?]*|subtitles by the amara\.org community)[.!?]?").unwrap()
+});
 static MULTISPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]{2,}").unwrap());
 static SPACE_BEFORE_PUNCT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+([,.;:!?])").unwrap());
 static DOUBLE_COMMA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",\s*([,.!?])").unwrap());
@@ -17,6 +25,8 @@ const HALLUCINATIONS: &[&str] = &[
     "thank you.", "thank you", "thanks for watching!", "thanks for watching.", "thank you for watching.",
     "you", "you.", "bye.", "bye!", "so", "okay.", "subtitles by the amara.org community",
     ".", "...", "i'm sorry.", "thank you very much.",
+    "vielen dank.", "vielen dank", "danke.", "danke schön.", "tschüss.", "bis zum nächsten mal.",
+    "vielen dank fürs zuschauen.", "vielen dank für's zuschauen!",
 ];
 
 pub struct Cleaned {
@@ -25,18 +35,30 @@ pub struct Cleaned {
     pub dropped_as_hallucination: bool,
 }
 
-pub fn clean(raw: &str, remove_fillers: bool, dictionary: Option<&[DictEntry]>, quiet_input: bool) -> Cleaned {
+#[derive(Default)]
+pub struct Options<'a> {
+    pub remove_fillers: bool,
+    pub format_lists: bool,
+    /// Language the text is in (ISO 639-1), if known; picks which filler words apply.
+    pub language: Option<&'a str>,
+    pub dictionary: Option<&'a [DictEntry]>,
+    /// The recording was near-silent, so stock phrases are likely invented.
+    pub quiet_input: bool,
+}
+
+pub fn clean(raw: &str, opts: &Options) -> Cleaned {
     let mut text = ANNOTATION.replace_all(raw, " ").to_string();
+    text = SUBTITLE_CREDIT.replace_all(&text, " ").to_string();
     text = text.replace('\n', " ");
     text = MULTISPACE.replace_all(text.trim(), " ").to_string();
 
     let lowered = text.to_lowercase();
-    if quiet_input && HALLUCINATIONS.contains(&lowered.as_str()) {
+    if opts.quiet_input && HALLUCINATIONS.contains(&lowered.as_str()) {
         return Cleaned { text: String::new(), dropped_as_hallucination: true };
     }
 
-    if remove_fillers {
-        text = strip_fillers(&text);
+    if opts.remove_fillers {
+        text = strip_fillers(&text, opts.language);
         text = DOUBLE_COMMA.replace_all(&text, "$1").to_string();
         text = text.trim_start_matches([',', ' ', '.']).to_string();
         text = MULTISPACE.replace_all(text.trim(), " ").to_string();
@@ -44,19 +66,29 @@ pub fn clean(raw: &str, remove_fillers: bool, dictionary: Option<&[DictEntry]>, 
         text = capitalize_first(&text);
     }
 
-    if let Some(dict) = dictionary {
+    if let Some(dict) = opts.dictionary {
         text = apply_dictionary(&text, dict);
+    }
+
+    if opts.format_lists {
+        text = crate::lists::format(text.trim());
     }
 
     Cleaned { text: text.trim().to_string(), dropped_as_hallucination: false }
 }
 
-/// Drops filler tokens; sentence-ending punctuation on a dropped filler moves to the previous word.
-fn strip_fillers(text: &str) -> String {
+/// Drops filler tokens; sentence-ending punctuation on a dropped filler moves to the previous word,
+/// and a sentence that started with a filler starts with a capital again.
+fn strip_fillers(text: &str, language: Option<&str>) -> String {
+    let english_fillers = matches!(language, None | Some("en"));
+    let is_filler = |core: &str| FILLER_WORD.is_match(core) || (english_fillers && FILLER_WORD_EN.is_match(core));
     let mut kept: Vec<String> = Vec::new();
+    let mut capitalize_next = false;
     for token in text.split_whitespace() {
         let core = token.trim_matches(|c: char| !c.is_alphanumeric());
-        if !core.is_empty() && FILLER_WORD.is_match(core) {
+        if !core.is_empty() && is_filler(core) {
+            let starts_sentence = kept.last().is_none_or(|p| p.ends_with(['.', '!', '?']));
+            capitalize_next |= starts_sentence && core.starts_with(char::is_uppercase);
             let trailing: String = token.chars().rev().take_while(|c| ".!?".contains(*c)).collect();
             if !trailing.is_empty() {
                 if let Some(prev) = kept.last_mut() {
@@ -68,7 +100,7 @@ fn strip_fillers(text: &str) -> String {
             }
             continue;
         }
-        kept.push(token.to_string());
+        kept.push(if std::mem::take(&mut capitalize_next) { capitalize_first(token) } else { token.to_string() });
     }
     kept.join(" ")
 }
@@ -143,27 +175,55 @@ mod tests {
         DictEntry { id: "x".into(), original: o.into(), replacement: r.into(), created_at: String::new() }
     }
 
+    fn tidy(raw: &str, language: Option<&str>) -> String {
+        clean(raw, &Options { remove_fillers: true, language, ..Options::default() }).text
+    }
+
     #[test]
     fn strips_fillers_and_fixes_spacing() {
-        let c = clean("Um, so I think, uh, we should ship it.", true, None, false);
-        assert_eq!(c.text, "So I think, we should ship it.");
+        assert_eq!(tidy("Um, so I think, uh, we should ship it.", Some("en")), "So I think, we should ship it.");
+    }
+
+    #[test]
+    fn capitalizes_sentence_after_dropped_filler() {
+        assert_eq!(tidy("That's done. Um, next we test it.", Some("en")), "That's done. Next we test it.");
+    }
+
+    #[test]
+    fn strips_german_fillers_but_keeps_um() {
+        assert_eq!(
+            tidy("Ähm, wir treffen uns, äh, um fünf Uhr. Öhm, passt das?", Some("de")),
+            "Wir treffen uns, um fünf Uhr. Passt das?"
+        );
     }
 
     #[test]
     fn keeps_fillers_when_disabled() {
-        let c = clean("Um, hello", false, None, false);
-        assert_eq!(c.text, "Um, hello");
+        assert_eq!(clean("Um, hello", &Options::default()).text, "Um, hello");
     }
 
     #[test]
     fn removes_annotations() {
-        assert_eq!(clean("[BLANK_AUDIO] Hello there (music)", true, None, false).text, "Hello there");
+        assert_eq!(tidy("[BLANK_AUDIO] Hello there (music)", None), "Hello there");
+    }
+
+    #[test]
+    fn removes_invented_subtitle_credits() {
+        assert_eq!(tidy("Das war's für heute. Untertitel im Auftrag des ZDF, 2021", Some("de")), "Das war's für heute.");
     }
 
     #[test]
     fn drops_hallucination_only_when_quiet() {
-        assert!(clean("Thank you.", true, None, true).dropped_as_hallucination);
-        assert_eq!(clean("Thank you.", true, None, false).text, "Thank you.");
+        let quiet = |t: &str| clean(t, &Options { quiet_input: true, ..Options::default() });
+        assert!(quiet("Thank you.").dropped_as_hallucination);
+        assert!(quiet("Vielen Dank.").dropped_as_hallucination);
+        assert_eq!(clean("Thank you.", &Options::default()).text, "Thank you.");
+    }
+
+    #[test]
+    fn formats_lists_after_cleanup() {
+        let opts = Options { remove_fillers: true, format_lists: true, language: Some("en"), ..Options::default() };
+        assert_eq!(clean("Um, first, milk. Second, uh, eggs.", &opts).text, "1. Milk\n2. Eggs");
     }
 
     #[test]

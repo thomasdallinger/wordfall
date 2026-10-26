@@ -111,8 +111,12 @@ pub fn save_and_score(
 ) -> anyhow::Result<LabResult> {
     let dir = lab_dir(data_dir);
     crate::audio::write_wav_16k(&dir.join(format!("{}.wav", prompt.id)), samples)?;
-    let t = engine.transcribe(samples, None, prompt_text, decode)?;
-    let hypothesis = postprocess::clean(&t.text, true, Some(dictionary), false).text;
+    let t = engine.transcribe(samples, &[], prompt_text, decode)?;
+    let hypothesis = postprocess::clean(
+        &t.text,
+        &postprocess::Options { remove_fillers: true, language: t.language.as_deref(), dictionary: Some(dictionary), ..Default::default() },
+    )
+    .text;
     let score = metrics::score(&prompt.text, &hypothesis, &prompt.terms);
     let wer = metrics::ratio(score.word_errors, score.ref_words);
     let meta = json!({

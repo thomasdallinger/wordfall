@@ -2,6 +2,7 @@
   import { Trash2Icon } from '@lucide/svelte';
   import { api } from '../api';
   import { formatSize, shortPath } from '../format';
+  import { THIS_DEVICE } from '../platform';
   import { app } from '../state.svelte';
   import type { ModelInfo } from '../types';
 
@@ -86,7 +87,7 @@
         {:else if active}
           <span class="in-use">{app.snapshot?.modelState === 'loading' ? 'Loading…' : 'In use'}</span>
         {:else if m.source === 'app'}
-          <button class="icon-btn is-bad" title="Remove from this Mac" aria-label="Remove {m.displayName} from this Mac" onclick={() => remove(m)}>
+          <button class="icon-btn is-bad" title="Remove from {THIS_DEVICE}" aria-label="Remove {m.displayName} from {THIS_DEVICE}" onclick={() => remove(m)}>
             <Trash2Icon size={14} strokeWidth={1.5} />
           </button>
         {/if}

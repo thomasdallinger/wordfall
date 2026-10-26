@@ -26,7 +26,7 @@ pub const GLOSSARY: &[&str] = &[
     "Whisper", "Parakeet", "macOS", "iOS", "PDF", "ERP", "HTML", "CSS", "UI", "UX", "CI",
 ];
 
-const PROJECT_ROOTS: &[&str] = &["IdeaProjects", "Projects", "Developer", "code"];
+const PROJECT_ROOTS: &[&str] = &["IdeaProjects", "Projects", "Developer", "code", "source/repos"];
 const MAX_TERMS: usize = 60;
 
 /// Folder names that look like product names: single alphabetic words of 4+ letters,

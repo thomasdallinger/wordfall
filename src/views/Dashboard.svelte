@@ -1,6 +1,7 @@
 <script lang="ts">
   import Sidebar from '../lib/components/Sidebar.svelte';
   import Toaster from '../lib/components/Toaster.svelte';
+  import { IS_WINDOWS, primaryMod } from '../lib/platform';
   import { app, type View } from '../lib/state.svelte';
   import Dictionary from './Dictionary.svelte';
   import Onboarding from './Onboarding.svelte';
@@ -11,7 +12,7 @@
   const KEYS: Record<string, View> = { '1': 'transcripts', '2': 'dictionary', '3': 'settings', ',': 'settings' };
 
   function onkeydown(e: KeyboardEvent) {
-    if (!e.metaKey || e.shiftKey || e.altKey || e.ctrlKey) return;
+    if (!primaryMod(e) || e.shiftKey || e.altKey || (IS_WINDOWS ? e.metaKey : e.ctrlKey)) return;
     const view = KEYS[e.key];
     if (!view) return;
     e.preventDefault();

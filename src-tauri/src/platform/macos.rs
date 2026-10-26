@@ -1,8 +1,8 @@
 //! macOS integrations: permissions, paste injection, focus restore, Fn/Globe setting,
 //! recording cues and system-output muting.
 
-use serde::Serialize;
 use std::{
+    path::Path,
     process::Command,
     sync::atomic::{AtomicI32, Ordering},
     thread,
@@ -28,13 +28,10 @@ extern "C" {
     fn CGRequestListenEventAccess() -> bool;
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Permissions {
-    pub microphone: &'static str,
-    pub accessibility: bool,
-    pub input_monitoring: bool,
-}
+use super::{FnUsage, Permissions};
+
+/// Identifies the app to paste into: a process id.
+pub type AppRef = i32;
 
 pub fn permissions() -> Permissions {
     Permissions {
@@ -75,6 +72,7 @@ pub fn request_accessibility() {
     let key = CFString::new("AXTrustedCheckOptionPrompt");
     let dict = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())]);
     unsafe { AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef()) };
+    open_privacy_pane("Privacy_Accessibility");
 }
 
 pub fn request_input_monitoring() {
@@ -83,7 +81,7 @@ pub fn request_input_monitoring() {
     }
 }
 
-pub fn open_privacy_pane(anchor: &str) {
+fn open_privacy_pane(anchor: &str) {
     let _ = Command::new("open")
         .arg(format!("x-apple.systempreferences:com.apple.preference.security?{anchor}"))
         .spawn();
@@ -93,8 +91,8 @@ pub fn open_privacy_pane(anchor: &str) {
 
 static LAST_FOREIGN_PID: AtomicI32 = AtomicI32::new(0);
 
-/// PID of the frontmost app, unless it's Wordfall itself.
-pub fn frontmost_foreign_pid() -> Option<i32> {
+/// The frontmost app, unless it's Wordfall itself.
+pub fn frontmost_foreign_app() -> Option<AppRef> {
     let ws = NSWorkspace::sharedWorkspace();
     let app = ws.frontmostApplication()?;
     let pid = app.processIdentifier();
@@ -102,13 +100,13 @@ pub fn frontmost_foreign_pid() -> Option<i32> {
 }
 
 /// The app the user was last working in (clicking the widget can activate Wordfall).
-pub fn last_foreign_pid() -> Option<i32> {
-    frontmost_foreign_pid().or_else(|| Some(LAST_FOREIGN_PID.load(Ordering::Relaxed)).filter(|p| *p > 0))
+pub fn last_foreign_app() -> Option<AppRef> {
+    frontmost_foreign_app().or_else(|| Some(LAST_FOREIGN_PID.load(Ordering::Relaxed)).filter(|p| *p > 0))
 }
 
 pub fn spawn_focus_tracker() {
     thread::spawn(|| loop {
-        if let Some(pid) = frontmost_foreign_pid() {
+        if let Some(pid) = frontmost_foreign_app() {
             LAST_FOREIGN_PID.store(pid, Ordering::Relaxed);
         }
         thread::sleep(Duration::from_millis(300));
@@ -123,7 +121,7 @@ fn wordfall_is_frontmost() -> bool {
 }
 
 /// If Wordfall stole focus (e.g. the widget was clicked), hand it back to `pid`.
-pub fn restore_focus(pid: Option<i32>) {
+pub fn restore_focus(pid: Option<AppRef>) {
     let Some(pid) = pid else { return };
     if !wordfall_is_frontmost() {
         return;
@@ -154,43 +152,18 @@ pub fn post_paste() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Puts `text` on the clipboard, presses ⌘V, then restores the previous clipboard text.
-pub fn paste_text(text: &str) -> anyhow::Result<()> {
-    // Synthetic ⌘V is silently dropped without Accessibility; fail so the caller keeps
-    // the text on the clipboard instead of restoring over it.
+pub fn ensure_can_paste() -> anyhow::Result<()> {
+    // Synthetic ⌘V is silently dropped without Accessibility.
     anyhow::ensure!(unsafe { AXIsProcessTrusted() }, "Wordfall needs Accessibility permission to paste");
-    let mut clipboard = arboard::Clipboard::new()?;
-    let previous = clipboard.get_text().ok();
-    clipboard.set_text(text.to_string())?;
-    thread::sleep(Duration::from_millis(40));
-    post_paste()?;
-    let ours = text.to_string();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(600));
-        if let (Ok(mut cb), Some(prev)) = (arboard::Clipboard::new(), previous) {
-            // Only restore if nobody else changed the clipboard meanwhile.
-            if cb.get_text().ok().as_deref() == Some(ours.as_str()) {
-                let _ = cb.set_text(prev);
-            }
-        }
-    });
     Ok(())
 }
 
-pub fn copy_text(text: &str) -> anyhow::Result<()> {
-    arboard::Clipboard::new()?.set_text(text.to_string())?;
-    Ok(())
+/// Opens a file or folder with its default app.
+pub fn open_path(path: &Path) -> std::io::Result<()> {
+    Command::new("open").arg(path).spawn().map(drop)
 }
 
 // ---------- Fn / Globe key system setting ----------
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FnUsage {
-    pub value: Option<i64>,
-    pub label: String,
-    pub ok: bool,
-}
 
 pub fn fn_usage() -> FnUsage {
     let out = Command::new("defaults").args(["read", "com.apple.HIToolbox", "AppleFnUsageType"]).output();

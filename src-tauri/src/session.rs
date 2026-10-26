@@ -12,7 +12,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     audio::Recording,
-    macos, postprocess,
+    platform, postprocess,
     settings::WidgetVisibility,
     store::make_record,
     transcribe::catalog_entry,
@@ -40,7 +40,7 @@ struct Active {
     id: u64,
     recording: Recording,
     mode: RecMode,
-    focus_pid: Option<i32>,
+    focus_app: Option<platform::AppRef>,
     was_muted: Option<bool>,
 }
 
@@ -85,26 +85,27 @@ pub fn start(app: &AppHandle, mode: RecMode) {
     }
     let settings = c.settings.read().clone();
     // Widget/tray clicks may have activated Wordfall; paste back into the app the user was in.
-    let focus_pid = if mode == RecMode::Click { macos::last_foreign_pid() } else { macos::frontmost_foreign_pid() };
+    let focus_app = if mode == RecMode::Click { platform::last_foreign_app() } else { platform::frontmost_foreign_app() };
     // Kick off model loading early if needed; the recording can proceed meanwhile.
     crate::ensure_model_loaded(app);
 
     if settings.sounds_enabled {
-        macos::play_cue(true);
+        platform::play_cue(true);
     }
     let recording = match Recording::start(settings.input_device.as_deref(), settings.input_gain) {
         Ok(r) => r,
         Err(e) => {
             c.sessions.starting.store(false, Ordering::SeqCst);
             log::error!("could not start recording: {e}");
-            notice(app, "error", "Microphone unavailable", &format!("{e}. Check microphone permission in System Settings."));
+            let hint = if cfg!(windows) { "Settings → Privacy & security → Microphone" } else { "System Settings" };
+            notice(app, "error", "Microphone unavailable", &format!("{e}. Check microphone permission in {hint}."));
             return;
         }
     };
     log::info!("recording ({mode:?}) from {}", recording.device_name);
-    let was_muted = settings.mute_system_audio.then(macos::mute_output);
+    let was_muted = settings.mute_system_audio.then(platform::mute_output);
     let id = c.sessions.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-    *c.sessions.active.lock() = Some(Active { id, recording, mode, focus_pid, was_muted });
+    *c.sessions.active.lock() = Some(Active { id, recording, mode, focus_app, was_muted });
     c.sessions.starting.store(false, Ordering::SeqCst);
     publish(app, RecState::Listening, Some(mode));
     spawn_level_meter(app.clone(), id);
@@ -142,7 +143,7 @@ pub fn cancel(app: &AppHandle) {
     let was_muted = active.was_muted;
     drop(active.recording.finish());
     if let Some(m) = was_muted {
-        macos::unmute_output(m);
+        platform::unmute_output(m);
     }
     let busy = c.sessions.processing.load(Ordering::SeqCst) > 0;
     publish(app, if busy { RecState::Processing } else { RecState::Idle }, None);
@@ -183,10 +184,10 @@ fn process(app: &AppHandle, active: Active) -> anyhow::Result<()> {
     let captured = active.recording.finish();
     let drain_ms = released.elapsed().as_millis() as u64;
     if let Some(m) = active.was_muted {
-        macos::unmute_output(m);
+        platform::unmute_output(m);
     }
     if settings.sounds_enabled {
-        macos::play_cue(false);
+        platform::play_cue(false);
     }
     if captured.duration < Duration::from_millis(300) || captured.samples_16k.len() < 4_000 {
         return Ok(());
@@ -207,11 +208,18 @@ fn process(app: &AppHandle, active: Active) -> anyhow::Result<()> {
         (settings.dictionary_enabled.then(|| store.dictionary.clone()), vocab::prompt(&terms))
     };
     let model_wait_ms = released.elapsed().as_millis() as u64 - drain_ms;
-    let transcript =
-        c.engine.transcribe(&captured.samples_16k, settings.language.as_deref(), prompt.as_deref(), &settings.decode)?;
+    let transcript = c.engine.transcribe(&captured.samples_16k, &settings.languages, prompt.as_deref(), &settings.decode)?;
     let post_started = std::time::Instant::now();
-    let quiet = captured.rms < 0.01;
-    let cleaned = postprocess::clean(&transcript.text, settings.remove_fillers, dictionary.as_deref(), quiet);
+    let cleaned = postprocess::clean(
+        &transcript.text,
+        &postprocess::Options {
+            remove_fillers: settings.remove_fillers,
+            format_lists: settings.format_lists,
+            language: transcript.language.as_deref(),
+            dictionary: dictionary.as_deref(),
+            quiet_input: captured.rms < 0.01,
+        },
+    );
     let post_ms = post_started.elapsed().as_millis() as u64;
     if cleaned.text.is_empty() {
         log::info!("no speech in {:.1}s clip (rms {:.4}, raw {:?})", captured.duration.as_secs_f32(), captured.rms, transcript.text);
@@ -225,20 +233,21 @@ fn process(app: &AppHandle, active: Active) -> anyhow::Result<()> {
         output.push(' ');
     }
     if settings.copy_only {
-        macos::copy_text(output.trim_end())?;
+        platform::copy_text(output.trim_end())?;
         notice(app, "success", "Copied to clipboard", "Paste it wherever you like.");
     } else {
-        macos::restore_focus(active.focus_pid);
-        if let Err(e) = macos::paste_text(&output) {
-            macos::copy_text(output.trim_end())?;
+        platform::restore_focus(active.focus_app);
+        if let Err(e) = platform::paste_text(&output) {
+            platform::copy_text(output.trim_end())?;
             notice(app, "warning", "Couldn't paste", &format!("{e}. The text is on your clipboard."));
         }
     }
 
     let paste_ms = paste_started.elapsed().as_millis() as u64;
     log::info!(
-        "dictation {:.1}s: total {}ms = drain {drain_ms} + model-wait {model_wait_ms} + transcribe {} + post {post_ms} + paste {paste_ms} | mic start {}ms | conf {:.2} | rms {:.4}: {:?}",
+        "dictation {:.1}s ({}): total {}ms = drain {drain_ms} + model-wait {model_wait_ms} + transcribe {} + post {post_ms} + paste {paste_ms} | mic start {}ms | conf {:.2} | rms {:.4}: {:?}",
         captured.duration.as_secs_f32(),
+        transcript.language.as_deref().unwrap_or("?"),
         released.elapsed().as_millis(),
         transcript.elapsed_ms,
         captured.start_latency_ms,
@@ -254,6 +263,7 @@ fn process(app: &AppHandle, active: Active) -> anyhow::Result<()> {
         captured.duration.as_millis() as u64,
         transcript.elapsed_ms,
     );
+    record.language = transcript.language.clone();
     if settings.keep_audio {
         let path = c.dir.join("audio").join(format!("{}.wav", record.id));
         match crate::audio::write_wav_16k(&path, &captured.samples_16k) {

@@ -10,7 +10,7 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
-    audio, lab, macos,
+    audio, lab, platform,
     session::{self, RecMode, RecState},
     settings::Settings,
     store::{self, DictEntry, HistoryRecord, ImportResult, Stats, Suggestion},
@@ -34,8 +34,8 @@ pub struct Snapshot {
     model_state: ModelState,
     model_error: Option<String>,
     active_model: Option<String>,
-    permissions: macos::Permissions,
-    fn_usage: macos::FnUsage,
+    permissions: platform::Permissions,
+    fn_usage: platform::FnUsage,
     ptt_listening: bool,
     version: String,
 }
@@ -52,8 +52,8 @@ pub fn get_snapshot(app: AppHandle, core: State<'_, Core>) -> Snapshot {
         model_state,
         model_error,
         active_model: core.engine.loaded_model(),
-        permissions: macos::permissions(),
-        fn_usage: macos::fn_usage(),
+        permissions: platform::permissions(),
+        fn_usage: platform::fn_usage(),
         ptt_listening: core.listener.get().is_some_and(|l| l.installed.load(Ordering::Relaxed)),
         version: app.package_info().version.to_string(),
     }
@@ -86,6 +86,10 @@ pub fn update_settings(app: AppHandle, core: State<'_, Core>, patch: Value) -> C
     }
     if before.model != after.model || before.model_folders != after.model_folders {
         crate::ensure_model_loaded(&app);
+    }
+    if after.languages.len() > 1 && before.languages.len() <= 1 {
+        let app = app.clone();
+        thread::spawn(move || crate::prepare_language_detection(&app));
     }
     if before.widget_visibility != after.widget_visibility {
         session::widget_visibility_changed(&app, after.widget_visibility);
@@ -180,8 +184,8 @@ pub fn lab_start(app: AppHandle, core: State<'_, Core>, prompt_id: String) -> Cm
     if core.sessions.is_active() {
         return Err("Finish the current dictation first.".into());
     }
-    if macos::permissions().microphone != "granted" {
-        macos::request_microphone();
+    if platform::permissions().microphone != "granted" {
+        platform::request_microphone();
         return Err("Microphone access is needed.".into());
     }
     let s = core.settings.read().clone();
@@ -311,8 +315,7 @@ pub fn open_path(core: State<'_, Core>, path: String) -> CmdResult<()> {
     if !p.starts_with(&core.dir) {
         return Err("Only Wordfall's own files can be opened.".into());
     }
-    std::process::Command::new("open").arg(&p).spawn().map_err(err)?;
-    Ok(())
+    platform::open_path(&p).map_err(err)
 }
 
 #[tauri::command]
@@ -484,8 +487,8 @@ pub fn list_input_devices() -> Vec<audio::AudioDevice> {
 }
 
 #[tauri::command]
-pub fn check_permissions() -> macos::Permissions {
-    macos::permissions()
+pub fn check_permissions() -> platform::Permissions {
+    platform::permissions()
 }
 
 #[derive(Deserialize)]
@@ -499,23 +502,20 @@ pub enum PermissionKind {
 #[tauri::command]
 pub fn request_permission(kind: PermissionKind) {
     match kind {
-        PermissionKind::Microphone => macos::request_microphone(),
-        PermissionKind::Accessibility => {
-            macos::request_accessibility();
-            macos::open_privacy_pane("Privacy_Accessibility");
-        }
-        PermissionKind::InputMonitoring => macos::request_input_monitoring(),
+        PermissionKind::Microphone => platform::request_microphone(),
+        PermissionKind::Accessibility => platform::request_accessibility(),
+        PermissionKind::InputMonitoring => platform::request_input_monitoring(),
     }
 }
 
 #[tauri::command]
-pub fn set_fn_do_nothing() -> macos::FnUsage {
-    macos::set_fn_do_nothing()
+pub fn set_fn_do_nothing() -> platform::FnUsage {
+    platform::set_fn_do_nothing()
 }
 
 #[tauri::command]
 pub fn copy_text(text: String) -> CmdResult<()> {
-    macos::copy_text(&text).map_err(err)
+    platform::copy_text(&text).map_err(err)
 }
 
 #[tauri::command]
@@ -559,10 +559,10 @@ pub fn resize_widget(app: AppHandle, width: f64, height: f64) {
 /// Emits `permissions-changed` whenever a permission flips (e.g. granted in System Settings).
 pub fn spawn_permission_watch(app: AppHandle) {
     thread::spawn(move || {
-        let mut last = macos::permissions();
+        let mut last = platform::permissions();
         loop {
             thread::sleep(Duration::from_secs(2));
-            let now = macos::permissions();
+            let now = platform::permissions();
             if now != last {
                 log::info!("permissions changed: {now:?}");
                 let _ = app.emit("permissions-changed", &now);

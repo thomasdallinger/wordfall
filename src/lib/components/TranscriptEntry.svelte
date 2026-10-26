@@ -1,6 +1,8 @@
 <script lang="ts">
   import { CheckIcon, CopyIcon, PencilIcon, Trash2Icon } from '@lucide/svelte';
-  import { formatTime } from '../format';
+  import { formatTime, languageName } from '../format';
+  import { IS_WINDOWS, primaryMod } from '../platform';
+  import { app } from '../state.svelte';
   import type { HistoryRecord } from '../types';
 
   let {
@@ -24,6 +26,10 @@
 
   const verified = $derived(record.reference != null);
   const time = $derived(formatTime(record.timestamp));
+  /** Only worth showing when the user dictates in more than one language. */
+  const language = $derived(
+    record.language && (app.settings?.languages.length ?? 0) !== 1 ? languageName(record.language) : null,
+  );
 
   /** Plain and matching segments, for highlighting search hits in place. */
   const segments = $derived.by(() => {
@@ -79,7 +85,7 @@
     return () => node.removeEventListener('input', fit);
   }
 
-  /** ↑/↓ walk the list; Enter corrects; ⌘C copies the whole transcript. */
+  /** ↑/↓ walk the list; Enter corrects; ⌘C (Ctrl+C) copies the whole transcript. */
   function onkeydown(e: KeyboardEvent) {
     if (e.target !== entry) return;
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -89,7 +95,7 @@
     } else if (e.key === 'Enter') {
       e.preventDefault();
       startEdit();
-    } else if (e.key === 'c' && e.metaKey && !window.getSelection()?.toString()) {
+    } else if (e.key === 'c' && primaryMod(e) && !window.getSelection()?.toString()) {
       e.preventDefault();
       oncopy();
     }
@@ -103,12 +109,13 @@
   tabindex="0"
   data-entry
   aria-label="Transcript from {time}{verified ? ', verified' : ''}"
-  aria-keyshortcuts="Enter Meta+C"
+  aria-keyshortcuts={IS_WINDOWS ? 'Enter Control+C' : 'Enter Meta+C'}
   bind:this={entry}
   {onkeydown}
 >
   <div class="margin">
     <time datetime={record.timestamp}>{time}</time>
+    {#if language}<span>{language}</span>{/if}
     {#if verified}<span class="verified status-ok">Verified</span>{/if}
   </div>
 
@@ -124,7 +131,7 @@
             e.preventDefault();
             e.stopPropagation();
             stopEdit();
-          } else if (e.key === 'Enter' && e.metaKey) {
+          } else if (e.key === 'Enter' && primaryMod(e)) {
             e.preventDefault();
             void save();
           }
@@ -139,7 +146,7 @@
           {/if}
         </p>
         <button class="btn btn-quiet" onclick={stopEdit}>Cancel</button>
-        <button class="btn btn-signal" disabled={!draft.trim() || saving} onclick={save} title="Save (⌘ Return)">Save</button>
+        <button class="btn btn-signal" disabled={!draft.trim() || saving} onclick={save} title={IS_WINDOWS ? 'Save (Ctrl+Enter)' : 'Save (⌘ Return)'}>Save</button>
       </div>
     </div>
   {:else}
@@ -206,6 +213,8 @@
     color: var(--ink);
     overflow-wrap: anywhere;
     text-wrap: pretty;
+    /* Dictated lists arrive as one item per line. */
+    white-space: pre-line;
     cursor: text;
   }
   mark {
@@ -237,6 +246,7 @@
     width: calc(100% + 20px);
     resize: none;
     overflow: hidden;
+    white-space: pre-wrap;
     border-radius: var(--radius-control);
     background: var(--surface);
     border: 1px solid var(--ink-3);
