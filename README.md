@@ -83,7 +83,20 @@ open /Applications/Wordfall.app
 
 **You need:** Windows 10 or 11 (x64), [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
 with the *Desktop development with C++* workload, [Rust](https://rustup.rs) (stable, the default MSVC
-toolchain), Node 22+, CMake and Git. WebView2 ships with Windows 11; on Windows 10 the installer fetches it.
+toolchain), Node 22+, CMake, [LLVM](https://llvm.org) (whisper.cpp's Rust bindings need `libclang`) and Git.
+WebView2 ships with Windows 11; on Windows 10 the installer fetches it. With winget:
+
+```powershell
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install Rustlang.Rustup
+winget install Kitware.CMake
+winget install LLVM.LLVM
+winget install OpenJS.NodeJS.LTS
+winget install Git.Git
+```
+
+Open a new terminal afterwards so `cargo` and `cmake` are on your `PATH`. If the build says it is *unable to
+find libclang*, point it at LLVM: `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"`.
 
 1. **Get the code**
 
