@@ -42,7 +42,13 @@ struct Active {
     mode: RecMode,
     focus_app: Option<platform::AppRef>,
     was_muted: Option<bool>,
+    /// Keeps the app at full speed until the dictation has been processed.
+    _busy: platform::Busy,
 }
+
+/// After this long without a dictation, the model is warmed up while the user speaks.
+#[cfg(target_os = "macos")]
+const WARM_UP_AFTER_IDLE: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Default)]
 pub struct Sessions {
@@ -83,6 +89,8 @@ pub fn start(app: &AppHandle, mode: RecMode) {
     if c.sessions.active.lock().is_some() || c.sessions.starting.swap(true, Ordering::SeqCst) {
         return;
     }
+    // First, so the cue and the microphone start at full priority.
+    let busy = platform::busy("Dictation");
     let settings = c.settings.read().clone();
     // Widget/tray clicks may have activated Wordfall; paste back into the app the user was in.
     let focus_app = if mode == RecMode::Click { platform::last_foreign_app() } else { platform::frontmost_foreign_app() };
@@ -105,10 +113,21 @@ pub fn start(app: &AppHandle, mode: RecMode) {
     log::info!("recording ({mode:?}) from {}", recording.device_name);
     let was_muted = settings.mute_system_audio.then(platform::mute_output);
     let id = c.sessions.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-    *c.sessions.active.lock() = Some(Active { id, recording, mode, focus_app, was_muted });
+    *c.sessions.active.lock() = Some(Active { id, recording, mode, focus_app, was_muted, _busy: busy });
     c.sessions.starting.store(false, Ordering::SeqCst);
     publish(app, RecState::Listening, Some(mode));
     spawn_level_meter(app.clone(), id);
+    // Only macOS pages the idle model out; elsewhere (CPU-only) the extra encoder pass would just
+    // delay the first dictation.
+    #[cfg(target_os = "macos")]
+    {
+        let engine = c.engine.clone();
+        thread::spawn(move || {
+            if let Some(took) = engine.warm_up_if_idle(WARM_UP_AFTER_IDLE) {
+                log::info!("warmed up the model after an idle period in {}ms", took.as_millis());
+            }
+        });
+    }
 }
 
 /// Switch an in-flight hold into hands-free mode (UI only; the hotkey machine owns timing).

@@ -3,7 +3,7 @@
 
 use std::{f32::consts::TAU, sync::LazyLock};
 
-const RATE: u32 = 48_000;
+pub const RATE: u32 = 48_000;
 /// Overall level the cues were tuned at.
 const VOLUME: f32 = 0.7;
 /// Each voice runs this long past its decay before it is cut.
@@ -81,6 +81,7 @@ fn render(tones: &[Tone]) -> Vec<f32> {
 }
 
 /// 16-bit mono PCM WAV.
+#[cfg(any(windows, test))]
 fn encode_wav(samples: &[f32]) -> Vec<u8> {
     let data_len = samples.len() as u32 * 2;
     let mut wav = Vec::with_capacity(44 + data_len as usize);
@@ -102,15 +103,30 @@ fn encode_wav(samples: &[f32]) -> Vec<u8> {
     wav
 }
 
-static START: LazyLock<Vec<u8>> = LazyLock::new(|| encode_wav(&render(&start_tones())));
-static STOP: LazyLock<Vec<u8>> = LazyLock::new(|| encode_wav(&render(&stop_tones())));
+static START: LazyLock<Vec<f32>> = LazyLock::new(|| render(&start_tones()));
+static STOP: LazyLock<Vec<f32>> = LazyLock::new(|| render(&stop_tones()));
 
-/// The cue as a WAV file in memory; lives for the whole process.
-pub fn wav(start: bool) -> &'static [u8] {
+/// The cue as mono samples at `RATE`; lives for the whole process.
+pub fn samples(start: bool) -> &'static [f32] {
     if start {
         &START
     } else {
         &STOP
+    }
+}
+
+#[cfg(any(windows, test))]
+static START_WAV: LazyLock<Vec<u8>> = LazyLock::new(|| encode_wav(samples(true)));
+#[cfg(any(windows, test))]
+static STOP_WAV: LazyLock<Vec<u8>> = LazyLock::new(|| encode_wav(samples(false)));
+
+/// The cue as a WAV file in memory; lives for the whole process.
+#[cfg(any(windows, test))]
+pub fn wav(start: bool) -> &'static [u8] {
+    if start {
+        &START_WAV
+    } else {
+        &STOP_WAV
     }
 }
 

@@ -286,7 +286,6 @@ pub async fn ensure_silero(models_dir: &Path) -> anyhow::Result<PathBuf> {
 }
 
 struct Loaded {
-    id: String,
     english_only: bool,
     // `state` borrows nothing from `ctx` at the type level but must not outlive it;
     // field order guarantees state drops first.
@@ -299,8 +298,12 @@ struct Loaded {
     ctx: WhisperContext,
 }
 
-/// Encoder frames used for language detection: about 5 s of audio, a sixth of the full window.
+/// Encoder frames used for the quick language check: about 5 s of audio, a sixth of the full window.
 const DETECT_AUDIO_CTX: i32 = 256;
+/// Below this probability the quick check is re-run on the full window. The short window is out
+/// of distribution for whisper and leans English on German full of English loanwords; a wrong
+/// guess is costly, because whisper then translates instead of transcribing.
+const DETECT_CONFIDENT: f32 = 0.9;
 
 impl Loaded {
     /// Probability per language id for the start of `audio`.
@@ -309,10 +312,7 @@ impl Loaded {
             // A fresh state takes its encoder size from its first full run and keeps it, because
             // `lang_detect` never changes it. One short silent run pins it to the small window.
             let mut state = self.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
-            let mut warm = full_params(&DecodeOptions::default(), Some("en"), None, DETECT_AUDIO_CTX);
-            warm.set_no_speech_thold(1.0);
-            warm.set_max_len(1);
-            state.full(warm, &vec![0.0f32; 16_000]).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
+            warm(&mut state, DETECT_AUDIO_CTX).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
             self.detect = Some(state);
         }
         Ok(())
@@ -320,21 +320,51 @@ impl Loaded {
 
     fn language_probs(&mut self, audio: &[f32], threads: usize) -> anyhow::Result<Vec<f32>> {
         self.ensure_detect_state()?;
-        let state = self.detect.as_mut().expect("created above");
-        state.pcm_to_mel(audio, threads).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
-        let (_, probs) = state.lang_detect(0, threads).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
-        Ok(probs)
+        detect_on(self.detect.as_mut().expect("created above"), audio, threads)
     }
+
+    /// Like `language_probs`, but on the full 30 s window whisper was trained on (slower, more
+    /// reliable). Runs on the main state, which must be set up for the full window.
+    fn full_window_language_probs(&mut self, audio: &[f32], threads: usize) -> anyhow::Result<Vec<f32>> {
+        debug_assert_eq!(self.state_audio_ctx, 0);
+        detect_on(&mut self.state, audio, threads)
+    }
+}
+
+fn detect_on(state: &mut WhisperState, audio: &[f32], threads: usize) -> anyhow::Result<Vec<f32>> {
+    state.pcm_to_mel(audio, threads).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
+    let (_, probs) = state.lang_detect(0, threads).map_err(|e| anyhow::anyhow!("language detection: {e:?}"))?;
+    Ok(probs)
+}
+
+/// One second of silence, the input of every throwaway warm-up run.
+static WARM_SILENCE: [f32; 16_000] = [0.0; 16_000];
+
+/// Throwaway decode of a second of silence at `audio_ctx`. One encoder pass and one decoded
+/// token touch every weight (and fix a fresh state's encoder size); the fallback re-decodes
+/// would only add time.
+fn warm(state: &mut WhisperState, audio_ctx: i32) -> Result<(), whisper_rs::WhisperError> {
+    let mut params = full_params(&DecodeOptions::default(), Some("en"), None, audio_ctx);
+    params.set_no_speech_thold(1.0);
+    params.set_single_segment(true);
+    params.set_max_tokens(1);
+    params.set_temperature_inc(0.0);
+    state.full(params, &WARM_SILENCE)
 }
 
 #[derive(Default)]
 pub struct Engine {
     loaded: Mutex<Option<Loaded>>,
+    /// Id of the model in `loaded`, kept separately so reading it never waits behind a running
+    /// warm-up or transcription (which hold `loaded` for seconds).
+    loaded_id: Mutex<Option<String>>,
     /// Path to the Silero VAD model, used when `DecodeOptions::vad == Silero`.
     pub silero_path: Mutex<Option<PathBuf>>,
     silero: Mutex<Option<whisper_rs::WhisperVadContext>>,
     /// Language of the previous dictation; ambiguous clips stay in it.
     last_language: Mutex<Option<String>>,
+    /// When the model last ran (load, warm-up or dictation).
+    last_used: Mutex<Option<Instant>>,
 }
 
 pub struct Transcript {
@@ -356,11 +386,13 @@ impl Transcript {
 
 impl Engine {
     pub fn loaded_model(&self) -> Option<String> {
-        self.loaded.lock().as_ref().map(|l| l.id.clone())
+        self.loaded_id.lock().clone()
     }
 
     pub fn unload(&self) {
-        *self.loaded.lock() = None;
+        let mut loaded = self.loaded.lock();
+        *loaded = None;
+        *self.loaded_id.lock() = None;
     }
 
     /// Sets up language detection ahead of the first multi-language dictation (no-op if done).
@@ -388,14 +420,39 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("could not load {id}: {e:?}"))?;
         let mut state = ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
         // Warm-up pass so the first real dictation doesn't pay for Metal shader compilation.
-        let silence = vec![0.0f32; 16_000];
-        let opts = DecodeOptions::default();
-        let mut warm = full_params(&opts, Some("en"), None, 0);
-        warm.set_no_speech_thold(1.0);
-        let _ = state.full(warm, &silence);
-        *self.loaded.lock() = Some(Loaded { id: id.to_string(), english_only, state, state_audio_ctx: 0, detect: None, ctx });
+        let _ = warm(&mut state, 0);
+        let mut loaded = self.loaded.lock();
+        *loaded = Some(Loaded { english_only, state, state_audio_ctx: 0, detect: None, ctx });
+        *self.loaded_id.lock() = Some(id.to_string());
+        drop(loaded);
+        *self.last_used.lock() = Some(Instant::now());
         log::info!("loaded {id} in {:?}", started.elapsed());
         Ok(())
+    }
+
+    /// Runs a throwaway decode if the model has sat unused for `idle`. After a long idle macOS has
+    /// compressed or paged out the model and the GPU is cold, which made the first dictation take
+    /// seconds longer; warming up while the user is still speaking hides that. Returns how long the
+    /// warm-up took, or `None` if it wasn't needed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn warm_up_if_idle(&self, idle: std::time::Duration) -> Option<std::time::Duration> {
+        {
+            let mut last_used = self.last_used.lock();
+            if last_used.is_some_and(|t| t.elapsed() < idle) {
+                return None;
+            }
+            // Claimed right away, so a quick second start (e.g. after an Escape) doesn't queue
+            // another warm-up ahead of the real transcription.
+            *last_used = Some(Instant::now());
+        }
+        let started = Instant::now();
+        let mut guard = self.loaded.lock();
+        let loaded = guard.as_mut()?;
+        let _ = warm(&mut loaded.state, loaded.state_audio_ctx);
+        if let Some(detect) = loaded.detect.as_mut() {
+            let _ = detect_on(detect, &WARM_SILENCE, thread_count(&DecodeOptions::default()) as usize);
+        }
+        Some(started.elapsed())
     }
 
     /// `languages` are the ones the user speaks: empty = any (whisper detects), one = forced,
@@ -452,13 +509,30 @@ impl Engine {
             [] => "auto".into(),
             [one] => one.clone(),
             several => {
-                // Like whisper's own "auto", but on a short window and only the user's languages compete.
-                let probs = loaded.language_probs(audio, thread_count(opts) as usize)?;
-                let prob = |code: &str| whisper_rs::get_lang_id(code).and_then(|id| probs.get(id as usize).copied()).unwrap_or(0.0);
+                // Like whisper's own "auto", but only the user's languages compete, and a quick check
+                // on a short window settles clear cases.
+                let threads = thread_count(opts) as usize;
+                let mut probs = loaded.language_probs(audio, threads)?;
+                let mut window = "short";
+                let lookup = |probs: &[f32], code: &str| {
+                    whisper_rs::get_lang_id(code).and_then(|id| probs.get(id as usize).copied()).unwrap_or(0.0)
+                };
+                // The full-window check needs the main state on the full window (the default).
+                if needs_full_window(several, |l| lookup(&probs, l)) && audio_ctx == 0 {
+                    // Only a second opinion: if it fails, the quick guess still beats no dictation.
+                    match loaded.full_window_language_probs(audio, threads) {
+                        Ok(full) => {
+                            probs = full;
+                            window = "full";
+                        }
+                        Err(e) => log::warn!("full-window language check failed, keeping the quick guess: {e}"),
+                    }
+                }
+                let prob = |code: &str| lookup(&probs, code);
                 let previous = self.last_language.lock().clone();
                 let chosen = pick_language(several, previous.as_deref(), prob).to_string();
                 log::info!(
-                    "language {chosen} ({})",
+                    "language {chosen} ({}; {window} window)",
                     several.iter().map(|l| format!("{l} {:.2}", prob(l))).collect::<Vec<_>>().join(", ")
                 );
                 chosen
@@ -474,6 +548,7 @@ impl Engine {
         if language.is_some() {
             self.last_language.lock().clone_from(&language);
         }
+        *self.last_used.lock() = Some(Instant::now());
 
         let mut text = String::new();
         let (mut prob_sum, mut prob_n) = (0.0f32, 0usize);
@@ -564,6 +639,11 @@ fn thread_count(opts: &DecodeOptions) -> i32 {
     }
 }
 
+/// Whether the quick short-window guess is too unsure to trust.
+pub fn needs_full_window(allowed: &[String], prob: impl Fn(&str) -> f32) -> bool {
+    allowed.iter().map(|l| prob(l)).fold(0.0, f32::max) < DETECT_CONFIDENT
+}
+
 /// The most likely of `allowed`, except that an ambiguous clip (e.g. a one-word "OK")
 /// stays in the previous dictation's language: switching needs twice its probability.
 pub fn pick_language<'a>(allowed: &'a [String], previous: Option<&str>, prob: impl Fn(&str) -> f32) -> &'a str {
@@ -637,6 +717,17 @@ mod tests {
     fn ambiguous_clip_keeps_previous_language() {
         let allowed = langs(&["en", "de"]);
         assert_eq!(pick_language(&allowed, Some("de"), probs(&[("en", 0.5), ("de", 0.3)])), "de");
+    }
+
+    #[test]
+    fn unsure_quick_guess_gets_the_full_window() {
+        let allowed = langs(&["en", "de"]);
+        // The German dictation of 2026-11-05 that came out translated into English.
+        assert!(needs_full_window(&allowed, probs(&[("en", 0.66), ("de", 0.14)])));
+        assert!(needs_full_window(&allowed, probs(&[("en", 0.4), ("de", 0.47)])));
+        // Clear cases keep the fast path.
+        assert!(!needs_full_window(&allowed, probs(&[("en", 0.01), ("de", 0.99)])));
+        assert!(!needs_full_window(&allowed, probs(&[("en", 0.96), ("de", 0.0)])));
     }
 
     #[test]

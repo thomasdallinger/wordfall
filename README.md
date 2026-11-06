@@ -17,7 +17,7 @@ Local speech recognition for macOS and Windows. Nothing leaves your computer.</p
 - **On-device Whisper.** whisper.cpp with Metal on macOS, CPU (or Vulkan/CUDA) on Windows. Large v3 Turbo by
   default; switch models in Settings.
 - **Fast.** About 0.7 s from release to text for a typical dictation on an M-series Mac (about 0.1 s more
-  when it also has to tell your languages apart).
+  when it also has to tell your languages apart, up to about 0.7 s more when that's a close call).
 - **Gets your words right.** A dictionary of replacements (“post gress” → “PostgreSQL”), words to
   recognise, and suggestions learned from your transcripts.
 - **No hallucinated "Thank you."** Voice activity detection drops silence, hum and typing before decoding.
@@ -81,7 +81,7 @@ open /Applications/Wordfall.app
 
 ### Windows
 
-**You need:** Windows 10 or 11 (x64), [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
+**You need:** Windows 10 or 11 on an x64 CPU with AVX2 (Intel since 2013, AMD since 2015), [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
 with the *Desktop development with C++* workload, [Rust](https://rustup.rs) (stable, the default MSVC
 toolchain), Node 22+, CMake, [LLVM](https://llvm.org) (whisper.cpp's Rust bindings need `libclang`) and Git.
 WebView2 ships with Windows 11; on Windows 10 the installer fetches it. With winget:
@@ -113,8 +113,8 @@ find libclang*, point it at LLVM: `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\b
    npm run tauri:windows -- --features vulkan  # GPU via Vulkan (needs the Vulkan SDK); or --features cuda
    ```
 
-   `tauri:windows` is `tauri build` with the C/C++ runtime linked statically (see
-   `scripts/tauri-windows.mjs`), so the app runs without the Visual C++ Redistributable.
+   `tauri:windows` is `tauri build` with the C/C++ runtime linked statically, so the app runs without the
+   Visual C++ Redistributable, and whisper.cpp built for AVX2 (see `scripts/tauri-windows.mjs`).
 
 3. **Install.** Run `src-tauri\target\release\bundle\nsis\Wordfall_<version>_x64-setup.exe`. It installs
    for your user only (no admin needed); Wordfall lives in the notification area.
@@ -170,7 +170,10 @@ src-tauri/target/release/wordfall bench     # accuracy/latency regression check
 Cross-compiling the Windows app from macOS works with `cargo-xwin` (`npm run tauri:windows -- --runner cargo-xwin
 --target x86_64-pc-windows-msvc`, with LLVM, lld and NSIS from Homebrew). whisper-rs-sys decides from the *host*
 OS that it must link `ggml-blas`, so cross builds need an empty `ggml-blas.lib` on the library path
-(`RUSTFLAGS="-L native=<dir>"`); native Windows builds don't.
+(`RUSTFLAGS="-L native=<dir>"`); native Windows builds don't. whisper-rs-sys doesn't rebuild when the `GGML_*`
+settings in `scripts/tauri-windows.mjs` change, so after they do (including the first build after pulling the
+AVX2 settings), run `cargo clean -p whisper-rs-sys --release --target x86_64-pc-windows-msvc` once; otherwise the
+cross build keeps its old, much slower CPU code.
 
 Layout:
 

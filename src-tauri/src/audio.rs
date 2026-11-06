@@ -1,4 +1,4 @@
-//! Microphone capture (cpal), mono downmix, level metering and 16 kHz resampling.
+//! Microphone capture (cpal), mono downmix, level metering, 16 kHz resampling and short clip playback.
 //!
 //! cpal streams are `!Send` on macOS, so each recording owns a dedicated thread that
 //! builds the stream, keeps it alive until told to stop, then drops it.
@@ -244,6 +244,50 @@ pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
             a + (b - a) * frac
         })
         .collect()
+}
+
+/// Plays a short mono clip on the default output device, blocking until it has played.
+/// Returns how long the device took to start pulling audio. (Windows plays cues with PlaySound.)
+#[cfg(target_os = "macos")]
+pub fn play_clip(clip: &[f32], clip_rate: u32) -> anyhow::Result<Duration> {
+    let requested = Instant::now();
+    let device = cpal::default_host().default_output_device().ok_or_else(|| anyhow::anyhow!("no output device"))?;
+    let config = device.default_output_config()?;
+    anyhow::ensure!(config.sample_format() == cpal::SampleFormat::F32, "unsupported output format {}", config.sample_format());
+    let rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+    let samples = resample(clip, clip_rate, rate);
+    let total = samples.len();
+    let played = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (started_tx, started_rx) = mpsc::channel::<Instant>();
+    let mut started_tx = Some(started_tx);
+    let counter = played.clone();
+    let stream = device.build_output_stream(
+        &config.into(),
+        move |out: &mut [f32], _| {
+            if let Some(tx) = started_tx.take() {
+                let _ = tx.send(Instant::now());
+            }
+            let mut i = counter.load(Ordering::Relaxed);
+            for frame in out.chunks_mut(channels) {
+                frame.fill(samples.get(i).copied().unwrap_or(0.0));
+                i += 1;
+            }
+            counter.store(i, Ordering::Relaxed);
+        },
+        |e| log::warn!("cue output error: {e}"),
+        None,
+    )?;
+    stream.play()?;
+    let started = started_rx.recv_timeout(Duration::from_secs(3)).map_err(|_| anyhow::anyhow!("output did not start"))?;
+    // Keep the stream open until the clip and ~100 ms of trailing silence have been handed over,
+    // so the device buffer drains before the stream stops.
+    let done = total + rate as usize / 10;
+    let deadline = started + Duration::from_secs_f64(done as f64 / rate as f64) + Duration::from_secs(1);
+    while played.load(Ordering::Relaxed) < done && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(started.duration_since(requested))
 }
 
 /// Reads a 16-bit PCM WAV file into mono f32 samples at 16 kHz (diagnostics only).

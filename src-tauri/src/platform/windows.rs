@@ -199,6 +199,13 @@ pub fn set_fn_do_nothing() -> FnUsage {
 
 // ---------- cues & muting ----------
 
+/// macOS keeps the app out of App Nap while this lives; Windows has nothing to opt out of.
+pub struct Busy;
+
+pub fn busy(_reason: &str) -> Busy {
+    Busy
+}
+
 pub fn play_cue(start: bool) {
     // SND_ASYNC keeps reading the buffer while playing; the cue lives for the whole process.
     let wav = crate::cues::wav(start);

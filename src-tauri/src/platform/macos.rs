@@ -14,7 +14,9 @@ use core_graphics::{
     event::{CGEvent, CGEventFlags, CGEventTapLocation},
     event_source::{CGEventSource, CGEventSourceStateID},
 };
+use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
+use objc2_foundation::{NSActivityOptions, NSObjectProtocol, NSProcessInfo, NSString};
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -192,14 +194,37 @@ pub fn set_fn_do_nothing() -> FnUsage {
 
 // ---------- cues & muting ----------
 
+/// Plays the cue in-process. Launching a player process (afplay) per cue made the start cue late
+/// or inaudible after a long idle: the new process starts cold and inherits Wordfall's App Nap
+/// throttling. It also left a zombie process behind per cue.
 pub fn play_cue(start: bool) {
-    // afplay needs a file; write the cue once per process (and again if the temp folder was cleaned).
-    let wav = crate::cues::wav(start);
-    let path = std::env::temp_dir().join(if start { "wordfall-cue-start.wav" } else { "wordfall-cue-stop.wav" });
-    if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(wav.len() as u64) && std::fs::write(&path, wav).is_err() {
-        return;
+    let _ = thread::Builder::new().name("wordfall-cue".into()).spawn(move || {
+        match crate::audio::play_clip(crate::cues::samples(start), crate::cues::RATE) {
+            Ok(latency) if latency > Duration::from_millis(150) => {
+                log::warn!("{} cue started {}ms late", if start { "start" } else { "stop" }, latency.as_millis())
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("could not play cue: {e}"),
+        }
+    });
+}
+
+/// Keeps macOS from napping Wordfall while it is alive (one per dictation). A napped app runs at
+/// background CPU and I/O priority, which slowed the first dictation after a long idle.
+pub struct Busy(Retained<ProtocolObject<dyn NSObjectProtocol>>);
+
+// SAFETY: NSProcessInfo's activity API is thread-safe; the token is only ever handed back to it.
+unsafe impl Send for Busy {}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        unsafe { NSProcessInfo::processInfo().endActivity(&self.0) };
     }
-    let _ = Command::new("afplay").arg(&path).spawn();
+}
+
+pub fn busy(reason: &str) -> Busy {
+    let options = NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | NSActivityOptions::LatencyCritical;
+    Busy(NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &NSString::from_str(reason)))
 }
 
 fn osascript(script: &str) -> Option<String> {
