@@ -1,5 +1,5 @@
 //! Local Whisper models: catalog, discovery (app folder + user-added folders),
-//! download, and a warm whisper.cpp engine (Metal).
+//! download, and a warm whisper.cpp engine (Metal on macOS, Vulkan on Windows).
 
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -337,6 +337,30 @@ fn detect_on(state: &mut WhisperState, audio: &[f32], threads: usize) -> anyhow:
     Ok(probs)
 }
 
+/// The GPU whisper.cpp runs on (its first GPU device, as with the default `gpu_device` 0), or "CPU"
+/// when the build has no GPU backend or no usable GPU. A CPU-only Windows build is several times
+/// slower, so the load log names the device.
+fn compute_device() -> String {
+    use std::ffi::CStr;
+    use whisper_rs::whisper_rs_sys as sys;
+    // SAFETY: ggml's backend registry is initialised on first use and lives for the whole process;
+    // the returned strings are owned by it.
+    unsafe {
+        for i in 0..sys::ggml_backend_dev_count() {
+            let dev = sys::ggml_backend_dev_get(i);
+            let kind = sys::ggml_backend_dev_type(dev);
+            if kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+                || kind == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+            {
+                let name = CStr::from_ptr(sys::ggml_backend_dev_name(dev)).to_string_lossy();
+                let desc = CStr::from_ptr(sys::ggml_backend_dev_description(dev)).to_string_lossy();
+                return format!("{desc} ({name})");
+            }
+        }
+    }
+    "CPU".into()
+}
+
 /// One second of silence, the input of every throwaway warm-up run.
 static WARM_SILENCE: [f32; 16_000] = [0.0; 16_000];
 
@@ -419,14 +443,14 @@ impl Engine {
         let ctx = WhisperContext::new_with_params(path, params)
             .map_err(|e| anyhow::anyhow!("could not load {id}: {e:?}"))?;
         let mut state = ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
-        // Warm-up pass so the first real dictation doesn't pay for Metal shader compilation.
+        // Warm-up pass so the first real dictation doesn't pay for Metal/Vulkan shader compilation.
         let _ = warm(&mut state, 0);
         let mut loaded = self.loaded.lock();
         *loaded = Some(Loaded { english_only, state, state_audio_ctx: 0, detect: None, ctx });
         *self.loaded_id.lock() = Some(id.to_string());
         drop(loaded);
         *self.last_used.lock() = Some(Instant::now());
-        log::info!("loaded {id} in {:?}", started.elapsed());
+        log::info!("loaded {id} in {:?} on {}", started.elapsed(), compute_device());
         Ok(())
     }
 

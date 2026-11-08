@@ -34,7 +34,7 @@ regex = "1"
 anyhow = "1"
 toml = "0.8"
 dirs = "6"
-whisper-rs = "0.16"
+whisper-rs = { version = "0.16", features = ["raw-api"] } # raw-api: ggml device names for the load log
 sys-locale = "0.3"
 cpal = "0.15"
 arboard = "3"

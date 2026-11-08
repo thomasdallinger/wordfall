@@ -14,10 +14,11 @@ Local speech recognition for macOS and Windows. Nothing leaves your computer.</p
   don't flip to a language you don't speak.
 - **Clean text.** Drops um, uh, äh, ähm. Say "first, … second, …" / "erstens, … zweitens, …" for a
   numbered list, "bullet point …" / "Stichpunkt …" for a bulleted one.
-- **On-device Whisper.** whisper.cpp with Metal on macOS, CPU (or Vulkan/CUDA) on Windows. Large v3 Turbo by
+- **On-device Whisper.** whisper.cpp with Metal on macOS, Vulkan (any recent GPU) on Windows. Large v3 Turbo by
   default; switch models in Settings.
 - **Fast.** About 0.7 s from release to text for a typical dictation on an M-series Mac (about 0.1 s more
-  when it also has to tell your languages apart, up to about 0.7 s more when that's a close call).
+  when it also has to tell your languages apart, up to about 0.7 s more when that's a close call). On Windows
+  with a desktop GPU about 0.1–0.4 s (RTX 5070 Ti, 7–38 s clips).
 - **Gets your words right.** A dictionary of replacements (“post gress” → “PostgreSQL”), words to
   recognise, and suggestions learned from your transcripts.
 - **No hallucinated "Thank you."** Voice activity detection drops silence, hum and typing before decoding.
@@ -83,7 +84,8 @@ open /Applications/Wordfall.app
 
 **You need:** Windows 10 or 11 on an x64 CPU with AVX2 (Intel since 2013, AMD since 2015), [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
 with the *Desktop development with C++* workload, [Rust](https://rustup.rs) (stable, the default MSVC
-toolchain), Node 22+, CMake, [LLVM](https://llvm.org) (whisper.cpp's Rust bindings need `libclang`) and Git.
+toolchain), Node 22+, CMake, [LLVM](https://llvm.org) (whisper.cpp's Rust bindings need `libclang`), the
+[Vulkan SDK](https://vulkan.lunarg.com) (Wordfall runs Whisper on your graphics card through Vulkan) and Git.
 WebView2 ships with Windows 11; on Windows 10 the installer fetches it. With winget:
 
 ```powershell
@@ -91,12 +93,16 @@ winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait
 winget install Rustlang.Rustup
 winget install Kitware.CMake
 winget install LLVM.LLVM
+winget install KhronosGroup.VulkanSDK
 winget install OpenJS.NodeJS.LTS
 winget install Git.Git
 ```
 
 Open a new terminal afterwards so `cargo` and `cmake` are on your `PATH`. If the build says it is *unable to
-find libclang*, point it at LLVM: `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"`.
+find libclang*, point it at LLVM: `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"`. If it fails with *An
+application control policy has blocked this file* (os error 4551), that's Smart App Control rejecting the unsigned
+helper programs every Rust build compiles and runs; builds need it switched off (*Windows Security → App &
+browser control → Smart App Control*).
 
 1. **Get the code**
 
@@ -109,20 +115,24 @@ find libclang*, point it at LLVM: `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\b
 2. **Build**
 
    ```powershell
-   npm run tauri:windows                       # CPU
-   npm run tauri:windows -- --features vulkan  # GPU via Vulkan (needs the Vulkan SDK); or --features cuda
+   npm run tauri:windows                       # GPU via Vulkan (NVIDIA, AMD or Intel graphics)
+   npm run tauri:windows -- --cpu              # CPU only, for PCs without a graphics driver that has Vulkan
    ```
 
-   `tauri:windows` is `tauri build` with the C/C++ runtime linked statically, so the app runs without the
-   Visual C++ Redistributable, and whisper.cpp built for AVX2 (see `scripts/tauri-windows.mjs`).
+   `tauri:windows` is `tauri build` with whisper.cpp's Vulkan backend, whisper.cpp built for AVX2, and the
+   C/C++ runtime linked statically so the app runs without the Visual C++ Redistributable (see
+   `scripts/tauri-windows.mjs`; `-- --features cuda` builds for CUDA instead, which needs the CUDA toolkit).
+   Use the GPU build if you can: on the CPU, even a fast desktop processor needs about as long as you spoke
+   to write it out.
 
 3. **Install.** Run `src-tauri\target\release\bundle\nsis\Wordfall_<version>_x64-setup.exe`. It installs
    for your user only (no admin needed); Wordfall lives in the notification area.
 
 4. **First launch.** Windows only asks for the microphone (*Settings → Privacy & security → Microphone →
    Let desktop apps access your microphone*); typing into other apps and the push-to-talk key need no extra
-   permission. Hold <kbd>Right Ctrl</kbd> to dictate (change it under *Settings → Recording*). Without a GPU
-   build, *Large v3 Turbo (Q5)* or *Base* are noticeably faster than the default model.
+   permission. Hold <kbd>Right Ctrl</kbd> to dictate (change it under *Settings → Recording*). The log
+   (`%APPDATA%\com.wordfall.app\wordfall.log`) says which device the model runs on (`loaded … on <GPU>`); if it
+   says `on CPU`, *Large v3 Turbo (Q5)* or *Base* are noticeably faster than the default model.
 
 **Updating.** `git pull`, `npm install`, `npm run tauri:windows`, then run the new installer over the old
 one. Your data in `%APPDATA%\com.wordfall.app` and models in `%LOCALAPPDATA%\com.wordfall.app\models` are kept.
@@ -169,7 +179,7 @@ src-tauri/target/release/wordfall bench     # accuracy/latency regression check
 
 Cross-compiling the Windows app from macOS works with `cargo-xwin` (`npm run tauri:windows -- --runner cargo-xwin
 --target x86_64-pc-windows-msvc`, with LLVM, lld and NSIS from Homebrew). whisper-rs-sys decides from the *host*
-OS that it must link `ggml-blas`, so cross builds need an empty `ggml-blas.lib` on the library path
+OS that it must link `ggml-blas`, so cross builds (CPU only; native Windows builds default to Vulkan) need an empty `ggml-blas.lib` on the library path
 (`RUSTFLAGS="-L native=<dir>"`); native Windows builds don't. whisper-rs-sys doesn't rebuild when the `GGML_*`
 settings in `scripts/tauri-windows.mjs` change, so after they do (including the first build after pulling the
 AVX2 settings), run `cargo clean -p whisper-rs-sys --release --target x86_64-pc-windows-msvc` once; otherwise the
