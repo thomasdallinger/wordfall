@@ -1,6 +1,7 @@
 <script lang="ts">
   import { PRODUCT } from '../brand';
   import { acceleratorParts, pttCap } from '../format';
+  import { IS_WINDOWS } from '../platform';
   import { app, SETTINGS_SECTIONS, type SettingsSection, type View } from '../state.svelte';
   import Keycaps from './Keycaps.svelte';
   import Logo from './Logo.svelte';
@@ -26,7 +27,10 @@
 </script>
 
 <nav class="sidebar" aria-label="Main">
-  <div class="titlebar" data-tauri-drag-region></div>
+  <!-- macOS draws the window buttons in this bar, so the brand starts after them there. -->
+  <div class="titlebar" class:mac={!IS_WINDOWS} data-tauri-drag-region>
+    <span class="brand"><Logo size={20} accent="var(--signal)" /> {PRODUCT}</span>
+  </div>
 
   <ul class="nav">
     {#each items as item (item.id)}
@@ -71,8 +75,6 @@
       <span class="hint">Hold <kbd class="keycap">{cap}</kbd> to dictate</span>
     {:else if toggleKeys.length}
       <span class="hint">Press <Keycaps keys={toggleKeys} /> to dictate</span>
-    {:else}
-      <span class="mark"><Logo size={14} /> {PRODUCT}</span>
     {/if}
   </div>
 </nav>
@@ -88,8 +90,25 @@
     border-right: 1px solid var(--line);
   }
   .titlebar {
+    display: flex;
+    align-items: center;
     height: var(--toolbar-height);
     flex-shrink: 0;
+    padding: 0 20px;
+  }
+  .titlebar.mac {
+    padding-left: 84px;
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--ink);
+    /* Clicks fall through to the drag region. */
+    pointer-events: none;
+    user-select: none;
   }
   .nav {
     display: flex;
@@ -165,11 +184,6 @@
     align-items: center;
     gap: 5px;
     white-space: nowrap;
-  }
-  .mark {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
   }
   .live-dot,
   .busy-dot {

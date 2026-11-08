@@ -82,7 +82,7 @@
   <div class="titlebar" data-tauri-drag-region></div>
 
   <div class="column">
-    <div class="brand"><Logo size={20} dot="var(--signal)" /> {PRODUCT}</div>
+    <div class="brand"><Logo size={20} accent="var(--signal)" /> {PRODUCT}</div>
 
     <ol class="steps" aria-label="Setup steps">
       {#each STEPS as label, i (label)}

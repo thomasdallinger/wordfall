@@ -9,7 +9,7 @@
 
 <Section id="about" title="About">
   <div class="about">
-    <span class="mark"><Logo size={28} dot="var(--signal)" /></span>
+    <span class="mark"><Logo size={28} accent="var(--signal)" /></span>
     <div>
       <p class="name">{PRODUCT}</p>
       <p class="version">Version {app.snapshot?.version ?? '–'}</p>
