@@ -64,6 +64,11 @@ impl Sessions {
         self.active.lock().is_some() || self.starting.load(Ordering::Relaxed)
     }
 
+    /// A dictation is being recorded or transcribed; meetings let it have the recognizer first.
+    pub fn dictation_busy(&self) -> bool {
+        self.is_active() || self.processing.load(Ordering::SeqCst) > 0
+    }
+
     pub fn current(&self) -> (RecState, Option<RecMode>) {
         let s = self.state.lock();
         (s.0.unwrap_or(RecState::Idle), s.1)
@@ -111,7 +116,8 @@ pub fn start(app: &AppHandle, mode: RecMode) {
         }
     };
     log::info!("recording ({mode:?}) from {}", recording.device_name);
-    let was_muted = settings.mute_system_audio.then(platform::mute_output);
+    // Muting would silence the meeting being recorded.
+    let was_muted = (settings.mute_system_audio && !crate::meetings::is_recording(app)).then(platform::mute_output);
     let id = c.sessions.next_id.fetch_add(1, Ordering::SeqCst) + 1;
     *c.sessions.active.lock() = Some(Active { id, recording, mode, focus_app, was_muted, _busy: busy });
     c.sessions.starting.store(false, Ordering::SeqCst);
@@ -324,7 +330,7 @@ fn prune_audio(dir: &std::path::Path, keep: usize) {
 }
 
 /// Blocks until the selected model is loaded (loading it if necessary).
-fn wait_for_model(app: &AppHandle) -> anyhow::Result<String> {
+pub(crate) fn wait_for_model(app: &AppHandle) -> anyhow::Result<String> {
     let c = core(app);
     let wanted = c.settings.read().model.clone();
     for _ in 0..600 {

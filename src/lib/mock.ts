@@ -15,12 +15,16 @@ import type {
   HistoryRecord,
   LabPrompt,
   LabStopResult,
+  Meeting,
+  MeetingItem,
+  MeetingSegment,
   ModelInfo,
   Permissions,
   Settings,
   Snapshot,
   Stats,
   Suggestion,
+  SummaryModelInfo,
 } from './types';
 
 type Handler = (payload: never) => void;
@@ -73,6 +77,11 @@ const settings: Settings = {
   keepAudio: true,
   promptMode: 'dictionary',
   decode: { beamSize: 5, temperature: 0, noSpeechThreshold: 0.6 },
+  meetingMaxMinutes: 180,
+  meetingSystemAudio: true,
+  meetingSpeakers: true,
+  summaryModel: 'qwen3-4b-instruct-2507',
+  meetingAudioDays: 14,
 };
 
 const missing = params.get('perm') === 'missing';
@@ -453,6 +462,118 @@ function cancel() {
   setRec('idle', null);
 }
 
+// ---------------------------------------------------------------- meetings
+
+const summaryModels: SummaryModelInfo[] = [
+  { id: 'qwen3-4b-instruct-2507', displayName: 'Qwen3 4B', sizeMb: 2497, downloaded: true, badge: 'Fast', recommended: true,
+    description: 'Good notes within a minute or two, even for long meetings. Runs well with 16 GB of memory.' },
+  { id: 'gemma-3-12b-it-qat', displayName: 'Gemma 3 12B', sizeMb: 6909, downloaded: false, badge: 'Better writing', recommended: false,
+    description: 'More natural notes, especially in German. Wants a 12 GB graphics card, or a Mac with 24 GB.' },
+  { id: 'qwen3-30b-a3b-instruct-2507', displayName: 'Qwen3 30B', sizeMb: 18557, downloaded: false, badge: 'Most thorough', recommended: false,
+    description: 'The most careful notes. Wants a Mac with 32 GB, or a 16 GB graphics card and 32 GB of memory.' },
+];
+
+const SAMPLE_SUMMARY = `# Billing page launch plan
+
+The team confirmed the November 20 launch of the new billing page, as long as legal approves the pricing text by Thursday. Migration, sandbox testing and a support guide are assigned.
+
+## Decisions
+- Launch on November 20, if legal approves the pricing text by Thursday.
+- Old invoices stay downloadable for ten years in a read-only archive.
+
+## Action items
+- [ ] **Anna**: write the migration script, including tests, this week.
+- [ ] **Mark**: set up the sandbox with the new payment API by Monday.
+- [ ] **Me**: write a short guide for support and send it on Friday.
+
+## Notes
+### Legal review
+- The design is finished; the pricing text still waits for legal.
+- Legal promised feedback by Thursday.
+
+### Payment provider
+- The provider changes its API on the 15th; test against the new version first.`;
+
+const sampleSegments: MeetingSegment[] = [
+  [0, 'mic', 0, "Good morning everyone. Let's start with the launch plan for the new billing page."],
+  [7_300, 'system', 1, 'Morning. The design is finished, but we are still waiting for the legal review of the pricing text.'],
+  [16_000, 'system', 2, 'I talked to legal yesterday. They promised feedback by Thursday.'],
+  [22_900, 'mic', 0, 'Good. Then we keep the release date of November 20th. Anna, can you prepare the migration script?'],
+  [31_700, 'system', 1, 'Yes, I will write the migration script this week. It needs about two days, including tests.'],
+].map(([startMs, channel, speaker, text]) => ({
+  startMs: startMs as number, endMs: (startMs as number) + 6000, channel: channel as 'mic' | 'system', speaker: speaker as number, text: text as string,
+}));
+
+const meetings: Meeting[] = params.get('empty') === '1' ? [] : [{
+  id: 'm-sample', title: 'Billing page launch plan', titleFromUser: false,
+  startedAt: new Date(Date.now() - 26 * 3600_000).toISOString(), endedAt: new Date(Date.now() - 25 * 3600_000).toISOString(),
+  durationMs: 34 * 60_000, status: 'done', notes: 'launch date?\nlegal — pricing text', segments: sampleSegments,
+  speakers: [{ id: 0, name: 'Me', renamed: false }, { id: 1, name: 'Anna', renamed: true }, { id: 2, name: 'Speaker 2', renamed: false }],
+  summary: SAMPLE_SUMMARY, summaryModel: 'qwen3-4b-instruct-2507', language: 'en', error: null,
+  systemAudio: true, stoppedByLimit: false, hasAudio: true,
+}];
+let activeMeeting: Snapshot['meeting'] = null;
+let meetingTimer: ReturnType<typeof setInterval> | null = null;
+
+function meetingItem(m: Meeting): MeetingItem {
+  const preview = m.summary?.split('\n').find((l) => l.trim() && !l.startsWith('#') && !l.startsWith('-')) ??
+    m.segments.slice(0, 4).map((s) => s.text).join(' ');
+  return { id: m.id, title: m.title, startedAt: m.startedAt, durationMs: m.durationMs, status: m.status, hasSummary: !!m.summary, preview };
+}
+
+function startMeeting(): string {
+  if (activeMeeting) throw new Error('A meeting is already being recorded.');
+  const m: Meeting = {
+    id: `m-${Date.now()}`, title: '', titleFromUser: false, startedAt: new Date().toISOString(), endedAt: null, durationMs: 0,
+    status: 'recording', notes: '', segments: [], speakers: [{ id: 0, name: 'Me', renamed: false }], summary: null,
+    summaryModel: null, language: 'en', error: null, systemAudio: true, stoppedByLimit: false, hasAudio: true,
+  };
+  meetings.unshift(m);
+  activeMeeting = { id: m.id, startedAt: m.startedAt, stopsAt: new Date(Date.now() + settings.meetingMaxMinutes * 60_000).toISOString() };
+  emit('meeting-state', { active: activeMeeting });
+  emit('meetings-changed', null);
+  let i = 0;
+  meetingTimer = setInterval(() => {
+    emit('meeting-levels', { mic: Math.random() * 0.7, system: Math.random() * 0.5 });
+    if (++i % 25 === 0) {
+      const src = sampleSegments[(i / 25 - 1) % sampleSegments.length];
+      const seg = { ...src, startMs: Date.now() - Date.parse(m.startedAt) - 6000 };
+      m.segments.push(seg);
+      if (!m.speakers.some((s) => s.id === seg.speaker)) m.speakers.push({ id: seg.speaker, name: `Speaker ${seg.speaker}`, renamed: false });
+      emit('meeting-segments', { id: m.id, segments: [seg], speakers: m.speakers });
+    }
+  }, 200);
+  return m.id;
+}
+
+async function stopMeeting() {
+  const m = meetings.find((x) => x.id === activeMeeting?.id);
+  if (!m) return;
+  if (meetingTimer) clearInterval(meetingTimer);
+  activeMeeting = null;
+  m.durationMs = Date.now() - Date.parse(m.startedAt);
+  m.status = 'processing';
+  emit('meeting-state', { active: null });
+  emit('meeting-changed', { id: m.id });
+  emit('meeting-progress', { id: m.id, phase: 'speakers', fraction: null, text: null });
+  await sleep(1200);
+  m.status = 'summarizing';
+  emit('meeting-changed', { id: m.id });
+  for (let f = 0; f <= 1; f += 0.1) {
+    await sleep(200);
+    emit('meeting-progress', { id: m.id, phase: 'reading', fraction: f, text: null });
+  }
+  for (let n = 40; n <= SAMPLE_SUMMARY.length; n += 40) {
+    await sleep(60);
+    emit('meeting-progress', { id: m.id, phase: 'writing', fraction: null, text: SAMPLE_SUMMARY.slice(0, n) });
+  }
+  m.summary = SAMPLE_SUMMARY;
+  m.title = 'Billing page launch plan';
+  m.status = 'done';
+  emit('meeting-changed', { id: m.id });
+  emit('meetings-changed', null);
+}
+
 // ---------------------------------------------------------------- command router
 
 function snapshot(): Snapshot {
@@ -462,6 +583,7 @@ function snapshot(): Snapshot {
     permissions, fnUsage,
     pttListening: params.get('ptt') !== 'unavailable',
     version: '0.1.0',
+    meeting: activeMeeting,
   });
 }
 
@@ -592,6 +714,60 @@ export async function mockInvoke(cmd: string, a: Args): Promise<unknown> {
       if (!String(a.path).startsWith(BENCH_ROOT)) throw new Error('Only files in the app folder can be opened.');
       return;
 
+    case 'list_meetings': return meetings.map(meetingItem);
+    case 'get_meeting': {
+      const m = meetings.find((x) => x.id === a.id);
+      if (!m) throw new Error('That meeting no longer exists.');
+      return clone(m);
+    }
+    case 'start_meeting': return startMeeting();
+    case 'stop_meeting': void stopMeeting(); return;
+    case 'update_meeting': {
+      const m = meetings.find((x) => x.id === a.id);
+      if (m && a.patch.title !== undefined) { m.title = a.patch.title; m.titleFromUser = !!a.patch.title; }
+      if (m && a.patch.notes !== undefined) m.notes = a.patch.notes;
+      emit('meetings-changed', null);
+      return;
+    }
+    case 'rename_speaker': {
+      const m = meetings.find((x) => x.id === a.id)!;
+      const sp = m.speakers.find((x) => x.id === a.speaker);
+      if (sp) { sp.name = a.name; sp.renamed = true; }
+      return clone(m);
+    }
+    case 'delete_meeting': {
+      const i = meetings.findIndex((x) => x.id === a.id);
+      if (i >= 0) meetings.splice(i, 1);
+      emit('meetings-changed', null);
+      return;
+    }
+    case 'summarize_meeting': {
+      const m = meetings.find((x) => x.id === a.id)!;
+      activeMeeting = { id: m.id, startedAt: m.startedAt, stopsAt: null };
+      void stopMeeting();
+      return;
+    }
+    case 'meeting_folder': return `/Users/you/Library/Application Support/com.wordfall.app/meetings/${a.id}`;
+    case 'list_summary_models': return clone(summaryModels);
+    case 'download_summary_model': {
+      const m = summaryModels.find((x) => x.id === a.id)!;
+      void (async () => {
+        const total = m.sizeMb * 1_000_000;
+        for (let i = 1; i <= 40; i++) {
+          await sleep(90);
+          emit('model-download-progress', { id: m.id, downloaded: Math.round((total * i) / 40), total });
+        }
+        m.downloaded = true;
+        emit('summary-models-changed', null);
+      })();
+      return;
+    }
+    case 'delete_summary_model': {
+      const m = summaryModels.find((x) => x.id === a.id);
+      if (m) m.downloaded = false;
+      emit('summary-models-changed', null);
+      return;
+    }
     case 'list_models': return clone(models);
     case 'download_model': void download(a.id); return;
     case 'delete_model': {

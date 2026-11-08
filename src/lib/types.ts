@@ -37,6 +37,96 @@ export interface Settings {
   promptMode: PromptMode;
   /** Advanced decoder knobs (tuned with the bench tool); opaque to the UI. */
   decode: Record<string, unknown>;
+  /** Meetings stop by themselves after this many minutes (0 = only when stopped). */
+  meetingMaxMinutes: number;
+  /** Record what the computer plays (the other participants), not just the microphone. */
+  meetingSystemAudio: boolean;
+  /** Tell speakers apart in meeting transcripts. */
+  meetingSpeakers: boolean;
+  /** Language model that writes meeting notes. */
+  summaryModel: string;
+  /** Meeting recordings are deleted after this many days (0 = kept). */
+  meetingAudioDays: number;
+}
+
+export type MeetingStatus = 'recording' | 'processing' | 'summarizing' | 'done';
+export type Channel = 'mic' | 'system';
+
+export interface MeetingSegment {
+  startMs: number;
+  endMs: number;
+  channel: Channel;
+  speaker: number;
+  text: string;
+  language?: string;
+}
+
+export interface MeetingSpeaker {
+  id: number;
+  name: string;
+  renamed: boolean;
+}
+
+export interface Meeting {
+  id: string;
+  /** Empty until the user or the notes name it. */
+  title: string;
+  titleFromUser: boolean;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number;
+  status: MeetingStatus;
+  /** The user's own notes. */
+  notes: string;
+  segments: MeetingSegment[];
+  speakers: MeetingSpeaker[];
+  /** Markdown notes written by the language model. */
+  summary: string | null;
+  summaryModel: string | null;
+  language: string | null;
+  /** Why the notes are missing, or what went wrong. */
+  error: string | null;
+  systemAudio: boolean;
+  stoppedByLimit: boolean;
+  hasAudio: boolean;
+}
+
+export interface MeetingItem {
+  id: string;
+  title: string;
+  startedAt: string;
+  durationMs: number;
+  status: MeetingStatus;
+  hasSummary: boolean;
+  preview: string;
+}
+
+export interface ActiveMeeting {
+  id: string;
+  startedAt: string;
+  /** When the time limit stops it, if there is one. */
+  stopsAt: string | null;
+}
+
+export type MeetingPhase = 'transcribing' | 'speakers' | 'loading' | 'reading' | 'writing';
+
+export interface MeetingProgress {
+  id: string;
+  phase: MeetingPhase;
+  /** 0..1 while reading the transcript. */
+  fraction: number | null;
+  /** The notes so far while writing. */
+  text: string | null;
+}
+
+export interface SummaryModelInfo {
+  id: string;
+  displayName: string;
+  sizeMb: number;
+  downloaded: boolean;
+  badge: string;
+  description: string;
+  recommended: boolean;
 }
 
 export interface HistoryRecord {
@@ -134,6 +224,8 @@ export interface Snapshot {
   fnUsage: FnUsage;
   pttListening: boolean;
   version: string;
+  /** The meeting being recorded, if any. */
+  meeting: ActiveMeeting | null;
 }
 
 export type LabCategory = 'short' | 'jargon' | 'numbers' | 'prose' | 'long' | 'personal';
@@ -198,6 +290,13 @@ export interface EventMap {
   'model-download-progress': { id: string; downloaded: number; total: number };
   'permissions-changed': Permissions;
   'lab-levels': { levels: number[] };
+  'meeting-state': { active: ActiveMeeting | null };
+  'meeting-segments': { id: string; segments: MeetingSegment[]; speakers: MeetingSpeaker[] };
+  'meeting-changed': { id: string };
+  'meeting-progress': MeetingProgress;
+  'meeting-levels': { mic?: number; system?: number };
+  'meetings-changed': null;
+  'summary-models-changed': null;
 }
 
 export type EventName = keyof EventMap;

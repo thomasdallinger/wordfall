@@ -10,7 +10,7 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
-    audio, lab, platform,
+    audio, lab, llm, meetings, platform,
     session::{self, RecMode, RecState},
     settings::Settings,
     store::{self, DictEntry, HistoryRecord, ImportResult, Stats, Suggestion},
@@ -38,6 +38,8 @@ pub struct Snapshot {
     fn_usage: platform::FnUsage,
     ptt_listening: bool,
     version: String,
+    /// The meeting being recorded, if any.
+    meeting: Option<meetings::ActiveMeeting>,
 }
 
 #[tauri::command]
@@ -56,6 +58,7 @@ pub fn get_snapshot(app: AppHandle, core: State<'_, Core>) -> Snapshot {
         fn_usage: platform::fn_usage(),
         ptt_listening: core.listener.get().is_some_and(|l| l.installed.load(Ordering::Relaxed)),
         version: app.package_info().version.to_string(),
+        meeting: core.meetings.active(),
     }
 }
 
@@ -570,4 +573,128 @@ pub fn spawn_permission_watch(app: AppHandle) {
             }
         }
     });
+}
+
+// ---------- meetings ----------
+
+#[tauri::command]
+pub fn list_meetings(app: AppHandle) -> Vec<meetings::MeetingItem> {
+    meetings::list(&app)
+}
+
+#[tauri::command]
+pub fn get_meeting(app: AppHandle, id: String) -> CmdResult<meetings::Meeting> {
+    meetings::get(&app, &id).map_err(err)
+}
+
+#[tauri::command]
+pub async fn start_meeting(app: AppHandle) -> CmdResult<String> {
+    // Opening the audio devices can take a moment; keep it off the main thread.
+    tauri::async_runtime::spawn_blocking(move || meetings::start(&app).map_err(|e| format!("{e:#}")))
+        .await
+        .map_err(err)?
+}
+
+#[tauri::command]
+pub fn stop_meeting(app: AppHandle) {
+    meetings::stop(&app);
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingPatch {
+    title: Option<String>,
+    notes: Option<String>,
+}
+
+#[tauri::command]
+pub fn update_meeting(app: AppHandle, id: String, patch: MeetingPatch) -> CmdResult<()> {
+    meetings::edit(&app, &id, |m| {
+        if let Some(t) = patch.title {
+            m.title_from_user = !t.trim().is_empty();
+            m.title = t.trim().to_string();
+        }
+        if let Some(n) = patch.notes {
+            m.notes = n;
+        }
+    })
+    .map(drop)
+    .map_err(err)
+}
+
+#[tauri::command]
+pub fn rename_speaker(app: AppHandle, id: String, speaker: u32, name: String) -> CmdResult<meetings::Meeting> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("A speaker needs a name.".into());
+    }
+    meetings::edit(&app, &id, |m| {
+        if let Some(s) = m.speakers.iter_mut().find(|s| s.id == speaker) {
+            s.name = name;
+            s.renamed = true;
+        }
+    })
+    .map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_meeting(app: AppHandle, id: String) -> CmdResult<()> {
+    meetings::delete(&app, &id).map_err(err)
+}
+
+#[tauri::command]
+pub fn summarize_meeting(app: AppHandle, id: String) -> CmdResult<()> {
+    meetings::summarize(&app, &id).map_err(|e| format!("{e:#}"))
+}
+
+/// The folder with a meeting's files (for "Show recordings").
+#[tauri::command]
+pub fn meeting_folder(core: State<'_, Core>, id: String) -> String {
+    meetings::root(&core.dir).join(id).display().to_string()
+}
+
+#[tauri::command]
+pub fn list_summary_models(core: State<'_, Core>) -> Vec<llm::LlmInfo> {
+    llm::list(&core.model_dirs.read().own)
+}
+
+#[tauri::command]
+pub fn download_summary_model(app: AppHandle, core: State<'_, Core>, id: String) -> CmdResult<()> {
+    let entry = llm::entry(&id).ok_or("unknown model")?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut downloads = core.downloads.lock();
+        if downloads.contains_key(&id) {
+            return Ok(());
+        }
+        downloads.insert(id.clone(), cancel.clone());
+    }
+    let own = core.model_dirs.read().own.clone();
+    tauri::async_runtime::spawn(async move {
+        let progress_app = app.clone();
+        let res = transcribe::download_file(entry.url, entry.file, entry.bytes, &own, cancel, |done, total| {
+            let _ = progress_app.emit("model-download-progress", json!({ "id": entry.id, "downloaded": done, "total": total }));
+        })
+        .await;
+        app.state::<Core>().downloads.lock().remove(entry.id);
+        match res {
+            Ok(_) => session::notice(&app, "success", "Summary model ready", &format!("{} downloaded.", entry.display_name)),
+            Err(e) => session::notice(&app, "error", "Download failed", &format!("{}: {e:#}", entry.display_name)),
+        }
+        let _ = app.emit("summary-models-changed", ());
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_summary_model(app: AppHandle, core: State<'_, Core>, id: String) -> CmdResult<()> {
+    let entry = llm::entry(&id).ok_or("unknown model")?;
+    if let Some(cancel) = core.downloads.lock().get(&id) {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    if let Some(path) = llm::locate(&core.model_dirs.read().own, entry) {
+        std::fs::remove_file(path).map_err(err)?;
+    }
+    let _ = app.emit("summary-models-changed", ());
+    Ok(())
 }

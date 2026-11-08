@@ -1,6 +1,6 @@
 <script lang="ts">
   import { PRODUCT } from '../brand';
-  import { acceleratorParts, pttCap } from '../format';
+  import { acceleratorParts, clock, pttCap } from '../format';
   import { IS_WINDOWS } from '../platform';
   import { app, SETTINGS_SECTIONS, type SettingsSection, type View } from '../state.svelte';
   import Keycaps from './Keycaps.svelte';
@@ -8,14 +8,29 @@
 
   const items: { id: View; label: string; key: string }[] = [
     { id: 'transcripts', label: 'Transcripts', key: '1' },
-    { id: 'dictionary', label: 'Dictionary', key: '2' },
-    { id: 'settings', label: 'Settings', key: '3' },
+    { id: 'meetings', label: 'Meetings', key: '2' },
+    { id: 'dictionary', label: 'Dictionary', key: '3' },
+    { id: 'settings', label: 'Settings', key: '4' },
   ];
 
   const inSettings = $derived(app.view === 'settings' || app.view === 'lab');
   const rec = $derived(app.snapshot?.recState ?? 'idle');
   const cap = $derived(pttCap(app.settings?.pttKey));
   const toggleKeys = $derived(acceleratorParts(app.settings?.toggleShortcut));
+
+  const meeting = $derived(app.activeMeeting);
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!meeting) return;
+    const t = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(t);
+  });
+
+  function openMeeting() {
+    if (!meeting) return;
+    app.go('meetings');
+    app.meetingId = meeting.id;
+  }
 
   function isActive(id: View) {
     return id === 'settings' ? inSettings : app.view === id;
@@ -65,7 +80,13 @@
   </ul>
 
   <div class="foot" aria-live="polite">
-    {#if rec === 'listening'}
+    {#if meeting}
+      <button class="meeting" onclick={openMeeting}>
+        <span class="live-dot" aria-hidden="true"></span>
+        <span>Meeting</span>
+        <span class="clock">{clock(now - Date.parse(meeting.startedAt))}</span>
+      </button>
+    {:else if rec === 'listening'}
       <span class="live-dot" aria-hidden="true"></span>
       <span>Listening</span>
     {:else if rec === 'processing'}
@@ -184,6 +205,20 @@
     align-items: center;
     gap: 5px;
     white-space: nowrap;
+  }
+  .meeting {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--ink);
+  }
+  .meeting:hover {
+    text-decoration: underline;
+  }
+  .clock {
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
   }
   .live-dot,
   .busy-dot {

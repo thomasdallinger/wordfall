@@ -52,7 +52,7 @@ permanent dark mode.
 
 ## Information architecture
 
-- **Sidebar:** *Transcripts* (home), *Dictionary*, *Settings*. Voice Lab lives under Settings → Accuracy.
+- **Sidebar:** *Transcripts* (home), *Meetings*, *Dictionary*, *Settings*. Voice Lab lives under Settings → Accuracy.
 - **Transcripts:** status line (only if something needs attention, or a one-line "Hold fn to dictate"
   hint when the list is empty) → search field → transcripts grouped by day ("Today", "Yesterday",
   "Monday 19 October"). Each entry: the text in serif, time on the left margin, actions on hover

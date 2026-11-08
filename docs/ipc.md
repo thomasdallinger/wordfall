@@ -40,6 +40,11 @@ interface Settings {
   keepAudio: boolean;            // keep WAV of each dictation for correction/benchmarking
   promptMode: 'none' | 'dictionary' | 'projects' | 'glossary'; // vocabulary hints fed to Whisper
   decode: Record<string, unknown>; // advanced decoder knobs (tuned via `wordfall bench`); UI treats as opaque
+  meetingMaxMinutes: number;     // meetings stop by themselves after this long; 0 = only when stopped (default 180)
+  meetingSystemAudio: boolean;   // also record what the computer plays (Windows loopback, macOS 14.2+ process tap)
+  meetingSpeakers: boolean;      // tell speakers apart (30 MB CAM++ voice model, fetched on first meeting)
+  summaryModel: string;          // id from list_summary_models, e.g. "qwen3-4b-instruct-2507"
+  meetingAudioDays: number;      // meeting WAVs are deleted after this many days; 0 = kept (default 14)
 }
 
 interface HistoryRecord {
@@ -82,7 +87,23 @@ interface Snapshot {
   settings: Settings; stats: Stats; recState: RecState; recMode: RecMode;
   modelState: ModelState; modelError: string | null; activeModel: string | null;
   permissions: Permissions; fnUsage: FnUsage; pttListening: boolean; version: string;
+  meeting: ActiveMeeting | null; // the meeting being recorded
 }
+
+// Meetings. Times in ms from the start of the meeting; speaker 0 is "Me".
+type MeetingStatus = 'recording' | 'processing' | 'summarizing' | 'done';
+interface MeetingSegment { startMs: number; endMs: number; channel: 'mic' | 'system'; speaker: number; text: string; language?: string }
+interface MeetingSpeaker { id: number; name: string; renamed: boolean }
+interface Meeting {
+  id: string; title: string; titleFromUser: boolean; startedAt: string; endedAt: string | null; durationMs: number;
+  status: MeetingStatus; notes: string /* the user's own */; segments: MeetingSegment[]; speakers: MeetingSpeaker[];
+  summary: string | null /* Markdown: "# Title", summary, ## decisions / action items / notes */;
+  summaryModel: string | null; language: string | null; error: string | null;
+  systemAudio: boolean; stoppedByLimit: boolean; hasAudio: boolean;
+}
+interface MeetingItem { id: string; title: string; startedAt: string; durationMs: number; status: MeetingStatus; hasSummary: boolean; preview: string }
+interface ActiveMeeting { id: string; startedAt: string; stopsAt: string | null }
+interface SummaryModelInfo { id: string; displayName: string; sizeMb: number; downloaded: boolean; badge: string; description: string; recommended: boolean }
 ```
 
 ## Commands (`invoke`)
@@ -128,6 +149,17 @@ interface Snapshot {
 | `bench_info` | – | `BenchInfo` |
 | `open_path` | `{ path }` | – (opens a file/folder inside Wordfall's data dir) |
 | `resize_widget` | `{ width: number, height: number }` (logical px of the widget content) | – |
+| `list_meetings` | – | `MeetingItem[]` (newest first) |
+| `get_meeting` | `{ id }` | `Meeting` |
+| `start_meeting` | – | `string` (id; fails if one is running or the microphone is unavailable) |
+| `stop_meeting` | – | – (the rest is transcribed, speakers labelled, then notes written; follow `meeting-progress`) |
+| `update_meeting` | `{ id, patch: { title?: string, notes?: string } }` | – (an empty title lets the notes name it) |
+| `rename_speaker` | `{ id, speaker: number, name }` | `Meeting` |
+| `delete_meeting` | `{ id }` | – (not while it's recording or being processed) |
+| `summarize_meeting` | `{ id }` | – (writes the notes again in the background) |
+| `meeting_folder` | `{ id }` | `string` (folder with `meeting.json`, `mic.wav`, `system.wav`; open with `open_path`) |
+| `list_summary_models` | – | `SummaryModelInfo[]` |
+| `download_summary_model` / `delete_summary_model` | `{ id }` | – (progress via `model-download-progress`) |
 
 ## Events (`listen`)
 
@@ -145,3 +177,10 @@ interface Snapshot {
 | `model-download-progress` | `{ id: string, downloaded: number, total: number }` |
 | `permissions-changed` | `Permissions` |
 | `lab-levels` | `{ levels: number[] }` (7 values, ~30 fps while a Voice Lab clip records) |
+| `meeting-state` | `{ active: ActiveMeeting \| null }` |
+| `meeting-levels` | `{ mic?: number, system?: number }` (0..1, 5 per second while recording) |
+| `meeting-segments` | `{ id, segments: MeetingSegment[], speakers: MeetingSpeaker[] }` (new transcript; speakers are provisional until the meeting ends) |
+| `meeting-progress` | `{ id, phase: 'transcribing' \| 'speakers' \| 'loading' \| 'reading' \| 'writing', fraction: number \| null, text: string \| null }` (`text` = notes so far while writing) |
+| `meeting-changed` | `{ id }` (status, transcript or notes changed: reload it) |
+| `meetings-changed` | – |
+| `summary-models-changed` | – |

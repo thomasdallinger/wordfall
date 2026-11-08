@@ -61,6 +61,16 @@ pub struct Settings {
     pub decode: DecodeOptions,
     /// Saved widget position (top-left, physical px) when the user dragged it.
     pub widget_position: Option<(i32, i32)>,
+    /// Meetings stop by themselves after this long (0 = only when stopped).
+    pub meeting_max_minutes: u32,
+    /// Record what the computer plays (the other participants), not just the microphone.
+    pub meeting_system_audio: bool,
+    /// Tell speakers apart in meeting transcripts.
+    pub meeting_speakers: bool,
+    /// Language model that writes meeting notes (see `llm::CATALOG`).
+    pub summary_model: String,
+    /// Meeting recordings are deleted after this many days (0 = kept).
+    pub meeting_audio_days: u32,
 }
 
 impl Default for Settings {
@@ -92,6 +102,11 @@ impl Default for Settings {
             prompt_mode: PromptMode::None,
             decode: DecodeOptions { vad: Vad::Silero, ..DecodeOptions::default() },
             widget_position: None,
+            meeting_max_minutes: 180,
+            meeting_system_audio: true,
+            meeting_speakers: true,
+            summary_model: "qwen3-4b-instruct-2507".into(),
+            meeting_audio_days: 14,
         }
     }
 }
@@ -129,6 +144,7 @@ impl Settings {
         }
         let mut next: Settings = serde_json::from_value(current)?;
         next.input_gain = next.input_gain.clamp(0.5, 4.0);
+        next.meeting_max_minutes = next.meeting_max_minutes.min(24 * 60);
         let mut seen = std::collections::HashSet::new();
         next.languages.retain(|l| whisper_rs::get_lang_id(l).is_some() && seen.insert(l.clone()));
         Ok(next)

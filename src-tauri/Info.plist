@@ -4,6 +4,8 @@
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Wordfall listens while you hold your push-to-talk key and transcribes your speech on this Mac.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Wordfall records the other participants of a meeting you start, to transcribe it on this Mac.</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Wordfall pastes your transcribed text into the app you're using.</string>
 	<key>LSUIElement</key>

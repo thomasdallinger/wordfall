@@ -6,6 +6,7 @@
   import Accuracy from './settings/Accuracy.svelte';
   import Data from './settings/Data.svelte';
   import General from './settings/General.svelte';
+  import Meetings from './settings/Meetings.svelte';
   import Model from './settings/Model.svelte';
   import Pill from './settings/Pill.svelte';
   import Recording from './settings/Recording.svelte';
@@ -67,6 +68,7 @@
     <General />
     <Recording />
     <Model />
+    <Meetings />
     <Pill />
     <Accuracy />
     <Data />

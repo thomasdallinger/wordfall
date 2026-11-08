@@ -1,6 +1,9 @@
 [env]
 # whisper.cpp's CPU-feature probes (try_run) can hang on Apple Silicon; Metal does the heavy lifting anyway.
 GGML_NATIVE = "OFF"
+# llama.cpp (the `wordfall-llm` helper) must use the same static C runtime as the rest of the app on
+# Windows; its build script only switches CMake to /MT when asked. Ignored elsewhere.
+LLAMA_STATIC_CRT = "1"
 
 [target.x86_64-pc-windows-msvc]
 # Link the C and C++ runtimes statically: whisper.cpp needs MSVCP140.dll, which clean Windows installs

@@ -3,14 +3,18 @@ mod bench;
 mod bench_report;
 mod commands;
 mod cues;
+mod fbank;
 mod hotkey;
 mod lab;
 mod lists;
+mod llm;
+mod meetings;
 mod metrics;
 mod platform;
 mod postprocess;
 mod session;
 mod settings;
+mod speakers;
 mod storage;
 mod store;
 mod transcribe;
@@ -65,6 +69,9 @@ pub struct Core {
     pub projects: Vec<String>,
     /// In-progress Voice Lab recording (prompt id, recording).
     pub lab: Mutex<Option<(String, audio::Recording)>>,
+    pub meetings: meetings::Meetings,
+    /// Tray items whose label follows the app's state.
+    tray_meeting: OnceLock<MenuItem<tauri::Wry>>,
 }
 
 const DASHBOARD: &str = "dashboard";
@@ -191,11 +198,21 @@ pub fn apply_autostart(app: &AppHandle) {
     }
 }
 
+/// Updates tray labels that depend on state (the meeting item).
+pub fn refresh_tray(app: &AppHandle) {
+    if let Some(item) = app.state::<Core>().tray_meeting.get() {
+        let label = if meetings::is_recording(app) { "Stop Meeting" } else { "Start Meeting" };
+        let _ = item.set_text(label);
+    }
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Wordfall", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "Start / Stop Dictation", true, None::<&str>)?;
+    let meeting = MenuItem::with_id(app, "meeting", "Start Meeting", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Wordfall", true, Some("CmdOrCtrl+Q"))?;
-    let menu = Menu::with_items(app, &[&open, &toggle, &PredefinedMenuItem::separator(app)?, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &toggle, &meeting, &PredefinedMenuItem::separator(app)?, &quit])?;
+    let _ = app.state::<Core>().tray_meeting.set(meeting);
     // macOS tints the monochrome template to the menu bar; the Windows tray wants the colour icon.
     let icon = if cfg!(target_os = "macos") {
         tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?
@@ -210,6 +227,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, e| match e.id().as_ref() {
             "open" => show_dashboard(app),
             "toggle" => session::toggle(app, RecMode::Click),
+            "meeting" => {
+                let app = app.clone();
+                thread::spawn(move || meetings::toggle(&app));
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -293,6 +314,13 @@ pub fn run() {
         }
         return;
     }
+    if args.iter().any(|a| a == "--meeting") {
+        if let Err(e) = meetings::cli(&args) {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--transcribe") {
         if let Err(e) = cli_transcribe(&args) {
             eprintln!("error: {e:#}");
@@ -335,7 +363,11 @@ pub fn run() {
                 widget_size: Mutex::new((140.0, 40.0)),
                 projects: dirs::home_dir().map(|h| vocab::project_names(&h)).unwrap_or_default(),
                 lab: Mutex::new(None),
+                meetings: meetings::Meetings::default(),
+                tray_meeting: OnceLock::new(),
             });
+            meetings::recover(&dir);
+            meetings::prune_audio(&dir, settings.meeting_audio_days);
             let silero_app = handle.clone();
             tauri::async_runtime::spawn(async move {
                 let dir = silero_app.state::<Core>().model_dirs.read().own.clone();
@@ -432,6 +464,18 @@ pub fn run() {
             commands::lab_delete,
             commands::bench_info,
             commands::open_path,
+            commands::list_meetings,
+            commands::get_meeting,
+            commands::start_meeting,
+            commands::stop_meeting,
+            commands::update_meeting,
+            commands::rename_speaker,
+            commands::delete_meeting,
+            commands::summarize_meeting,
+            commands::meeting_folder,
+            commands::list_summary_models,
+            commands::download_summary_model,
+            commands::delete_summary_model,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Wordfall");

@@ -165,7 +165,7 @@ impl ModelDirs {
     }
 }
 
-fn is_complete(path: &Path, expected: u64) -> bool {
+pub fn is_complete(path: &Path, expected: u64) -> bool {
     std::fs::metadata(path).map(|m| m.len() == expected).unwrap_or(false)
 }
 
@@ -174,13 +174,25 @@ pub async fn download(
     entry: &'static CatalogEntry,
     own_dir: &Path,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    progress: impl FnMut(u64, u64),
+) -> anyhow::Result<PathBuf> {
+    download_file(entry.url, entry.file, entry.bytes, own_dir, cancel, progress).await
+}
+
+/// Streams `url` to `<dir>/<file>.part`, checks its size, then renames it into place.
+pub async fn download_file(
+    url: &str,
+    file_name: &str,
+    bytes: u64,
+    own_dir: &Path,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
     mut progress: impl FnMut(u64, u64),
 ) -> anyhow::Result<PathBuf> {
     tokio::fs::create_dir_all(own_dir).await?;
-    let dest = own_dir.join(entry.file);
-    let part = own_dir.join(format!("{}.part", entry.file));
-    let resp = reqwest::Client::new().get(entry.url).send().await?.error_for_status()?;
-    let total = resp.content_length().unwrap_or(entry.bytes);
+    let dest = own_dir.join(file_name);
+    let part = own_dir.join(format!("{file_name}.part"));
+    let resp = reqwest::Client::new().get(url).send().await?.error_for_status()?;
+    let total = resp.content_length().unwrap_or(bytes);
     let mut file = tokio::fs::File::create(&part).await?;
     let mut stream = resp.bytes_stream();
     let mut done = 0u64;
@@ -201,9 +213,9 @@ pub async fn download(
     }
     file.flush().await?;
     drop(file);
-    if done != entry.bytes {
+    if done != bytes {
         let _ = tokio::fs::remove_file(&part).await;
-        anyhow::bail!("download incomplete ({done} of {} bytes)", entry.bytes);
+        anyhow::bail!("download incomplete ({done} of {bytes} bytes)");
     }
     tokio::fs::rename(&part, &dest).await?;
     progress(done, total);
@@ -528,40 +540,8 @@ impl Engine {
             loaded.state = loaded.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
             loaded.state_audio_ctx = audio_ctx;
         }
-        let lang: String = match languages {
-            _ if loaded.english_only => "en".into(),
-            [] => "auto".into(),
-            [one] => one.clone(),
-            several => {
-                // Like whisper's own "auto", but only the user's languages compete, and a quick check
-                // on a short window settles clear cases.
-                let threads = thread_count(opts) as usize;
-                let mut probs = loaded.language_probs(audio, threads)?;
-                let mut window = "short";
-                let lookup = |probs: &[f32], code: &str| {
-                    whisper_rs::get_lang_id(code).and_then(|id| probs.get(id as usize).copied()).unwrap_or(0.0)
-                };
-                // The full-window check needs the main state on the full window (the default).
-                if needs_full_window(several, |l| lookup(&probs, l)) && audio_ctx == 0 {
-                    // Only a second opinion: if it fails, the quick guess still beats no dictation.
-                    match loaded.full_window_language_probs(audio, threads) {
-                        Ok(full) => {
-                            probs = full;
-                            window = "full";
-                        }
-                        Err(e) => log::warn!("full-window language check failed, keeping the quick guess: {e}"),
-                    }
-                }
-                let prob = |code: &str| lookup(&probs, code);
-                let previous = self.last_language.lock().clone();
-                let chosen = pick_language(several, previous.as_deref(), prob).to_string();
-                log::info!(
-                    "language {chosen} ({}; {window} window)",
-                    several.iter().map(|l| format!("{l} {:.2}", prob(l))).collect::<Vec<_>>().join(", ")
-                );
-                chosen
-            }
-        };
+        let previous = self.last_language.lock().clone();
+        let lang = choose_language(loaded, audio, languages, previous.as_deref(), opts, audio_ctx)?;
         let params = full_params(opts, Some(lang.as_str()), prompt, audio_ctx);
         loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
         let language = if lang == "auto" {
@@ -604,11 +584,128 @@ impl Engine {
     }
 }
 
+/// The language to decode `audio` in. `languages` are the ones the user speaks: empty = any
+/// (whisper detects), one = forced, several = whichever of them the audio sounds most like,
+/// staying with `previous` when it's a close call.
+fn choose_language(
+    loaded: &mut Loaded,
+    audio: &[f32],
+    languages: &[String],
+    previous: Option<&str>,
+    opts: &DecodeOptions,
+    audio_ctx: i32,
+) -> anyhow::Result<String> {
+    Ok(match languages {
+        _ if loaded.english_only => "en".into(),
+        [] => "auto".into(),
+        [one] => one.clone(),
+        several => {
+            // Like whisper's own "auto", but only the user's languages compete, and a quick check
+            // on a short window settles clear cases.
+            let threads = thread_count(opts) as usize;
+            let mut probs = loaded.language_probs(audio, threads)?;
+            let mut window = "short";
+            let lookup = |probs: &[f32], code: &str| {
+                whisper_rs::get_lang_id(code).and_then(|id| probs.get(id as usize).copied()).unwrap_or(0.0)
+            };
+            // The full-window check needs the main state on the full window (the default).
+            if needs_full_window(several, |l| lookup(&probs, l)) && audio_ctx == 0 {
+                // Only a second opinion: if it fails, the quick guess still beats no dictation.
+                match loaded.full_window_language_probs(audio, threads) {
+                    Ok(full) => {
+                        probs = full;
+                        window = "full";
+                    }
+                    Err(e) => log::warn!("full-window language check failed, keeping the quick guess: {e}"),
+                }
+            }
+            let prob = |code: &str| lookup(&probs, code);
+            let chosen = pick_language(several, previous, prob).to_string();
+            log::info!(
+                "language {chosen} ({}; {window} window)",
+                several.iter().map(|l| format!("{l} {:.2}", prob(l))).collect::<Vec<_>>().join(", ")
+            );
+            chosen
+        }
+    })
+}
+
+/// A stretch of a longer recording with its text (times relative to the audio passed in).
+#[derive(Debug, Clone)]
+pub struct TimedText {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
 impl Engine {
-    /// Speech-only audio according to Silero VAD (segments joined with short silences),
-    /// or `None` if there's no speech. whisper.cpp only applies its built-in VAD in
-    /// `whisper_full()`, not with an external state, so we run it ourselves.
-    fn silero_speech(&self, audio: &[f32]) -> anyhow::Result<Option<Vec<f32>>> {
+    /// Where there is speech in `audio`, as sample ranges: Silero VAD when available, otherwise
+    /// the energy gate (one range at most).
+    pub fn speech_regions(&self, audio: &[f32]) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+        if self.silero_path.lock().is_none() {
+            return Ok(crate::vad::trim(audio).into_iter().collect());
+        }
+        self.silero_segments(audio)
+    }
+
+    /// Transcribes one utterance of a meeting (a few seconds up to about 30), keeping whisper's
+    /// segment timestamps. Unlike `transcribe` it leaves dictation's language memory alone; the
+    /// meeting passes its own `previous` language. Returns the segments and the language used.
+    pub fn transcribe_timed(
+        &self,
+        audio: &[f32],
+        languages: &[String],
+        previous: Option<&str>,
+        prompt: Option<&str>,
+        opts: &DecodeOptions,
+    ) -> anyhow::Result<(Vec<TimedText>, Option<String>)> {
+        let mut guard = self.loaded.lock();
+        let loaded = guard.as_mut().ok_or_else(|| anyhow::anyhow!("no model loaded"))?;
+        let min = (opts.min_audio_ms as usize) * 16;
+        let padded: Vec<f32>;
+        let audio = if audio.len() < min {
+            padded = audio.iter().copied().chain(std::iter::repeat(0.0).take(min - audio.len())).collect();
+            &padded[..]
+        } else {
+            audio
+        };
+        // Meetings always use the full window: timestamps and long utterances need it.
+        if loaded.state_audio_ctx != 0 {
+            loaded.state = loaded.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
+            loaded.state_audio_ctx = 0;
+        }
+        let lang = choose_language(loaded, audio, languages, previous, opts, 0)?;
+        let mut params = full_params(opts, Some(lang.as_str()), prompt, 0);
+        params.set_no_timestamps(false);
+        loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
+        let language = if lang == "auto" {
+            whisper_rs::get_lang_str(loaded.state.full_lang_id_from_state()).map(str::to_string)
+        } else {
+            Some(lang)
+        };
+        *self.last_used.lock() = Some(Instant::now());
+        let mut out = Vec::new();
+        for seg in loaded.state.as_iter() {
+            if seg.no_speech_probability() > opts.no_speech_skip {
+                continue;
+            }
+            let Ok(text) = seg.to_str_lossy() else { continue };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            // Timestamps are in centiseconds.
+            out.push(TimedText {
+                start_ms: seg.start_timestamp().max(0) as u64 * 10,
+                end_ms: seg.end_timestamp().max(0) as u64 * 10,
+                text: text.to_string(),
+            });
+        }
+        Ok((out, language))
+    }
+
+    /// Silero speech segments as sample ranges.
+    fn silero_segments(&self, audio: &[f32]) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
         let mut guard = self.silero.lock();
         if guard.is_none() {
             let path = self.silero_path.lock().clone().ok_or_else(|| anyhow::anyhow!("Silero VAD model not available"))?;
@@ -624,18 +721,31 @@ impl Engine {
         vp.set_speech_pad(200);
         vp.set_min_silence_duration(300);
         let segments = vctx.segments_from_samples(vp, audio).map_err(|e| anyhow::anyhow!("Silero VAD: {e:?}"))?;
-        let gap = vec![0.0f32; 1_600];
-        let mut out = Vec::with_capacity(audio.len());
+        let mut out = Vec::new();
         for i in 0..segments.num_segments() {
             let Some(seg) = segments.get_segment(i) else { continue };
             let start = ((seg.start * 160.0) as usize).min(audio.len());
             let end = ((seg.end * 160.0) as usize).min(audio.len());
             if end > start {
-                if !out.is_empty() {
-                    out.extend_from_slice(&gap);
-                }
-                out.extend_from_slice(&audio[start..end]);
+                out.push(start..end);
             }
+        }
+        Ok(out)
+    }
+}
+
+impl Engine {
+    /// Speech-only audio according to Silero VAD (segments joined with short silences),
+    /// or `None` if there's no speech. whisper.cpp only applies its built-in VAD in
+    /// `whisper_full()`, not with an external state, so we run it ourselves.
+    fn silero_speech(&self, audio: &[f32]) -> anyhow::Result<Option<Vec<f32>>> {
+        let gap = vec![0.0f32; 1_600];
+        let mut out = Vec::with_capacity(audio.len());
+        for range in self.silero_segments(audio)? {
+            if !out.is_empty() {
+                out.extend_from_slice(&gap);
+            }
+            out.extend_from_slice(&audio[range]);
         }
         Ok((!out.is_empty()).then_some(out))
     }

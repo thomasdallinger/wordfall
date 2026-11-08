@@ -10,7 +10,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macos_keys;
 #[cfg(target_os = "macos")]
-pub use {macos::*, macos_keys::run_key_listener};
+mod macos_tap;
+#[cfg(target_os = "macos")]
+pub use {macos::*, macos_keys::run_key_listener, macos_tap::SystemTap};
 
 #[cfg(windows)]
 mod windows;

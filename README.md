@@ -21,6 +21,10 @@ Local speech recognition for macOS and Windows. Nothing leaves your computer.</p
   with a desktop GPU about 0.1–0.4 s (RTX 5070 Ti, 7–38 s clips).
 - **Gets your words right.** A dictionary of replacements (“post gress” → “PostgreSQL”), words to
   recognise, and suggestions learned from your transcripts.
+- **Meeting notes.** Start a meeting from *Meetings*: Wordfall records you and the other participants (the
+  computer's audio, so Zoom, Teams and Meet work with headphones), transcribes as it goes, tells speakers apart,
+  and writes notes with decisions and action items when you stop, with a language model that runs on your
+  computer. Jot down your own notes during the meeting and the notes are built around them.
 - **No hallucinated "Thank you."** Voice activity detection drops silence, hum and typing before decoding.
 - **Measured, not guessed.** A built-in benchmark harness scores engines and settings on accuracy and
   latency (see [`bench/`](bench/README.md) and [results](docs/benchmark-results.md)).
@@ -119,11 +123,12 @@ browser control → Smart App Control*).
    npm run tauri:windows -- --cpu              # CPU only, for PCs without a graphics driver that has Vulkan
    ```
 
-   `tauri:windows` is `tauri build` with whisper.cpp's Vulkan backend, whisper.cpp built for AVX2, and the
+   `tauri:windows` is `tauri build` with the Vulkan backend for whisper.cpp and llama.cpp (meeting notes),
+   whisper.cpp built for AVX2, and the
    C/C++ runtime linked statically so the app runs without the Visual C++ Redistributable (see
    `scripts/tauri-windows.mjs`; `-- --features cuda` builds for CUDA instead, which needs the CUDA toolkit).
    Use the GPU build if you can: on the CPU, even a fast desktop processor needs about as long as you spoke
-   to write it out.
+   to write it out. The first build compiles whisper.cpp and llama.cpp and takes a while (15 to 30 minutes).
 
 3. **Install.** Run `src-tauri\target\release\bundle\nsis\Wordfall_<version>_x64-setup.exe`. It installs
    for your user only (no admin needed); Wordfall lives in the notification area.
@@ -157,6 +162,26 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
 
   "number one / two", "finally", "als Erstes / Zweites" and "zuletzt" work too. A list needs at least two items.
 
+## Meetings
+
+- **Start:** *Meetings → Start meeting* (or *Start Meeting* in the tray menu). Stop it the same way; it also stops
+  by itself after 3 hours (*Settings → Meetings → Stop automatically after*).
+- **During:** type rough notes under *My notes*; the *Transcript* tab fills in a few seconds behind the talk.
+  Dictation keeps working and goes first.
+- **After:** the last seconds are transcribed, speakers are labelled (click a name to rename someone), and the
+  notes are written: about a minute for an hour of meeting on a recent GPU or Apple Silicon Mac, a few minutes for
+  three hours. Notes are in the language the meeting was held in. *Write the notes again* picks up renamed speakers
+  and edited notes.
+- **Other participants** are recorded from what the computer plays: WASAPI loopback on Windows, a Core Audio
+  process tap on macOS 14.2+ (macOS asks once for *System Audio Recording*; on macOS 13 only the microphone is
+  recorded). Without headphones, your microphone also hears the call; Wordfall drops those echoed lines.
+- **Models:** the notes model is downloaded in *Settings → Meetings* (Qwen3 4B, 2.5 GB, is the default; Gemma 3 12B
+  and Qwen3 30B write better notes on machines with more memory). It runs in a helper process (`wordfall-llm`,
+  llama.cpp with Metal / Vulkan) that only lives while notes are written, so its memory is free the rest of the
+  time. Speakers are told apart with a 30 MB voice model (3D-Speaker CAM++), fetched with the first meeting.
+- **Files:** each meeting is a folder under `meetings/` in the data folder (`meeting.json`, `mic.wav`,
+  `system.wav`). Recordings are deleted after 2 weeks by default; notes and transcripts stay until you delete them.
+
 ## Models
 
 Models are whisper.cpp `ggml` files, downloaded on demand into
@@ -175,6 +200,8 @@ npm run tauri dev               # the real app
 npm run check                   # svelte-check / TypeScript
 (cd src-tauri && cargo test)    # Rust unit tests
 src-tauri/target/release/wordfall bench     # accuracy/latency regression check
+src-tauri/target/release/wordfall --meeting mic.wav --system system.wav [--notes "…"] [--no-summary]
+                                # a recorded meeting through the live pipeline, then notes
 ```
 
 Cross-compiling the Windows app from macOS works with `cargo-xwin` (`npm run tauri:windows -- --runner cargo-xwin
@@ -198,6 +225,10 @@ Layout:
   - `postprocess.rs`: filler removal (language-aware), dictionary
   - `lists.rs`: spoken enumerations → numbered / bulleted lists
   - `session.rs`: record → transcribe → paste pipeline
+  - `meetings/`: meeting recording, live transcription, echo removal, speaker labels, storage, notes
+  - `speakers.rs`, `fbank.rs`: voice embeddings (CAM++ via tract) and clustering
+  - `llm.rs`: notes-model catalog, prompts, and the client for `src/bin/wordfall-llm.rs` (llama.cpp in its own
+    process: it brings a ggml that clashes with whisper.cpp's)
   - `bench.rs`: benchmark harness
 - `docs/ipc.md`: contract between UI and core. `DESIGN.md`: design principles and tokens.
 

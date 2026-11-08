@@ -7,7 +7,7 @@
 //   npm run tauri:windows -- --features cuda   # GPU via CUDA instead (needs the CUDA toolkit)
 //   (other extra arguments pass through to `tauri build`)
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 export const WINDOWS_CRT_ENV = {
@@ -70,6 +70,7 @@ if (process.platform === 'win32' && !cpuOnly && !pickedFeatures) {
   delete env.Path; // Windows env keys are case-insensitive; keep a single PATH for the child
   args.push('--features', 'vulkan');
   shortenBuildDir(env);
+  serialCustomBuildSteps(env);
 }
 
 // ggml's Vulkan build runs a nested CMake project (vulkan-shaders-gen) whose MSBuild file-tracking
@@ -89,6 +90,28 @@ function shortenBuildDir(env) {
   env.CARGO_BUILD_BUILD_DIR = `${env.SystemDrive ?? env.SYSTEMDRIVE ?? 'C:'}\\wfb`;
   console.log(`tauri:windows: the Vulkan build needs short paths; cargo's intermediate files go to ${env.CARGO_BUILD_BUILD_DIR}`);
 }
+// CMake 3.27+ (policy CMP0147) marks custom commands in Visual Studio projects as BuildInParallel. MSBuild then
+// runs the steps of the vulkan-shaders-gen ExternalProject in llama.cpp's ggml (configure, build, install) at the
+// same time, and a fresh build fails with "Not a file: .../vulkan-shaders-gen-build/cmake_install.cmake". MSBuild
+// picks up Directory.Build.targets from any folder above a project, so one in cargo's build directory turns the
+// parallel custom steps off for the CMake projects of whisper.cpp and llama.cpp (compiling stays parallel).
+function serialCustomBuildSteps(env) {
+  const dir = env.CARGO_BUILD_BUILD_DIR ?? env.CARGO_TARGET_DIR ?? path.resolve(import.meta.dirname, '..', 'src-tauri', 'target');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'Directory.Build.targets'),
+    [
+      '<Project>',
+      '  <!-- Written by scripts/tauri-windows.mjs: keep CMake custom build steps in order. -->',
+      '  <ItemGroup>',
+      '    <CustomBuild Update="@(CustomBuild)" BuildInParallel="false" />',
+      '  </ItemGroup>',
+      '</Project>',
+      '',
+    ].join('\n'),
+  );
+}
+
 // RUSTFLAGS replaces the rustflags in .cargo/config.toml, so keep crt-static when it's set.
 if (env.RUSTFLAGS && !env.RUSTFLAGS.includes('crt-static')) env.RUSTFLAGS += ' -C target-feature=+crt-static';
 

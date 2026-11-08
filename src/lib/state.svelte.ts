@@ -7,6 +7,9 @@ import type {
   AudioDevice,
   DictEntry,
   HistoryRecord,
+  MeetingProgress,
+  MeetingSegment,
+  MeetingSpeaker,
   ModelInfo,
   Notice,
   NoticeKind,
@@ -14,15 +17,17 @@ import type {
   Settings,
   Snapshot,
   Suggestion,
+  SummaryModelInfo,
 } from './types';
 
-export type View = 'transcripts' | 'dictionary' | 'settings' | 'lab';
-export type SettingsSection = 'general' | 'recording' | 'model' | 'pill' | 'accuracy' | 'data' | 'about';
+export type View = 'transcripts' | 'meetings' | 'dictionary' | 'settings' | 'lab';
+export type SettingsSection = 'general' | 'recording' | 'model' | 'meetings' | 'pill' | 'accuracy' | 'data' | 'about';
 
 export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
   { id: 'general', label: 'General' },
   { id: 'recording', label: 'Recording' },
   { id: 'model', label: 'Model' },
+  { id: 'meetings', label: 'Meetings' },
   { id: 'pill', label: 'Pill' },
   { id: 'accuracy', label: 'Accuracy' },
   { id: 'data', label: 'Data' },
@@ -32,6 +37,12 @@ export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
 export interface Toast extends Notice {
   id: number;
 }
+
+/** Live updates for open meeting views. */
+export type MeetingEvent =
+  | { kind: 'segments'; id: string; segments: MeetingSegment[]; speakers: MeetingSpeaker[] }
+  | { kind: 'changed'; id: string }
+  | { kind: 'list' };
 
 class AppState {
   snapshot = $state<Snapshot | null>(null);
@@ -44,6 +55,14 @@ class AppState {
   devices = $state<AudioDevice[]>([]);
   downloads = $state<Record<string, { downloaded: number; total: number }>>({});
   levels = $state<number[]>(SILENT_LEVELS);
+  summaryModels = $state<SummaryModelInfo[]>([]);
+  /** Input levels (0..1) of the meeting being recorded. */
+  meetingLevels = $state<{ mic: number; system: number }>({ mic: 0, system: 0 });
+  /** Progress of meetings being finished (transcribing the rest, speakers, notes). */
+  meetingProgress = $state<Record<string, MeetingProgress>>({});
+  /** The meeting open in the Meetings view (null = the list). */
+  meetingId = $state<string | null>(null);
+  #meetingListeners = new Set<(e: MeetingEvent) => void>();
   #historyListeners = new Set<() => void>();
   #sectionListeners = new Set<(id: SettingsSection) => void>();
   /** The most recent finished dictation (used by the onboarding practice area). */
@@ -58,6 +77,7 @@ class AppState {
   pendingSection = $state<SettingsSection | null>(null);
 
   settings = $derived(this.snapshot?.settings ?? null);
+  activeMeeting = $derived(this.snapshot?.meeting ?? null);
   activeModelInfo = $derived(
     this.models.find((m) => m.id === (this.snapshot?.settings.model ?? '')) ?? null,
   );
@@ -78,7 +98,7 @@ class AppState {
     this.snapshot = await api.getSnapshot();
     await this.#subscribe(kind);
     if (kind === 'dashboard') {
-      await Promise.all([this.loadDictionary(), this.loadModels(), this.loadDevices()]);
+      await Promise.all([this.loadDictionary(), this.loadModels(), this.loadDevices(), this.loadSummaryModels()]);
     }
   }
 
@@ -108,6 +128,10 @@ class AppState {
       on('permissions-changed', (p) => {
         if (this.snapshot) this.snapshot.permissions = p;
       }),
+      on('meeting-state', ({ active }) => {
+        if (this.snapshot) this.snapshot.meeting = active;
+        if (!active) this.meetingLevels = { mic: 0, system: 0 };
+      }),
     ];
     if (kind === 'dashboard') {
       subs.push(
@@ -122,6 +146,15 @@ class AppState {
         on('model-download-progress', (p) => {
           this.downloads[p.id] = { downloaded: p.downloaded, total: p.total };
         }),
+        on('summary-models-changed', () => this.loadSummaryModels()),
+        on('meeting-levels', (l) => (this.meetingLevels = { mic: l.mic ?? 0, system: l.system ?? 0 })),
+        on('meeting-progress', (p) => (this.meetingProgress[p.id] = p)),
+        on('meeting-segments', (e) => this.#meetingEvent({ kind: 'segments', ...e })),
+        on('meeting-changed', ({ id }) => {
+          delete this.meetingProgress[id];
+          this.#meetingEvent({ kind: 'changed', id });
+        }),
+        on('meetings-changed', () => this.#meetingEvent({ kind: 'list' })),
       );
     }
     this.#unlisten = await Promise.all(subs);
@@ -146,6 +179,40 @@ class AppState {
   onHistoryChanged(fn: () => void): () => void {
     this.#historyListeners.add(fn);
     return () => this.#historyListeners.delete(fn);
+  }
+
+  #meetingEvent(e: MeetingEvent) {
+    this.#meetingListeners.forEach((fn) => fn(e));
+  }
+
+  /** Runs `fn` on meeting updates (new transcript, finished notes, list changes). */
+  onMeetingEvent(fn: (e: MeetingEvent) => void): () => void {
+    this.#meetingListeners.add(fn);
+    return () => this.#meetingListeners.delete(fn);
+  }
+
+  async loadSummaryModels() {
+    this.summaryModels = await api.listSummaryModels();
+    for (const m of this.summaryModels) if (m.downloaded) delete this.downloads[m.id];
+  }
+
+  /** Starts a meeting and shows it. */
+  async startMeeting() {
+    try {
+      const id = await api.startMeeting();
+      this.meetingId = id;
+      this.view = 'meetings';
+    } catch (e) {
+      this.error('The meeting didn’t start', e);
+    }
+  }
+
+  async stopMeeting() {
+    try {
+      await api.stopMeeting();
+    } catch (e) {
+      this.error('The meeting is still recording', e);
+    }
   }
 
   /** Runs `fn` when something asks to show a settings section. Returns an unsubscribe function. */
@@ -278,6 +345,8 @@ class AppState {
   }
 
   go(view: View, section?: SettingsSection) {
+    // Choosing Meetings again goes back from a meeting to the list.
+    if (view === 'meetings' && this.view === 'meetings') this.meetingId = null;
     this.view = view;
     if (view !== 'settings' || !section) return;
     // An open settings view scrolls right away; otherwise it picks this up when it mounts.

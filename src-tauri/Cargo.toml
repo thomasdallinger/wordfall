@@ -5,6 +5,8 @@ description = "Wordfall — local push-to-talk dictation for macOS and Windows"
 authors = ["Wordfall contributors"]
 edition = "2021"
 rust-version = "1.85"
+# Two binaries: the app, and the `wordfall-llm` helper Tauri bundles next to it.
+default-run = "wordfall"
 
 [lib]
 name = "wordfall_lib"
@@ -12,8 +14,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 # GPU backends for whisper.cpp on Windows (macOS always uses Metal). Each needs its SDK at build time.
-vulkan = ["whisper-rs/vulkan"]
-cuda = ["whisper-rs/cuda"]
+vulkan = ["whisper-rs/vulkan", "llama-cpp-2/vulkan"]
+cuda = ["whisper-rs/cuda", "llama-cpp-2/cuda"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -41,6 +43,12 @@ arboard = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
+# Meeting summaries. Only the `wordfall-llm` helper binary links it: llama.cpp brings its own copy of
+# ggml, which must not meet whisper.cpp's in one process (see src/bin/wordfall-llm.rs).
+llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["common"] }
+llama-cpp-sys-2 = { version = "0.1.161", default-features = false }
+# Speaker embeddings for meeting transcripts (pure Rust ONNX, no native runtime to ship).
+tract-onnx = "0.23"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
@@ -50,7 +58,13 @@ objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", features = ["NSRunningApplication", "NSWorkspace", "NSApplication", "libc"] }
 objc2-av-foundation = { version = "0.3", features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
 block2 = "0.6"
+# System audio for meetings (Core Audio process taps, macOS 14.2+).
+objc2-core-audio = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = "0.3"
+libc = "0.2"
 whisper-rs = { version = "0.16", features = ["metal"] }
+llama-cpp-2 = { version = "0.1.161", default-features = false, features = ["common", "metal"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

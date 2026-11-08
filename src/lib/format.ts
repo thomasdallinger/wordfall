@@ -33,6 +33,24 @@ export function dayKey(iso: string): string {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
+/** Elapsed time as "4:05" or "1:04:05". */
+export function clock(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+}
+
+/** Meeting length in words: "45 min", "1 h 20 min", "under a minute". */
+export function duration(ms: number): string {
+  const min = Math.round(ms / 60_000);
+  if (min < 1) return 'under a minute';
+  if (min < 60) return `${min} min`;
+  const h = Math.floor(min / 60);
+  return min % 60 ? `${h} h ${min % 60} min` : `${h} h`;
+}
+
 export function formatNumber(n: number): string {
   return Math.round(n).toLocaleString('en-US');
 }

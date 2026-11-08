@@ -15,6 +15,8 @@ import type {
   ImportResult,
   LabPrompt,
   LabStopResult,
+  Meeting,
+  MeetingItem,
   ModelInfo,
   PermissionKind,
   Permissions,
@@ -22,6 +24,7 @@ import type {
   Snapshot,
   Stats,
   Suggestion,
+  SummaryModelInfo,
 } from './types';
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -131,6 +134,22 @@ export const api = {
   showDashboard: () => call<void>('show_dashboard'),
   /** Imports transcripts, dictionary and suggestions found in a folder; adds it as a model folder if it holds models. */
   importData: (path: string) => call<ImportResult>('import_data', { path }),
+  listMeetings: () => call<MeetingItem[]>('list_meetings'),
+  getMeeting: (id: string) => call<Meeting>('get_meeting', { id }),
+  /** Starts recording a meeting; resolves to its id. */
+  startMeeting: () => call<string>('start_meeting'),
+  stopMeeting: () => call<void>('stop_meeting'),
+  updateMeeting: (id: string, patch: { title?: string; notes?: string }) => call<void>('update_meeting', { id, patch }),
+  renameSpeaker: (id: string, speaker: number, name: string) => call<Meeting>('rename_speaker', { id, speaker, name }),
+  deleteMeeting: (id: string) => call<void>('delete_meeting', { id }),
+  /** Writes (or rewrites) the notes in the background; follow `meeting-progress`. */
+  summarizeMeeting: (id: string) => call<void>('summarize_meeting', { id }),
+  /** Folder with the meeting's files (inside the data folder, for `openPath`). */
+  meetingFolder: (id: string) => call<string>('meeting_folder', { id }),
+  listSummaryModels: () => call<SummaryModelInfo[]>('list_summary_models'),
+  downloadSummaryModel: (id: string) => call<void>('download_summary_model', { id }),
+  deleteSummaryModel: (id: string) => call<void>('delete_summary_model', { id }),
+
   /** Fit the widget window to its content (logical px); Rust keeps it anchored bottom-center. */
   resizeWidget: (width: number, height: number) => call<void>('resize_widget', { width, height }),
 };
