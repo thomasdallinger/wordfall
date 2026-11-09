@@ -216,6 +216,35 @@ impl Worker {
     }
 }
 
+/// Identifies the helper build (its GPU code is compiled per build).
+fn helper_stamp() -> Option<String> {
+    let meta = std::fs::metadata(helper_path().ok()?).ok()?;
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(format!("{}-{modified}", meta.len()))
+}
+
+/// Runs the helper once on a tiny prompt, so the first real notes don't wait for its GPU code to
+/// be compiled (on a Mac, Metal compiles llama.cpp's kernels on first use: about a minute and a
+/// half, cached afterwards). Does nothing if this helper build has been warmed up before.
+pub fn warm_up(model: &Path, data: &Path) {
+    let marker = data.join("llm-warm");
+    let Some(stamp) = helper_stamp() else { return };
+    if std::fs::read_to_string(&marker).is_ok_and(|s| s == stamp) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let result = Worker::spawn(model, &data.join("llm.log")).and_then(|mut w| w.chat("Answer with one word.", "Ready?", 1, |_| {}));
+    match result {
+        Ok(_) => {
+            log::info!("summary model warmed up in {:.1}s", started.elapsed().as_secs_f32());
+            if let Err(e) = std::fs::write(&marker, stamp) {
+                log::warn!("could not note the warm-up: {e}");
+            }
+        }
+        Err(e) => log::warn!("warming up the summary model failed: {e:#}"),
+    }
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
         // Closing stdin ends the helper; make sure it is gone so its memory is freed.
@@ -307,7 +336,7 @@ Two or three sentences: what the meeting was about and what came out of it.
 - One line per decision that was actually agreed. Leave this section out if nothing was decided.
 
 ## {actions}
-- [ ] **Who**: what, and by when if a date was mentioned. Leave this section out if there were no tasks.
+- [ ] **Who**: what, and by when only if a date was said. Only what someone said they would do: questions and advice aren't tasks. Leave this section out if there were no tasks.
 
 ## {notes}
 ### A heading per topic
@@ -331,7 +360,7 @@ fn final_prompt(input: &SummaryInput, language: &str, body_label: &str, body: &s
 "));
     if !input.notes.trim().is_empty() {
         p.push_str(
-            "My own notes, written during the meeting. They show what mattered to me. Every point in them must              appear in your notes, in the right place, filled in with details from the transcript:
+            "My own notes, written during the meeting. They show what mattered to me. Every point in them must appear in your notes, in the right place, filled in with details from the transcript:
 <my-notes>
 ",
         );
@@ -424,9 +453,29 @@ pub fn summarize(worker: &mut Worker, input: &SummaryInput, mut progress: impl F
             progress(Progress::Writing(&written));
         }
     })?;
-    let text = clean(&text);
+    let text = drop_repeated_tasks(&clean(&text));
     anyhow::ensure!(!text.trim().is_empty(), "the summary model wrote nothing");
     Ok(text)
+}
+
+/// Drops a task that says word for word what an earlier one says, whoever it's filed under
+/// (small models sometimes list a task once under a speaker's label and again under their name).
+fn drop_repeated_tasks(text: &str) -> String {
+    let what = |line: &str| -> Option<String> {
+        let item = line.trim_start().strip_prefix("- [ ]").or_else(|| line.trim_start().strip_prefix("- [x]"))?;
+        // Past the owner: "**Who**: what" or "Who: what".
+        let item = item.split_once(':').map(|(_, rest)| rest).unwrap_or(item);
+        let words: Vec<String> = item.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+        (!words.is_empty()).then(|| words.join(" "))
+    };
+    let mut seen = std::collections::HashSet::new();
+    text.lines()
+        .filter(|l| match what(l) {
+            Some(w) => seen.insert(w),
+            None => true,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Drops reasoning blocks and stray fences some models add.
@@ -513,6 +562,18 @@ Summary.
 ## Aufgaben
 - [ ] **Me**: x"), "## Aufgaben
 - [ ] **Me**: x");
+    }
+
+    #[test]
+    fn drops_a_task_repeated_under_another_name() {
+        let text = "## Action items\n- [ ] **Speaker 1**: Prepare the release candidate by Wednesday.\n\
+                    - [ ] **Me**: Write the help articles.\n- [ ] **Samantha**: prepare the release candidate by Wednesday\n\
+                    - [ ] **Speaker 1**: Write the release notes.";
+        assert_eq!(
+            drop_repeated_tasks(text),
+            "## Action items\n- [ ] **Speaker 1**: Prepare the release candidate by Wednesday.\n\
+             - [ ] **Me**: Write the help articles.\n- [ ] **Speaker 1**: Write the release notes."
+        );
     }
 
     #[test]

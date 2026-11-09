@@ -202,6 +202,8 @@ npm run check                   # svelte-check / TypeScript
 src-tauri/target/release/wordfall bench     # accuracy/latency regression check
 src-tauri/target/release/wordfall --meeting mic.wav --system system.wav [--notes "…"] [--no-summary]
                                 # a recorded meeting through the live pipeline, then notes
+src-tauri/target/release/wordfall --meeting-notes transcript.txt [--language de] [--notes "…"]
+                                # notes for a transcript as --meeting prints it (no audio)
 ```
 
 Cross-compiling the Windows app from macOS works with `cargo-xwin` (`npm run tauri:windows -- --runner cargo-xwin

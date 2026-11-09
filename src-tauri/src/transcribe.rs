@@ -541,7 +541,7 @@ impl Engine {
             loaded.state_audio_ctx = audio_ctx;
         }
         let previous = self.last_language.lock().clone();
-        let lang = choose_language(loaded, audio, languages, previous.as_deref(), opts, audio_ctx)?;
+        let lang = choose_language(loaded, audio, languages, previous.as_deref(), opts, audio_ctx, false)?;
         let params = full_params(opts, Some(lang.as_str()), prompt, audio_ctx);
         loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
         let language = if lang == "auto" {
@@ -586,7 +586,10 @@ impl Engine {
 
 /// The language to decode `audio` in. `languages` are the ones the user speaks: empty = any
 /// (whisper detects), one = forced, several = whichever of them the audio sounds most like,
-/// staying with `previous` when it's a close call.
+/// staying with `previous` when it's a close call. `thorough` also confirms on the full window
+/// what the quick check is most often confidently wrong about, and what costs the most when it
+/// is: the first language, and a switch to another one (meetings, where a wrong guess makes
+/// whisper translate a whole utterance).
 fn choose_language(
     loaded: &mut Loaded,
     audio: &[f32],
@@ -594,6 +597,7 @@ fn choose_language(
     previous: Option<&str>,
     opts: &DecodeOptions,
     audio_ctx: i32,
+    thorough: bool,
 ) -> anyhow::Result<String> {
     Ok(match languages {
         _ if loaded.english_only => "en".into(),
@@ -603,13 +607,17 @@ fn choose_language(
             // Like whisper's own "auto", but only the user's languages compete, and a quick check
             // on a short window settles clear cases.
             let threads = thread_count(opts) as usize;
-            let mut probs = loaded.language_probs(audio, threads)?;
-            let mut window = "short";
+            let (mut probs, mut window) = if thorough && previous.is_none() && audio_ctx == 0 {
+                (loaded.full_window_language_probs(audio, threads)?, "full")
+            } else {
+                (loaded.language_probs(audio, threads)?, "short")
+            };
             let lookup = |probs: &[f32], code: &str| {
                 whisper_rs::get_lang_id(code).and_then(|id| probs.get(id as usize).copied()).unwrap_or(0.0)
             };
             // The full-window check needs the main state on the full window (the default).
-            if needs_full_window(several, |l| lookup(&probs, l)) && audio_ctx == 0 {
+            let switching = thorough && previous.is_some_and(|p| pick_language(several, previous, |l| lookup(&probs, l)) != p);
+            if window == "short" && (switching || needs_full_window(several, |l| lookup(&probs, l))) && audio_ctx == 0 {
                 // Only a second opinion: if it fails, the quick guess still beats no dictation.
                 match loaded.full_window_language_probs(audio, threads) {
                     Ok(full) => {
@@ -674,7 +682,8 @@ impl Engine {
             loaded.state = loaded.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
             loaded.state_audio_ctx = 0;
         }
-        let lang = choose_language(loaded, audio, languages, previous, opts, 0)?;
+        // The quick check can be confidently wrong, e.g. on speech that starts mid-sentence.
+        let lang = choose_language(loaded, audio, languages, previous, opts, 0, true)?;
         let mut params = full_params(opts, Some(lang.as_str()), prompt, 0);
         params.set_no_timestamps(false);
         loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;

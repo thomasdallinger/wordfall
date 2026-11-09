@@ -314,6 +314,13 @@ pub fn run() {
         }
         return;
     }
+    if args.iter().any(|a| a == "--meeting-notes") {
+        if let Err(e) = meetings::cli_notes(&args) {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--meeting") {
         if let Err(e) = meetings::cli(&args) {
             eprintln!("error: {e:#}");
@@ -375,6 +382,16 @@ pub fn run() {
                     Ok(path) => *silero_app.state::<Core>().engine.silero_path.lock() = Some(path),
                     Err(e) => log::warn!("Silero VAD unavailable, using energy gate: {e:#}"),
                 }
+            });
+            // So that the first meeting notes don't wait for the summary model's GPU code to be
+            // compiled: once per build, after startup has settled and outside a dictation.
+            let warm_app = handle.clone();
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_secs(90));
+                while warm_app.state::<Core>().sessions.dictation_busy() {
+                    thread::sleep(std::time::Duration::from_secs(5));
+                }
+                meetings::warm_up_summaries(&warm_app);
             });
 
             // Push-to-talk listener.

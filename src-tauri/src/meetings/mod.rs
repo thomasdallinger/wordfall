@@ -33,7 +33,7 @@ use crate::{
     vocab, Core,
 };
 pub use pipeline::ME;
-use pipeline::{ChannelProcessor, Ctx, LiveSpeakers};
+use pipeline::{ChannelProcessor, Ctx, EchoFilter, LiveSpeakers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -419,6 +419,8 @@ struct Chan {
     proc: ChannelProcessor,
     /// 16 kHz samples so far (including filled gaps).
     received: u64,
+    /// The start of this channel's timeline has been lined up with the microphone's.
+    aligned: bool,
 }
 
 fn wait_for_recognizer(app: &AppHandle) {
@@ -472,6 +474,7 @@ fn record(
             wav: open_wav("system.wav"),
             proc: ChannelProcessor::new(Channel::System),
             received: 0,
+            aligned: false,
         });
     }
     chans.push(Chan {
@@ -481,11 +484,13 @@ fn record(
         wav: open_wav("mic.wav"),
         proc: ChannelProcessor::new(Channel::Mic),
         received: 0,
+        aligned: true,
     });
 
     let mut embedder = load_embedder(app, settings);
     let mut embeddings: Vec<Option<Vec<f32>>> = Vec::new();
     let mut live = LiveSpeakers::new(settings.meeting_speakers, &meeting.lock().speakers);
+    let mut echo = EchoFilter::default();
     let started = Instant::now();
     let mut last_pass = Instant::now();
     let mut last_save = Instant::now();
@@ -518,9 +523,25 @@ fn record(
         let elapsed = started.elapsed();
         let expected = (elapsed.as_secs_f64() * TARGET_RATE as f64) as u64;
         let mut levels = json!({});
+        let mic_first = chans.iter().find(|c| c.channel == Channel::Mic).and_then(|c| c.rec.first_sample_at());
         for ch in chans.iter_mut() {
             buf.clear();
             ch.resampler.push(&ch.rec.take(), &mut buf);
+            // The system tap starts after the microphone (on macOS it builds an aggregate device
+            // first), so its first sample was heard later. Unless its timeline starts that much
+            // later too, everything on it is early against the microphone (by about a third of a
+            // second on a MacBook), and echo of it is looked for in the wrong places.
+            if !ch.aligned && !buf.is_empty() {
+                if let (Some(first), Some(mic)) = (ch.rec.first_sample_at(), mic_first) {
+                    ch.aligned = true;
+                    let late = first.saturating_duration_since(mic);
+                    if ch.received == 0 && late < Duration::from_secs(5) {
+                        let pad = (late.as_secs_f64() * TARGET_RATE as f64) as usize;
+                        buf.splice(0..0, std::iter::repeat(0.0).take(pad));
+                        log::info!("system audio started {} ms after the microphone; lined up", late.as_millis());
+                    }
+                }
+            }
             // Windows loopback delivers nothing while nothing plays: fill with silence so both
             // channels keep the same timeline.
             let behind = expected.saturating_sub(ch.received + buf.len() as u64);
@@ -558,7 +579,8 @@ fn record(
             if embedder.is_none() && settings.meeting_speakers {
                 embedder = load_embedder(app, settings);
             }
-            let added = transcribe_pass(app, meeting, &mut chans, embedder.as_ref(), &mut embeddings, &mut live, settings, stopping);
+            let added =
+                transcribe_pass(app, meeting, &mut chans, embedder.as_ref(), &mut embeddings, &mut live, &mut echo, settings, stopping);
             if added > 0 || last_save.elapsed() > Duration::from_secs(30) {
                 save(&c.dir, &meeting.lock());
                 last_save = Instant::now();
@@ -590,9 +612,10 @@ fn record(
         fill_embeddings(&dir, &m.segments, &mut embeddings, e);
     }
     embeddings.resize(m.segments.len(), None);
-    let dropped = pipeline::drop_echo(&mut m.segments, &mut embeddings);
-    if dropped > 0 {
-        log::info!("dropped {dropped} microphone segments that echoed the other side");
+    let dropped = pipeline::drop_echo(&mut m.segments, &mut embeddings, &echo);
+    if !dropped.is_empty() {
+        let by_voice = dropped.iter().filter(|(_, why)| matches!(why, pipeline::Echo::Voice(..))).count();
+        log::info!("dropped {} microphone segments that echoed the other side ({by_voice} by voice)", dropped.len());
     }
     pipeline::assign_speakers(&mut m.segments, &embeddings, &mut m.speakers, settings.meeting_speakers && embedder.is_some());
     m.language = pipeline::meeting_language(&m.segments);
@@ -626,6 +649,7 @@ fn transcribe_pass(
     embedder: Option<&Embedder>,
     embeddings: &mut Vec<Option<Vec<f32>>>,
     live: &mut LiveSpeakers,
+    echo: &mut EchoFilter,
     settings: &Settings,
     flush: bool,
 ) -> usize {
@@ -656,14 +680,23 @@ fn transcribe_pass(
     };
     let mut new_segments = Vec::new();
     // System audio first, so microphone echo of it can be recognised.
+    let mut system_speech = Vec::new();
+    let mut system_language = None;
     for ch in chans.iter_mut() {
-        let heard = match ch.proc.process(&ctx, flush) {
+        if ch.channel == Channel::Mic {
+            ch.proc.adopt_language(system_language.as_deref());
+        }
+        let heard = match ch.proc.process(&ctx, flush, &system_speech) {
             Ok(h) => h,
             Err(e) => {
                 log::error!("meeting transcription failed: {e:#}");
                 continue;
             }
         };
+        if ch.channel == Channel::System {
+            system_speech = ch.proc.speech.clone();
+            system_language = ch.proc.language.clone();
+        }
         let mut m = meeting.lock();
         for h in heard {
             let seg = Segment {
@@ -674,7 +707,7 @@ fn transcribe_pass(
                 text: h.text,
                 language: h.language,
             };
-            if seg.channel == Channel::Mic && pipeline::is_echo(&seg, &m.segments) {
+            if seg.channel == Channel::Mic && echo.check(&seg, h.embedding.as_deref(), &m.segments).is_some() {
                 continue;
             }
             let Meeting { speakers, .. } = &mut *m;
@@ -714,6 +747,25 @@ fn finish(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, settings: &Settings) {
     prune_audio(&c.dir, settings.meeting_audio_days);
     let _ = app.emit("meeting-changed", json!({ "id": id }));
     let _ = app.emit("meetings-changed", ());
+}
+
+/// Gets the summary model's GPU code compiled before the first notes need it (see
+/// `llm::warm_up`), unless a meeting is being recorded or summarised.
+pub fn warm_up_summaries(app: &AppHandle) {
+    let c = app.state::<Core>();
+    if is_recording(app) {
+        return;
+    }
+    let Some(_one_at_a_time) = c.meetings.summarizing.try_lock() else { return };
+    let chosen = c.settings.read().summary_model.clone();
+    let own = c.model_dirs.read().own.clone();
+    // The kernels don't depend on the model; any downloaded one will do.
+    let model = llm::entry(&chosen)
+        .and_then(|e| llm::locate(&own, e))
+        .or_else(|| llm::CATALOG.iter().find_map(|e| llm::locate(&own, e)));
+    if let Some(model) = model {
+        llm::warm_up(&model, &c.dir);
+    }
 }
 
 /// Writes (or rewrites) the notes of a finished meeting in the background.
@@ -861,13 +913,24 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     meeting.speakers.push(Speaker { id: ME, name: "Me".into(), renamed: false });
     let mut embeddings = Vec::new();
     let mut live = LiveSpeakers::new(embedder.is_some(), &meeting.speakers);
+    let mut echo = EchoFilter::default();
     let mut pos = 0;
     while pos < longest {
         let end = (pos + step).min(longest);
         let flush = end == longest;
+        let mut system_speech = Vec::new();
+        let mut system_language = None;
         for (proc, audio) in procs.iter_mut() {
             proc.push(&audio[pos.min(audio.len())..end.min(audio.len())]);
-            for h in proc.process(&ctx, flush)? {
+            if proc.channel == Channel::Mic {
+                proc.adopt_language(system_language.as_deref());
+            }
+            let heard = proc.process(&ctx, flush, &system_speech)?;
+            if proc.channel == Channel::System {
+                system_speech = proc.speech.clone();
+                system_language = proc.language.clone();
+            }
+            for h in heard {
                 let seg = Segment {
                     start_ms: h.start_ms,
                     end_ms: h.end_ms,
@@ -876,9 +939,11 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
                     text: h.text,
                     language: h.language,
                 };
-                if seg.channel == Channel::Mic && pipeline::is_echo(&seg, &meeting.segments) {
-                    eprintln!("(echo dropped) {}", seg.text);
-                    continue;
+                if seg.channel == Channel::Mic {
+                    if let Some(why) = echo.check(&seg, h.embedding.as_deref(), &meeting.segments) {
+                        eprintln!("(echo dropped, {why:?}) {}", seg.text);
+                        continue;
+                    }
                 }
                 let speaker = live.assign(seg.channel, h.embedding.as_deref(), &mut meeting.speakers);
                 eprintln!("[{:>6.1}s] {:?} {} | {}", seg.start_ms as f32 / 1000.0, seg.channel, speaker, seg.text);
@@ -890,7 +955,9 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     }
     meeting.duration_ms = longest as u64 / 16;
     let transcribed = started.elapsed();
-    pipeline::drop_echo(&mut meeting.segments, &mut embeddings);
+    for (seg, why) in pipeline::drop_echo(&mut meeting.segments, &mut embeddings, &echo) {
+        eprintln!("(echo dropped at the end, {why:?}) [{:>6.1}s] {}", seg.start_ms as f32 / 1000.0, seg.text);
+    }
     pipeline::assign_speakers(&mut meeting.segments, &embeddings, &mut meeting.speakers, embedder.is_some());
     meeting.language = pipeline::meeting_language(&meeting.segments);
     let lines = pipeline::transcript_lines(&meeting.segments, &meeting.speakers);
@@ -901,22 +968,57 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     if args.iter().any(|a| a == "--no-summary") {
         return Ok(());
     }
+    let speakers: Vec<String> = meeting.speakers.iter().map(|s| s.name.clone()).collect();
+    print_notes(&data_dir, &settings, &lines, &speakers, meeting.language.as_deref(), meeting.duration_ms / 60_000, args)
+}
+
+/// `wordfall --meeting-notes <transcript.txt> [--language de] [--minutes 30] [--notes "…"]`: writes
+/// notes for a transcript as `--meeting` prints it ("[mm:ss] Speaker: text" lines), without the
+/// audio. For working on the notes prompt.
+pub fn cli_notes(args: &[String]) -> anyhow::Result<()> {
+    let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let path = arg("--meeting-notes").ok_or_else(|| anyhow::anyhow!("missing transcript file"))?;
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data dir"))?.join("com.wordfall.app");
+    let settings = Settings::load(&data_dir);
+    let line = regex::Regex::new(r"^\[[\d:]+\] ([^:]+): ")?;
+    let lines: Vec<String> = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?.lines().filter(|l| line.is_match(l)).map(str::to_string).collect();
+    anyhow::ensure!(!lines.is_empty(), "no transcript lines in {path}");
+    let mut speakers: Vec<String> = Vec::new();
+    for l in &lines {
+        let name = line.captures(l).expect("matched above")[1].to_string();
+        if !speakers.contains(&name) {
+            speakers.push(name);
+        }
+    }
+    let minutes = arg("--minutes").and_then(|m| m.parse().ok()).unwrap_or(1);
+    print_notes(&data_dir, &settings, &lines, &speakers, arg("--language").as_deref(), minutes, args)
+}
+
+fn print_notes(
+    data_dir: &Path,
+    settings: &Settings,
+    lines: &[String],
+    speakers: &[String],
+    language: Option<&str>,
+    minutes: u64,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let entry = llm::entry(&settings.summary_model).ok_or_else(|| anyhow::anyhow!("unknown summary model"))?;
-    let path = llm::locate(&model_dirs.own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
+    let path = llm::locate(&settings.model_dirs(data_dir).own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
     let t = Instant::now();
     let mut worker = llm::Worker::spawn(&path, &data_dir.join("llm.log"))?;
-    let speakers: Vec<String> = meeting.speakers.iter().map(|s| s.name.clone()).collect();
     let notes = arg("--notes").unwrap_or_default();
     let input = llm::SummaryInput {
         title: None,
         notes: &notes,
-        transcript: &lines,
-        speakers: &speakers,
-        language: meeting.language.as_deref(),
+        transcript: lines,
+        speakers,
+        language,
         when: &chrono::Local::now().format("%A %-d %B %Y, %H:%M").to_string(),
-        minutes: meeting.duration_ms / 60_000,
+        minutes,
     };
     let summary = llm::summarize(&mut worker, &input, |_| {})?;
-    println!("--- notes ({:.1}s, language {:?}) ---\n{summary}", t.elapsed().as_secs_f32(), meeting.language);
+    println!("--- notes ({:.1}s, language {language:?}) ---\n{summary}", t.elapsed().as_secs_f32());
     Ok(())
 }

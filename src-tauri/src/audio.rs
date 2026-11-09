@@ -170,6 +170,11 @@ impl Recording {
         self.sample_rate
     }
 
+    /// When the first audio arrived, if it has.
+    pub fn first_sample_at(&self) -> Option<Instant> {
+        *self.shared.first_sample.lock()
+    }
+
     /// Hands over (and forgets) everything captured since the last call, at the device rate.
     /// Long recordings (meetings) use this so memory stays flat.
     pub fn take(&self) -> Vec<f32> {

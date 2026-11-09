@@ -678,7 +678,11 @@ pub fn download_summary_model(app: AppHandle, core: State<'_, Core>, id: String)
         .await;
         app.state::<Core>().downloads.lock().remove(entry.id);
         match res {
-            Ok(_) => session::notice(&app, "success", "Summary model ready", &format!("{} downloaded.", entry.display_name)),
+            Ok(_) => {
+                session::notice(&app, "success", "Summary model ready", &format!("{} downloaded.", entry.display_name));
+                let app = app.clone();
+                std::thread::spawn(move || meetings::warm_up_summaries(&app));
+            }
             Err(e) => session::notice(&app, "error", "Download failed", &format!("{}: {e:#}", entry.display_name)),
         }
         let _ = app.emit("summary-models-changed", ());
