@@ -238,6 +238,25 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Wordfall's own log lines on stderr, for the headless checks (the app writes them to a file).
+fn init_stderr_logging() {
+    struct Stderr;
+    impl log::Log for Stderr {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Info && m.target().starts_with("wordfall")
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                eprintln!("{:<5} {}", r.level(), r.args());
+            }
+        }
+        fn flush(&self) {}
+    }
+    if log::set_boxed_logger(Box::new(Stderr)).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
 fn init_logging(dir: &std::path::Path) {
     struct FileLog(Mutex<std::fs::File>);
     impl log::Log for FileLog {
@@ -261,8 +280,10 @@ fn init_logging(dir: &std::path::Path) {
     }
 }
 
-/// `wordfall --transcribe <file.wav> [--model <id>] [--languages en,de]`: headless pipeline check that prints JSON.
+/// `wordfall --transcribe <file.wav> [--model <id>] [--languages en,de] [--previous de]`: headless pipeline
+/// check that prints JSON. `--previous` is the language of the dictation before, as in the app.
 fn cli_transcribe(args: &[String]) -> anyhow::Result<()> {
+    init_stderr_logging();
     let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let wav = arg("--transcribe").ok_or_else(|| anyhow::anyhow!("missing WAV path"))?;
     let data_dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data dir"))?.join("com.wordfall.app");
@@ -285,6 +306,7 @@ fn cli_transcribe(args: &[String]) -> anyhow::Result<()> {
     if languages.len() > 1 {
         engine.prepare_detection()?;
     }
+    engine.set_previous_language(arg("--previous"));
     let t = engine.transcribe(&audio, &languages, None, &settings.decode)?;
     let cleaned = postprocess::clean(
         &t.text,

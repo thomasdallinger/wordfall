@@ -431,6 +431,11 @@ impl Engine {
         *self.loaded_id.lock() = None;
     }
 
+    /// Pretends the previous dictation was in `language` (the `--transcribe --previous` check).
+    pub fn set_previous_language(&self, language: Option<String>) {
+        *self.last_language.lock() = language;
+    }
+
     /// Sets up language detection ahead of the first multi-language dictation (no-op if done).
     pub fn prepare_detection(&self) -> anyhow::Result<()> {
         match self.loaded.lock().as_mut() {
@@ -541,7 +546,7 @@ impl Engine {
             loaded.state_audio_ctx = audio_ctx;
         }
         let previous = self.last_language.lock().clone();
-        let lang = choose_language(loaded, audio, languages, previous.as_deref(), opts, audio_ctx, false)?;
+        let lang = choose_language(loaded, audio, languages, previous.as_deref(), opts, audio_ctx)?;
         let params = full_params(opts, Some(lang.as_str()), prompt, audio_ctx);
         loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
         let language = if lang == "auto" {
@@ -586,10 +591,10 @@ impl Engine {
 
 /// The language to decode `audio` in. `languages` are the ones the user speaks: empty = any
 /// (whisper detects), one = forced, several = whichever of them the audio sounds most like,
-/// staying with `previous` when it's a close call. `thorough` also confirms on the full window
-/// what the quick check is most often confidently wrong about, and what costs the most when it
-/// is: the first language, and a switch to another one (meetings, where a wrong guess makes
-/// whisper translate a whole utterance).
+/// staying with `previous` when it's a close call. Besides unsure guesses, the full window also
+/// confirms what the quick check is most often confidently wrong about and what costs the most
+/// when it is, because whisper then translates instead of transcribing: the first language, and
+/// a switch away from the previous one (German full of English terms heard as English).
 fn choose_language(
     loaded: &mut Loaded,
     audio: &[f32],
@@ -597,7 +602,6 @@ fn choose_language(
     previous: Option<&str>,
     opts: &DecodeOptions,
     audio_ctx: i32,
-    thorough: bool,
 ) -> anyhow::Result<String> {
     Ok(match languages {
         _ if loaded.english_only => "en".into(),
@@ -607,7 +611,7 @@ fn choose_language(
             // Like whisper's own "auto", but only the user's languages compete, and a quick check
             // on a short window settles clear cases.
             let threads = thread_count(opts) as usize;
-            let (mut probs, mut window) = if thorough && previous.is_none() && audio_ctx == 0 {
+            let (mut probs, mut window) = if previous.is_none() && audio_ctx == 0 {
                 (loaded.full_window_language_probs(audio, threads)?, "full")
             } else {
                 (loaded.language_probs(audio, threads)?, "short")
@@ -615,24 +619,22 @@ fn choose_language(
             let lookup = |probs: &[f32], code: &str| {
                 whisper_rs::get_lang_id(code).and_then(|id| probs.get(id as usize).copied()).unwrap_or(0.0)
             };
+            let shares = |probs: &[f32]| several.iter().map(|l| format!("{l} {:.2}", lookup(probs, l))).collect::<Vec<_>>().join(", ");
+            let mut quick = String::new();
             // The full-window check needs the main state on the full window (the default).
-            let switching = thorough && previous.is_some_and(|p| pick_language(several, previous, |l| lookup(&probs, l)) != p);
-            if window == "short" && (switching || needs_full_window(several, |l| lookup(&probs, l))) && audio_ctx == 0 {
+            if window == "short" && needs_full_window(several, previous, |l| lookup(&probs, l)) && audio_ctx == 0 {
                 // Only a second opinion: if it fails, the quick guess still beats no dictation.
                 match loaded.full_window_language_probs(audio, threads) {
                     Ok(full) => {
+                        quick = format!(", short window said {}", shares(&probs));
                         probs = full;
                         window = "full";
                     }
                     Err(e) => log::warn!("full-window language check failed, keeping the quick guess: {e}"),
                 }
             }
-            let prob = |code: &str| lookup(&probs, code);
-            let chosen = pick_language(several, previous, prob).to_string();
-            log::info!(
-                "language {chosen} ({}; {window} window)",
-                several.iter().map(|l| format!("{l} {:.2}", prob(l))).collect::<Vec<_>>().join(", ")
-            );
+            let chosen = pick_language(several, previous, |l| lookup(&probs, l)).to_string();
+            log::info!("language {chosen} ({}; {window} window{quick})", shares(&probs));
             chosen
         }
     })
@@ -682,8 +684,7 @@ impl Engine {
             loaded.state = loaded.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
             loaded.state_audio_ctx = 0;
         }
-        // The quick check can be confidently wrong, e.g. on speech that starts mid-sentence.
-        let lang = choose_language(loaded, audio, languages, previous, opts, 0, true)?;
+        let lang = choose_language(loaded, audio, languages, previous, opts, 0)?;
         let mut params = full_params(opts, Some(lang.as_str()), prompt, 0);
         params.set_no_timestamps(false);
         loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
@@ -782,9 +783,12 @@ fn thread_count(opts: &DecodeOptions) -> i32 {
     }
 }
 
-/// Whether the quick short-window guess is too unsure to trust.
-pub fn needs_full_window(allowed: &[String], prob: impl Fn(&str) -> f32) -> bool {
+/// Whether the quick short-window guess needs the full window's second opinion: when it is unsure,
+/// and when it would switch away from the previous language, where it is most often confidently
+/// wrong (German full of English terms heard as English).
+pub fn needs_full_window(allowed: &[String], previous: Option<&str>, prob: impl Fn(&str) -> f32) -> bool {
     allowed.iter().map(|l| prob(l)).fold(0.0, f32::max) < DETECT_CONFIDENT
+        || previous.is_some_and(|p| pick_language(allowed, previous, &prob) != p)
 }
 
 /// The most likely of `allowed`, except that an ambiguous clip (e.g. a one-word "OK")
@@ -866,11 +870,21 @@ mod tests {
     fn unsure_quick_guess_gets_the_full_window() {
         let allowed = langs(&["en", "de"]);
         // The German dictation of 2026-11-05 that came out translated into English.
-        assert!(needs_full_window(&allowed, probs(&[("en", 0.66), ("de", 0.14)])));
-        assert!(needs_full_window(&allowed, probs(&[("en", 0.4), ("de", 0.47)])));
+        assert!(needs_full_window(&allowed, None, probs(&[("en", 0.66), ("de", 0.14)])));
+        assert!(needs_full_window(&allowed, None, probs(&[("en", 0.4), ("de", 0.47)])));
         // Clear cases keep the fast path.
-        assert!(!needs_full_window(&allowed, probs(&[("en", 0.01), ("de", 0.99)])));
-        assert!(!needs_full_window(&allowed, probs(&[("en", 0.96), ("de", 0.0)])));
+        assert!(!needs_full_window(&allowed, None, probs(&[("en", 0.01), ("de", 0.99)])));
+        assert!(!needs_full_window(&allowed, None, probs(&[("en", 0.96), ("de", 0.0)])));
+    }
+
+    #[test]
+    fn confident_switch_gets_the_full_window() {
+        let allowed = langs(&["en", "de"]);
+        // The German dictation of 2026-11-09 after a German one, heard as English at 0.95.
+        assert!(needs_full_window(&allowed, Some("de"), probs(&[("en", 0.95), ("de", 0.01)])));
+        // Staying in the same language keeps the fast path, in either direction.
+        assert!(!needs_full_window(&allowed, Some("en"), probs(&[("en", 0.95), ("de", 0.01)])));
+        assert!(!needs_full_window(&allowed, Some("de"), probs(&[("en", 0.01), ("de", 0.99)])));
     }
 
     #[test]
