@@ -8,12 +8,14 @@ import type {
   DictEntry,
   HistoryRecord,
   MeetingProgress,
+  MeetingQuestions,
   MeetingSegment,
   MeetingSpeaker,
   ModelInfo,
   Notice,
   NoticeKind,
   PermissionKind,
+  QuestionAct,
   Settings,
   Snapshot,
   Suggestion,
@@ -21,6 +23,8 @@ import type {
 } from './types';
 
 export type View = 'transcripts' | 'meetings' | 'dictionary' | 'settings' | 'lab';
+/** Which window this webview is: the main window, the pill, or the floating Questions window. */
+export type WindowKind = 'dashboard' | 'widget' | 'questions';
 export type SettingsSection = 'general' | 'recording' | 'model' | 'meetings' | 'pill' | 'accuracy' | 'data' | 'about';
 
 export const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
@@ -60,6 +64,8 @@ class AppState {
   meetingLevels = $state<{ mic: number; system: number }>({ mic: 0, system: 0 });
   /** Progress of meetings being finished (transcribing the rest, speakers, notes). */
   meetingProgress = $state<Record<string, MeetingProgress>>({});
+  /** Live questions per meeting id (loaded on demand, kept fresh by `meeting-questions`). */
+  meetingQuestions = $state<Record<string, MeetingQuestions>>({});
   /** The meeting open in the Meetings view (null = the list). */
   meetingId = $state<string | null>(null);
   #meetingListeners = new Set<(e: MeetingEvent) => void>();
@@ -94,7 +100,7 @@ class AppState {
   #unlisten: Unlisten[] = [];
   #toastSeq = 0;
 
-  async init(kind: 'dashboard' | 'widget') {
+  async init(kind: WindowKind) {
     this.snapshot = await api.getSnapshot();
     await this.#subscribe(kind);
     if (kind === 'dashboard') {
@@ -107,7 +113,7 @@ class AppState {
     this.#unlisten = [];
   }
 
-  async #subscribe(kind: 'dashboard' | 'widget') {
+  async #subscribe(kind: WindowKind) {
     const subs: Promise<Unlisten>[] = [
       on('recording-state', ({ state, mode }) => {
         if (!this.snapshot) return;
@@ -133,6 +139,16 @@ class AppState {
         if (!active) this.meetingLevels = { mic: 0, system: 0 };
       }),
     ];
+    if (kind !== 'widget') {
+      subs.push(
+        on('meeting-questions', ({ id, ...q }) => (this.meetingQuestions[id] = q)),
+        on('meeting-changed', ({ id }) => {
+          delete this.meetingProgress[id];
+          this.#meetingEvent({ kind: 'changed', id });
+        }),
+        on('meetings-changed', () => this.#meetingEvent({ kind: 'list' })),
+      );
+    }
     if (kind === 'dashboard') {
       subs.push(
         on('notice', (n) => this.toast(n.kind, n.title, n.message)),
@@ -150,11 +166,6 @@ class AppState {
         on('meeting-levels', (l) => (this.meetingLevels = { mic: l.mic ?? 0, system: l.system ?? 0 })),
         on('meeting-progress', (p) => (this.meetingProgress[p.id] = p)),
         on('meeting-segments', (e) => this.#meetingEvent({ kind: 'segments', ...e })),
-        on('meeting-changed', ({ id }) => {
-          delete this.meetingProgress[id];
-          this.#meetingEvent({ kind: 'changed', id });
-        }),
-        on('meetings-changed', () => this.#meetingEvent({ kind: 'list' })),
       );
     }
     this.#unlisten = await Promise.all(subs);
@@ -204,6 +215,26 @@ class AppState {
       this.view = 'meetings';
     } catch (e) {
       this.error('The meeting didn’t start', e);
+    }
+  }
+
+  async loadQuestions(id: string) {
+    try {
+      this.meetingQuestions[id] = await api.meetingQuestions(id);
+    } catch {
+      // The meeting is gone; nothing to show.
+    }
+  }
+
+  /** Later, Asked or Delete on a question; shown at once, put back if it fails. */
+  async actOnQuestion(id: string, number: number, act: QuestionAct) {
+    const q = this.meetingQuestions[id]?.questions.find((x) => x.number === number);
+    if (q) q.state = act;
+    try {
+      await api.actOnQuestion(id, number, act);
+    } catch (e) {
+      void this.loadQuestions(id);
+      this.error('That didn’t work', e);
     }
   }
 

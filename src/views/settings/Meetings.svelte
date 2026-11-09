@@ -92,6 +92,28 @@
       <Switch labelledby="meet-speakers" checked={s.meetingSpeakers} onchange={(v) => app.updateSettings({ meetingSpeakers: v })} />
     </Row>
 
+    <Row
+      id="meet-questions"
+      label="Suggest questions to ask"
+      help="While you talk, the summary model reads the last few minutes and proposes up to three questions: what was vague, what to challenge, what was left open. Give the meeting a goal to steer them. Questions you keep for later end up in the notes."
+    >
+      <Switch labelledby="meet-questions" checked={s.meetingQuestions} onchange={(v) => app.updateSettings({ meetingQuestions: v })} />
+    </Row>
+
+    {#if s.meetingQuestions}
+      <Row
+        id="meet-questions-window"
+        label="Show questions above other apps"
+        help="A small window at the top right that stays above the call. It doesn’t take the keyboard from the call; drag it anywhere."
+      >
+        <Switch
+          labelledby="meet-questions-window"
+          checked={s.meetingQuestionsWindow}
+          onchange={(v) => app.updateSettings({ meetingQuestionsWindow: v })}
+        />
+      </Row>
+    {/if}
+
     <Row id="meet-keep" label="Keep recordings for" help="The audio of each meeting, for re-checking the transcript. Notes and transcripts are kept until you delete them.">
       <select
         class="field select"

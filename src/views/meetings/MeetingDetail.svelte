@@ -4,6 +4,7 @@
   import ConfirmDialog from '../../lib/components/ConfirmDialog.svelte';
   import Menu from '../../lib/components/Menu.svelte';
   import Page from '../../lib/components/Page.svelte';
+  import QuestionStack from '../../lib/components/QuestionStack.svelte';
   import Segmented from '../../lib/components/Segmented.svelte';
   import { api } from '../../lib/api';
   import { clock, dayLabel, duration, formatTime } from '../../lib/format';
@@ -21,6 +22,7 @@
   let notesDraft = $state('');
   let notesDirty = false;
   let titleDraft = $state('');
+  let goalDraft = $state('');
   let editingSpeaker = $state<number | null>(null);
   let speakerDraft = $state('');
   let confirm: ConfirmDialog | undefined = $state();
@@ -28,6 +30,8 @@
   let followTranscript = true;
 
   const recording = $derived(meeting?.status === 'recording');
+  const questions = $derived(app.meetingQuestions[id] ?? null);
+  const showQuestions = $derived(recording && (app.settings?.meetingQuestions ?? false));
   const busy = $derived(meeting?.status === 'processing' || meeting?.status === 'summarizing');
   const progress = $derived(app.meetingProgress[id] ?? null);
   const live = $derived(app.activeMeeting?.id === id ? app.activeMeeting : null);
@@ -67,6 +71,8 @@
       if (wasRecording && m.status !== 'recording' && tab === 'notes' && !notesDirty) tab = 'summary';
       if (!notesDirty) notesDraft = m.notes;
       if (document.activeElement?.id !== 'meeting-title') titleDraft = m.title;
+      if (document.activeElement?.id !== 'meeting-goal') goalDraft = m.goal;
+      if (m.status === 'recording') void app.loadQuestions(id);
       if (initial) tab = m.status === 'recording' ? 'notes' : m.summary || m.status !== 'done' ? 'summary' : 'transcript';
       if (tab === 'summary' && m.status === 'recording') tab = 'notes';
     } catch (e) {
@@ -133,6 +139,16 @@
       meeting.titleFromUser = titleDraft.trim() !== '';
     } catch (e) {
       app.error('The title was not saved', e);
+    }
+  }
+
+  async function saveGoal() {
+    if (!meeting || goalDraft.trim() === meeting.goal) return;
+    try {
+      await api.updateMeeting(id, { goal: goalDraft });
+      meeting.goal = goalDraft.trim();
+    } catch (e) {
+      app.error('The goal was not saved', e);
     }
   }
 
@@ -274,6 +290,20 @@
         onblur={saveTitle}
         onkeydown={(e) => e.key === 'Enter' && (e.currentTarget as HTMLInputElement).blur()}
       />
+      {#if recording || meeting.goal}
+        <label class="goal">
+          <span class="goal-label">Goal</span>
+          <input
+            id="meeting-goal"
+            class="goal-field"
+            bind:value={goalDraft}
+            placeholder={recording ? 'What should this meeting achieve? The questions steer towards it.' : ''}
+            spellcheck="false"
+            onblur={saveGoal}
+            onkeydown={(e) => e.key === 'Enter' && (e.currentTarget as HTMLInputElement).blur()}
+          />
+        </label>
+      {/if}
       {#if recording}
         <p class="status live" aria-live="off">
           <span class="live-dot" aria-hidden="true"></span>
@@ -308,77 +338,96 @@
       </div>
     {/if}
 
-    <div class="tabs">
-      <Segmented label="Show" options={tabs} value={tab} onchange={(v) => (tab = v)} />
-    </div>
+    <div class={['columns', { 'with-questions': showQuestions }]}>
+      <div class="main">
+        <div class="tabs">
+          <Segmented label="Show" options={tabs} value={tab} onchange={(v) => (tab = v)} />
+        </div>
 
-    {#if tab === 'summary'}
-      <div class="notes-view">
-        {#if draftNotes}
-          <div class="md drafting selectable" aria-busy="true">{@html draftNotes.html}</div>
-        {:else if rendered}
-          <div class="md selectable">{@html rendered.html}</div>
-          {#if meeting.error}<p class="error">{meeting.error}</p>{/if}
-        {:else if busy}
-          <p class="placeholder">The notes appear here in a moment. Long meetings take a few minutes.</p>
-        {:else}
-          <p class="placeholder">{meeting.error ?? 'No notes yet.'}</p>
-          {#if meeting.segments.length > 0}
-            <button class="btn" onclick={summarize}>Write notes</button>
-          {/if}
-        {/if}
-      </div>
-    {:else if tab === 'notes'}
-      <textarea
-        class="my-notes selectable"
-        bind:value={notesDraft}
-        oninput={onNotesInput}
-        onblur={() => notesDirty && saveNotes()}
-        {@attach autosize}
-        aria-label="Your notes"
-        placeholder={recording
-          ? 'Jot down what matters to you, in a few words. When the meeting ends, the notes are built around these points and filled in from the transcript.'
-          : 'Your own notes. Write the notes again to work in changes.'}
-      ></textarea>
-    {:else}
-      <div class="transcript" bind:this={scroller} {@attach onPageScroll}>
-        {#if turns.length === 0}
-          <p class="placeholder">
-            {recording ? 'The transcript appears here a few seconds after people speak.' : 'Nothing was transcribed.'}
-          </p>
-        {/if}
-        {#each turns as t, i (i)}
-          <div class="turn">
-            <div class="margin">
-              <span class="time">{clock(t.startMs)}</span>
-            </div>
-            <div class="said">
-              {#if editingSpeaker === t.speaker && turns.findIndex((x) => x.speaker === t.speaker) === i}
-                <input
-                  class="field speaker-field"
-                  bind:value={speakerDraft}
-                  aria-label="Speaker name"
-                  {@attach focusOnMount}
-                  onblur={saveSpeaker}
-                  onkeydown={(e) => {
-                    if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
-                    if (e.key === 'Escape') editingSpeaker = null;
-                  }}
-                />
-              {:else}
-                <button class="speaker" title="Rename {speakerName(t.speaker)}" onclick={() => editSpeaker(t.speaker)}>
-                  {speakerName(t.speaker)}
-                </button>
+        {#if tab === 'summary'}
+          <div class="notes-view">
+            {#if draftNotes}
+              <div class="md drafting selectable" aria-busy="true">{@html draftNotes.html}</div>
+            {:else if rendered}
+              <div class="md selectable">{@html rendered.html}</div>
+              {#if meeting.error}<p class="error">{meeting.error}</p>{/if}
+            {:else if busy}
+              <p class="placeholder">The notes appear here in a moment. Long meetings take a few minutes.</p>
+            {:else}
+              <p class="placeholder">{meeting.error ?? 'No notes yet.'}</p>
+              {#if meeting.segments.length > 0}
+                <button class="btn" onclick={summarize}>Write notes</button>
               {/if}
-              <p class="words selectable">{t.text}</p>
-            </div>
+            {/if}
           </div>
-        {/each}
-        {#if recording && turns.length > 0}
-          <p class="listening">Listening…</p>
+        {:else if tab === 'notes'}
+          <textarea
+            class="my-notes selectable"
+            bind:value={notesDraft}
+            oninput={onNotesInput}
+            onblur={() => notesDirty && saveNotes()}
+            {@attach autosize}
+            aria-label="Your notes"
+            placeholder={recording
+              ? 'Jot down what matters to you, in a few words. When the meeting ends, the notes are built around these points and filled in from the transcript.'
+              : 'Your own notes. Write the notes again to work in changes.'}
+          ></textarea>
+        {:else}
+          <div class="transcript" bind:this={scroller} {@attach onPageScroll}>
+            {#if turns.length === 0}
+              <p class="placeholder">
+                {recording ? 'The transcript appears here a few seconds after people speak.' : 'Nothing was transcribed.'}
+              </p>
+            {/if}
+            {#each turns as t, i (i)}
+              <div class="turn">
+                <div class="margin">
+                  <span class="time">{clock(t.startMs)}</span>
+                </div>
+                <div class="said">
+                  {#if editingSpeaker === t.speaker && turns.findIndex((x) => x.speaker === t.speaker) === i}
+                    <input
+                      class="field speaker-field"
+                      bind:value={speakerDraft}
+                      aria-label="Speaker name"
+                      {@attach focusOnMount}
+                      onblur={saveSpeaker}
+                      onkeydown={(e) => {
+                        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                        if (e.key === 'Escape') editingSpeaker = null;
+                      }}
+                    />
+                  {:else}
+                    <button class="speaker" title="Rename {speakerName(t.speaker)}" onclick={() => editSpeaker(t.speaker)}>
+                      {speakerName(t.speaker)}
+                    </button>
+                  {/if}
+                  <p class="words selectable">{t.text}</p>
+                </div>
+              </div>
+            {/each}
+            {#if recording && turns.length > 0}
+              <p class="listening">Listening…</p>
+            {/if}
+          </div>
         {/if}
       </div>
-    {/if}
+      {#if showQuestions}
+        <aside class="questions" aria-labelledby="questions-title">
+          <div class="questions-head">
+            <h2 id="questions-title">Questions</h2>
+            {#if questions?.status === 'thinking'}<span class="sub" role="status">Reading the talk…</span>{/if}
+            <span class="spacer"></span>
+            {#if app.settings?.meetingQuestionsWindow}
+              <button class="btn btn-quiet small" title="Show the questions above other apps" onclick={() => api.showQuestionsWindow(true)}>
+                Float
+              </button>
+            {/if}
+          </div>
+          <QuestionStack meetingId={id} startedAt={meeting.startedAt} questions={questions?.questions ?? []} status={questions?.status ?? 'listening'} />
+        </aside>
+      {/if}
+    </div>
   {/if}
 </Page>
 
@@ -484,6 +533,71 @@
   }
   .tabs {
     margin: 20px 0 16px;
+  }
+  .goal {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 6px;
+  }
+  .goal-label {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--ink-2);
+  }
+  .goal-field {
+    flex: 1;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    font-size: 13px;
+    line-height: 20px;
+    color: var(--ink);
+    outline: none;
+  }
+  .goal-field::placeholder {
+    color: var(--ink-3);
+  }
+  .columns.with-questions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .questions {
+    order: -1;
+    margin-top: 20px;
+  }
+  @media (min-width: 1040px) {
+    .columns.with-questions {
+      grid-template-columns: minmax(0, 1fr) 280px;
+      column-gap: 32px;
+      align-items: start;
+    }
+    .questions {
+      order: 0;
+      position: sticky;
+      top: 16px;
+    }
+  }
+  .questions-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 28px;
+    margin-bottom: 8px;
+  }
+  .questions-head h2 {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .questions-head .spacer {
+    flex: 1;
+  }
+  .btn.small {
+    height: 24px;
+    padding: 0 8px;
+    font-size: 12px;
   }
   .placeholder {
     max-width: 56ch;

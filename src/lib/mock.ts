@@ -16,6 +16,8 @@ import type {
   LabPrompt,
   LabStopResult,
   Meeting,
+  QuestionKind,
+  QuestionStatus,
   MeetingItem,
   MeetingSegment,
   ModelInfo,
@@ -82,6 +84,8 @@ const settings: Settings = {
   meetingSpeakers: true,
   summaryModel: 'qwen3-4b-instruct-2507',
   meetingAudioDays: 14,
+  meetingQuestions: true,
+  meetingQuestionsWindow: true,
 };
 
 const missing = params.get('perm') === 'missing';
@@ -507,13 +511,34 @@ const sampleSegments: MeetingSegment[] = [
 const meetings: Meeting[] = params.get('empty') === '1' ? [] : [{
   id: 'm-sample', title: 'Billing page launch plan', titleFromUser: false,
   startedAt: new Date(Date.now() - 26 * 3600_000).toISOString(), endedAt: new Date(Date.now() - 25 * 3600_000).toISOString(),
-  durationMs: 34 * 60_000, status: 'done', notes: 'launch date?\nlegal — pricing text', segments: sampleSegments,
+  durationMs: 34 * 60_000, status: 'done', notes: 'launch date?\nlegal — pricing text', goal: '', questions: [], segments: sampleSegments,
   speakers: [{ id: 0, name: 'Me', renamed: false }, { id: 1, name: 'Anna', renamed: true }, { id: 2, name: 'Speaker 2', renamed: false }],
   summary: SAMPLE_SUMMARY, summaryModel: 'qwen3-4b-instruct-2507', language: 'en', error: null,
   systemAudio: true, stoppedByLimit: false, hasAudio: true,
 }];
 let activeMeeting: Snapshot['meeting'] = null;
 let meetingTimer: ReturnType<typeof setInterval> | null = null;
+let questionStatus: QuestionStatus = 'off';
+
+const SAMPLE_QUESTIONS: [QuestionKind, string][] = [
+  ['follow-up', 'Who reviews the migration script before it runs on the live data?'],
+  ['challenge', 'Is Thursday realistic for legal, given the pricing text changed twice?'],
+  ['understand', 'What does “about two days, including tests” cover: the script alone or the rollback too?'],
+  ['follow-up', 'What happens to the release date if legal’s feedback is late?'],
+];
+
+function emitQuestions(m: Meeting) {
+  emit('meeting-questions', { id: m.id, questions: clone(m.questions), status: questionStatus, goal: m.goal });
+}
+
+/** Proposes the next sample question while there's room, like a run of the questions model. */
+function proposeQuestion(m: Meeting) {
+  if (m.questions.filter((q) => q.state === 'live').length >= 3) return;
+  const next = SAMPLE_QUESTIONS[m.questions.length % SAMPLE_QUESTIONS.length];
+  if (m.questions.length >= SAMPLE_QUESTIONS.length) return;
+  const at = Date.now() - Date.parse(m.startedAt);
+  m.questions.push({ number: m.questions.length + 1, kind: next[0], text: next[1], state: 'live', atMs: at, changedMs: at });
+}
 
 function meetingItem(m: Meeting): MeetingItem {
   const preview = m.summary?.split('\n').find((l) => l.trim() && !l.startsWith('#') && !l.startsWith('-')) ??
@@ -525,16 +550,36 @@ function startMeeting(): string {
   if (activeMeeting) throw new Error('A meeting is already being recorded.');
   const m: Meeting = {
     id: `m-${Date.now()}`, title: '', titleFromUser: false, startedAt: new Date().toISOString(), endedAt: null, durationMs: 0,
-    status: 'recording', notes: '', segments: [], speakers: [{ id: 0, name: 'Me', renamed: false }], summary: null,
+    status: 'recording', notes: '', goal: '', questions: [], segments: [], speakers: [{ id: 0, name: 'Me', renamed: false }], summary: null,
     summaryModel: null, language: 'en', error: null, systemAudio: true, stoppedByLimit: false, hasAudio: true,
   };
   meetings.unshift(m);
   activeMeeting = { id: m.id, startedAt: m.startedAt, stopsAt: new Date(Date.now() + settings.meetingMaxMinutes * 60_000).toISOString() };
   emit('meeting-state', { active: activeMeeting });
   emit('meetings-changed', null);
+  questionStatus = settings.meetingQuestions ? 'listening' : 'off';
+  if (params.get('meeting') === 'live' && settings.meetingQuestions) {
+    // A meeting already under way: some talk and questions to look at.
+    m.segments = sampleSegments.map((x) => ({ ...x }));
+    m.speakers = [{ id: 0, name: 'Me', renamed: false }, { id: 1, name: 'Anna', renamed: true }, { id: 2, name: 'Speaker 2', renamed: false }];
+    m.goal = 'Fix the release date and who does the migration';
+    proposeQuestion(m);
+    proposeQuestion(m);
+    proposeQuestion(m);
+    m.questions[2].state = 'later';
+  }
   let i = 0;
   meetingTimer = setInterval(() => {
     emit('meeting-levels', { mic: Math.random() * 0.7, system: Math.random() * 0.5 });
+    if (settings.meetingQuestions && i % 50 === 20) {
+      questionStatus = 'thinking';
+      emitQuestions(m);
+    }
+    if (settings.meetingQuestions && i % 50 === 35) {
+      questionStatus = 'listening';
+      proposeQuestion(m);
+      emitQuestions(m);
+    }
     if (++i % 25 === 0) {
       const src = sampleSegments[(i / 25 - 1) % sampleSegments.length];
       const seg = { ...src, startMs: Date.now() - Date.parse(m.startedAt) - 6000 };
@@ -551,6 +596,8 @@ async function stopMeeting() {
   if (!m) return;
   if (meetingTimer) clearInterval(meetingTimer);
   activeMeeting = null;
+  questionStatus = 'off';
+  emitQuestions(m);
   m.durationMs = Date.now() - Date.parse(m.startedAt);
   m.status = 'processing';
   emit('meeting-state', { active: null });
@@ -573,6 +620,9 @@ async function stopMeeting() {
   emit('meeting-changed', { id: m.id });
   emit('meetings-changed', null);
 }
+
+// `?meeting=live`: open on a meeting that is being recorded (for the Questions window).
+if (params.get('meeting') === 'live') startMeeting();
 
 // ---------------------------------------------------------------- command router
 
@@ -726,9 +776,31 @@ export async function mockInvoke(cmd: string, a: Args): Promise<unknown> {
       const m = meetings.find((x) => x.id === a.id);
       if (m && a.patch.title !== undefined) { m.title = a.patch.title; m.titleFromUser = !!a.patch.title; }
       if (m && a.patch.notes !== undefined) m.notes = a.patch.notes;
+      if (m && a.patch.goal !== undefined) {
+        m.goal = a.patch.goal.trim();
+        emitQuestions(m);
+      }
       emit('meetings-changed', null);
       return;
     }
+    case 'meeting_questions': {
+      const m = meetings.find((x) => x.id === a.id);
+      if (!m) throw new Error('That meeting no longer exists.');
+      return { questions: clone(m.questions), status: m.status === 'recording' ? questionStatus : 'off', goal: m.goal };
+    }
+    case 'act_on_question': {
+      const m = meetings.find((x) => x.id === a.id)!;
+      const q = m.questions.find((x) => x.number === a.number);
+      if (!q) throw new Error('That question is gone.');
+      if (q.state !== 'live' && q.state !== 'later') throw new Error('That question is no longer open.');
+      q.state = a.act;
+      q.changedMs = Date.now() - Date.parse(m.startedAt);
+      emitQuestions(m);
+      return;
+    }
+    case 'show_questions_window':
+    case 'resize_questions_window':
+      return;
     case 'rename_speaker': {
       const m = meetings.find((x) => x.id === a.id)!;
       const sp = m.speakers.find((x) => x.id === a.speaker);

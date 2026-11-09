@@ -4,17 +4,19 @@
   import { PRODUCT } from './lib/brand';
   import { app } from './lib/state.svelte';
   import Dashboard from './views/Dashboard.svelte';
+  import QuestionsWindow from './views/QuestionsWindow.svelte';
   import Widget from './views/Widget.svelte';
+  import type { WindowKind } from './lib/state.svelte';
 
-  let kind = $state<'dashboard' | 'widget' | null>(null);
+  let kind = $state<WindowKind | null>(null);
   let failed = $state<string | null>(null);
 
   onMount(() => {
     document.title = PRODUCT;
     void (async () => {
       const label = await windowLabel();
-      const k = label === 'widget' ? 'widget' : 'dashboard';
-      if (k === 'widget') document.documentElement.classList.add('widget-transparent');
+      const k: WindowKind = label === 'widget' || label === 'questions' ? label : 'dashboard';
+      if (k !== 'dashboard') document.documentElement.classList.add('widget-transparent');
       try {
         await app.init(k);
         kind = k;
@@ -28,6 +30,8 @@
 
 {#if kind === 'widget'}
   <Widget />
+{:else if kind === 'questions'}
+  <QuestionsWindow />
 {:else if kind === 'dashboard'}
   <Dashboard />
 {:else if failed}

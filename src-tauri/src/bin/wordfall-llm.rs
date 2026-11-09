@@ -12,6 +12,7 @@
 //!   → {"op":"count","id":1,"text":"…"}
 //!   ← {"event":"count","id":1,"tokens":123}
 //!   → {"op":"chat","id":2,"messages":[{"role":"system","content":"…"},…],"maxTokens":1500}
+//!      (optional: "temperature":0.4, "grammar":"<GBNF>" to force the answer's form)
 //!   ← {"event":"progress","id":2,"done":2048,"total":9000}      (reading the prompt)
 //!   ← {"event":"token","id":2,"text":"…"}                       (writing)
 //!   ← {"event":"done","id":2,"text":"…","promptTokens":9000,"tokens":812,"ms":15012}
@@ -55,6 +56,9 @@ enum Request {
         max_tokens: u32,
         #[serde(default)]
         temperature: Option<f32>,
+        /// GBNF grammar (root rule `root`) the answer must follow.
+        #[serde(default)]
+        grammar: Option<String>,
     },
 }
 
@@ -120,9 +124,9 @@ fn run() -> anyhow::Result<()> {
                 let n = l.model.vocab().tokenize(text.as_bytes(), false, false).len();
                 send(json!({ "event": "count", "id": id, "tokens": n }));
             }
-            Request::Chat { id, messages, max_tokens, temperature } => {
+            Request::Chat { id, messages, max_tokens, temperature, grammar } => {
                 let Some(l) = loaded.as_ref() else { anyhow::bail!("no model loaded") };
-                if let Err(e) = chat(&backend, l, id, &messages, max_tokens, temperature.unwrap_or(0.4)) {
+                if let Err(e) = chat(&backend, l, id, &messages, max_tokens, temperature.unwrap_or(0.4), grammar.as_deref()) {
                     send(json!({ "event": "error", "id": id, "message": format!("{e:#}") }));
                 }
             }
@@ -164,6 +168,7 @@ fn chat(
     messages: &[Message],
     max_tokens: u32,
     temperature: f32,
+    grammar: Option<&str>,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let model = &l.model;
@@ -198,7 +203,11 @@ fn chat(
     }
     let prompt_ms = started.elapsed().as_millis();
 
-    let mut sampler = LlamaSampler::chain_simple([
+    let mut samplers = Vec::new();
+    if let Some(g) = grammar {
+        samplers.push(LlamaSampler::grammar(model, g, "root").map_err(|e| anyhow::anyhow!("bad grammar: {e}"))?);
+    }
+    samplers.extend([
         LlamaSampler::penalties(model.n_vocab(), 256, 1.05, 0.0, 0.0),
         LlamaSampler::top_k(40),
         LlamaSampler::top_p(0.9, 1),
@@ -206,6 +215,7 @@ fn chat(
         LlamaSampler::temp(temperature),
         LlamaSampler::dist(0x5EED),
     ]);
+    let mut sampler = LlamaSampler::chain_simple(samplers);
     let mut text = String::new();
     let mut pending: Vec<u8> = Vec::new();
     let mut pos = tokens.len() as i32;

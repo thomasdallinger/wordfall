@@ -17,7 +17,9 @@ import type {
   LabStopResult,
   Meeting,
   MeetingItem,
+  MeetingQuestions,
   ModelInfo,
+  QuestionAct,
   PermissionKind,
   Permissions,
   Settings,
@@ -139,7 +141,15 @@ export const api = {
   /** Starts recording a meeting; resolves to its id. */
   startMeeting: () => call<string>('start_meeting'),
   stopMeeting: () => call<void>('stop_meeting'),
-  updateMeeting: (id: string, patch: { title?: string; notes?: string }) => call<void>('update_meeting', { id, patch }),
+  updateMeeting: (id: string, patch: { title?: string; notes?: string; goal?: string }) =>
+    call<void>('update_meeting', { id, patch }),
+  /** Live questions and what the model is doing; updates arrive as `meeting-questions`. */
+  meetingQuestions: (id: string) => call<MeetingQuestions>('meeting_questions', { id }),
+  actOnQuestion: (id: string, number: number, act: QuestionAct) => call<void>('act_on_question', { id, number, act }),
+  /** Shows or hides the floating Questions window (only while a meeting records). */
+  showQuestionsWindow: (show: boolean) => call<void>('show_questions_window', { show }),
+  /** Fit the Questions window to its content (logical px); its top-left corner stays put. */
+  resizeQuestionsWindow: (width: number, height: number) => call<void>('resize_questions_window', { width, height }),
   renameSpeaker: (id: string, speaker: number, name: string) => call<Meeting>('rename_speaker', { id, speaker, name }),
   deleteMeeting: (id: string) => call<void>('delete_meeting', { id }),
   /** Writes (or rewrites) the notes in the background; follow `meeting-progress`. */

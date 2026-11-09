@@ -667,7 +667,7 @@ pub fn drop_echo(segments: &mut Vec<Segment>, embeddings: &mut Vec<Option<Vec<f3
     dropped
 }
 
-fn clock(ms: u64) -> String {
+pub(super) fn clock(ms: u64) -> String {
     let s = ms / 1000;
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)

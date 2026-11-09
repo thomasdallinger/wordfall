@@ -47,6 +47,10 @@ export interface Settings {
   summaryModel: string;
   /** Meeting recordings are deleted after this many days (0 = kept). */
   meetingAudioDays: number;
+  /** Propose questions to ask while a meeting is recorded (needs the summary model). */
+  meetingQuestions: boolean;
+  /** Also show them in a floating window above other apps. */
+  meetingQuestionsWindow: boolean;
 }
 
 export type MeetingStatus = 'recording' | 'processing' | 'summarizing' | 'done';
@@ -78,6 +82,10 @@ export interface Meeting {
   status: MeetingStatus;
   /** The user's own notes. */
   notes: string;
+  /** What the user wants out of the meeting; live questions steer towards it. */
+  goal: string;
+  /** Questions proposed while it was recorded. */
+  questions: MeetingQuestion[];
   segments: MeetingSegment[];
   speakers: MeetingSpeaker[];
   /** Markdown notes written by the language model. */
@@ -106,6 +114,32 @@ export interface ActiveMeeting {
   startedAt: string;
   /** When the time limit stops it, if there is one. */
   stopsAt: string | null;
+}
+
+/** understand: something vague; challenge: a claim to test; follow-up: something left open. */
+export type QuestionKind = 'understand' | 'challenge' | 'follow-up';
+export type QuestionState = 'live' | 'later' | 'asked' | 'answered' | 'expired' | 'deleted';
+/** What the user does to an open question. */
+export type QuestionAct = 'later' | 'asked' | 'deleted';
+/** What the live questions are doing: off, no summary model, loading it, waiting for talk, reading, failed. */
+export type QuestionStatus = 'off' | 'no-model' | 'starting' | 'listening' | 'thinking' | 'failed';
+
+export interface MeetingQuestion {
+  /** 1, 2, … in the order proposed. */
+  number: number;
+  text: string;
+  kind: QuestionKind;
+  state: QuestionState;
+  /** Meeting time it was proposed at, and of its last change. */
+  atMs: number;
+  changedMs: number;
+}
+
+export interface MeetingQuestions {
+  questions: MeetingQuestion[];
+  status: QuestionStatus;
+  /** The meeting's goal, which the questions steer towards. */
+  goal: string;
 }
 
 export type MeetingPhase = 'transcribing' | 'speakers' | 'loading' | 'reading' | 'writing';
@@ -294,6 +328,7 @@ export interface EventMap {
   'meeting-segments': { id: string; segments: MeetingSegment[]; speakers: MeetingSpeaker[] };
   'meeting-changed': { id: string };
   'meeting-progress': MeetingProgress;
+  'meeting-questions': { id: string } & MeetingQuestions;
   'meeting-levels': { mic?: number; system?: number };
   'meetings-changed': null;
   'summary-models-changed': null;

@@ -90,8 +90,8 @@ pub fn list(dir: &Path) -> Vec<LlmInfo> {
 
 // ---------- helper process ----------
 
-/// Context the helper is asked for; it shrinks it if memory is tight.
-const WANTED_CTX: u32 = 32_768;
+/// Context the helper is asked for when writing notes; it shrinks it if memory is tight.
+pub const NOTES_CTX: u32 = 32_768;
 
 fn helper_path() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
@@ -118,8 +118,8 @@ pub enum Event<'a> {
 
 impl Worker {
     /// Starts the helper and loads `model` (takes a few seconds; the GPU warms up meanwhile).
-    /// llama.cpp's log is appended to `log`.
-    pub fn spawn(model: &Path, log: &Path) -> anyhow::Result<Self> {
+    /// llama.cpp's log is appended to `log`. `ctx` is the context wanted, in tokens.
+    pub fn spawn(model: &Path, log: &Path, ctx: u32) -> anyhow::Result<Self> {
         let stderr = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
         let mut cmd = Command::new(helper_path()?);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(stderr);
@@ -144,7 +144,7 @@ impl Worker {
             }
         })?;
         let mut w = Self { child, stdin, events, ctx: 0, next_id: 1 };
-        w.send(json!({ "op": "load", "model": model.display().to_string(), "ctx": WANTED_CTX }))?;
+        w.send(json!({ "op": "load", "model": model.display().to_string(), "ctx": ctx }))?;
         let ready = w.next_event(Duration::from_secs(300))?;
         match ready["event"].as_str() {
             Some("ready") => {
@@ -186,13 +186,29 @@ impl Worker {
     }
 
     /// Runs one chat completion, reporting progress through `on_event`.
-    pub fn chat(&mut self, system: &str, user: &str, max_tokens: u32, mut on_event: impl FnMut(Event)) -> anyhow::Result<String> {
+    pub fn chat(&mut self, system: &str, user: &str, max_tokens: u32, on_event: impl FnMut(Event)) -> anyhow::Result<String> {
+        self.chat_shaped(system, user, max_tokens, None, on_event)
+    }
+
+    /// Like `chat`, with the answer held to a GBNF `grammar` (root rule `root`).
+    pub fn chat_shaped(
+        &mut self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        grammar: Option<&str>,
+        mut on_event: impl FnMut(Event),
+    ) -> anyhow::Result<String> {
         let id = self.next_id;
         self.next_id += 1;
-        self.send(json!({
+        let mut request = json!({
             "op": "chat", "id": id, "maxTokens": max_tokens,
             "messages": [{ "role": "system", "content": system }, { "role": "user", "content": user }],
-        }))?;
+        });
+        if let Some(g) = grammar {
+            request["grammar"] = json!(g);
+        }
+        self.send(request)?;
         loop {
             let ev = self.next_event(Duration::from_secs(600))?;
             if ev["id"].as_u64() != Some(id) {
@@ -233,7 +249,7 @@ pub fn warm_up(model: &Path, data: &Path) {
         return;
     }
     let started = std::time::Instant::now();
-    let result = Worker::spawn(model, &data.join("llm.log")).and_then(|mut w| w.chat("Answer with one word.", "Ready?", 1, |_| {}));
+    let result = Worker::spawn(model, &data.join("llm.log"), NOTES_CTX).and_then(|mut w| w.chat("Answer with one word.", "Ready?", 1, |_| {}));
     match result {
         Ok(_) => {
             log::info!("summary model warmed up in {:.1}s", started.elapsed().as_secs_f32());
@@ -258,6 +274,8 @@ impl Drop for Worker {
 pub struct SummaryInput<'a> {
     /// A title the user gave the meeting, if any.
     pub title: Option<&'a str>,
+    /// What the user wanted out of the meeting, if they said.
+    pub goal: Option<&'a str>,
     pub notes: &'a str,
     /// "[mm:ss] Speaker: text" lines.
     pub transcript: &'a [String],
@@ -323,6 +341,19 @@ fn headings(language: &str) -> [&'static str; 3] {
     }
 }
 
+/// Heading of the questions the meeting left open (added below the notes).
+pub fn open_questions_heading(language: &str) -> &'static str {
+    match language {
+        "German" => "Offene Fragen",
+        "French" => "Questions ouvertes",
+        "Spanish" => "Preguntas abiertas",
+        "Italian" => "Domande aperte",
+        "Dutch" => "Open vragen",
+        "Portuguese" => "Perguntas em aberto",
+        _ => "Open questions",
+    }
+}
+
 fn format_instructions(language: &str) -> String {
     let [decisions, actions, notes] = headings(language);
     format!(
@@ -351,6 +382,10 @@ fn final_prompt(input: &SummaryInput, language: &str, body_label: &str, body: &s
     if !input.speakers.is_empty() {
         p.push_str(&format!("Speakers as labelled below: {}.
 ", input.speakers.join(", ")));
+    }
+    if let Some(goal) = input.goal {
+        p.push_str(&format!("What I wanted out of the meeting: {}
+", goal.trim()));
     }
     p.push_str(&format!("
 <{body_label}>

@@ -605,6 +605,7 @@ pub fn stop_meeting(app: AppHandle) {
 pub struct MeetingPatch {
     title: Option<String>,
     notes: Option<String>,
+    goal: Option<String>,
 }
 
 #[tauri::command]
@@ -617,9 +618,42 @@ pub fn update_meeting(app: AppHandle, id: String, patch: MeetingPatch) -> CmdRes
         if let Some(n) = patch.notes {
             m.notes = n;
         }
+        if let Some(g) = &patch.goal {
+            m.goal = g.trim().to_string();
+        }
     })
-    .map(drop)
-    .map_err(err)
+    .map_err(err)?;
+    if patch.goal.is_some() {
+        meetings::emit_questions(&app, &id);
+    }
+    Ok(())
+}
+
+/// The live questions of a meeting, what the model is doing, and the goal (updates: `meeting-questions`).
+#[tauri::command]
+pub fn meeting_questions(app: AppHandle, id: String) -> CmdResult<meetings::LiveQuestions> {
+    meetings::questions_of(&app, &id).map_err(err)
+}
+
+/// Later, Asked or Delete on a live question.
+#[tauri::command]
+pub fn act_on_question(app: AppHandle, id: String, number: u32, act: meetings::QuestionAct) -> CmdResult<()> {
+    meetings::act_on_question(&app, &id, number, act).map_err(err)
+}
+
+/// Shows or hides the floating Questions window (only while a meeting is recorded).
+#[tauri::command]
+pub fn show_questions_window(app: AppHandle, show: bool) {
+    if show && meetings::is_recording(&app) {
+        crate::questions_window::open(&app);
+    } else {
+        crate::questions_window::hide(&app);
+    }
+}
+
+#[tauri::command]
+pub fn resize_questions_window(app: AppHandle, width: f64, height: f64) {
+    crate::questions_window::resize(&app, width, height);
 }
 
 #[tauri::command]

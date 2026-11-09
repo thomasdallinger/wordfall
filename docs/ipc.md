@@ -1,6 +1,7 @@
 # Wordfall IPC contract (Rust core <-> Svelte UI)
 
-Windows (labels): `dashboard` (main UI) and `widget` (floating pill, transparent, always on top).
+Windows (labels): `dashboard` (main UI), `widget` (floating pill, transparent, always on top) and `questions`
+(live questions of the meeting being recorded: transparent, always on top, never takes focus; open while one records).
 The UI picks its view from `getCurrentWindow().label`.
 
 All payload keys are camelCase.
@@ -45,6 +46,8 @@ interface Settings {
   meetingSpeakers: boolean;      // tell speakers apart (30 MB CAM++ voice model, fetched on first meeting)
   summaryModel: string;          // id from list_summary_models, e.g. "qwen3-4b-instruct-2507"
   meetingAudioDays: number;      // meeting WAVs are deleted after this many days; 0 = kept (default 14)
+  meetingQuestions: boolean;     // propose questions to ask while a meeting records (needs the summary model; default true)
+  meetingQuestionsWindow: boolean; // also show them in the floating `questions` window (default true)
 }
 
 interface HistoryRecord {
@@ -96,11 +99,19 @@ interface MeetingSegment { startMs: number; endMs: number; channel: 'mic' | 'sys
 interface MeetingSpeaker { id: number; name: string; renamed: boolean }
 interface Meeting {
   id: string; title: string; titleFromUser: boolean; startedAt: string; endedAt: string | null; durationMs: number;
-  status: MeetingStatus; notes: string /* the user's own */; segments: MeetingSegment[]; speakers: MeetingSpeaker[];
+  status: MeetingStatus; notes: string /* the user's own */; goal: string /* steers the questions */;
+  questions: MeetingQuestion[]; segments: MeetingSegment[]; speakers: MeetingSpeaker[];
   summary: string | null /* Markdown: "# Title", summary, ## decisions / action items / notes */;
   summaryModel: string | null; language: string | null; error: string | null;
   systemAudio: boolean; stoppedByLimit: boolean; hasAudio: boolean;
 }
+// Live questions. At most 3 'live' at a time; answered ones close by themselves, unanswered live ones expire
+// after 5 minutes; 'live' and 'later' ones left at the end are added to the notes as "Open questions".
+type QuestionKind = 'understand' | 'challenge' | 'follow-up';
+type QuestionState = 'live' | 'later' | 'asked' | 'answered' | 'expired' | 'deleted';
+type QuestionStatus = 'off' | 'no-model' | 'starting' | 'listening' | 'thinking' | 'failed';
+interface MeetingQuestion { number: number; text: string; kind: QuestionKind; state: QuestionState; atMs: number; changedMs: number }
+interface MeetingQuestions { questions: MeetingQuestion[]; status: QuestionStatus; goal: string }
 interface MeetingItem { id: string; title: string; startedAt: string; durationMs: number; status: MeetingStatus; hasSummary: boolean; preview: string }
 interface ActiveMeeting { id: string; startedAt: string; stopsAt: string | null }
 interface SummaryModelInfo { id: string; displayName: string; sizeMb: number; downloaded: boolean; badge: string; description: string; recommended: boolean }
@@ -153,7 +164,11 @@ interface SummaryModelInfo { id: string; displayName: string; sizeMb: number; do
 | `get_meeting` | `{ id }` | `Meeting` |
 | `start_meeting` | – | `string` (id; fails if one is running or the microphone is unavailable) |
 | `stop_meeting` | – | – (the rest is transcribed, speakers labelled, then notes written; follow `meeting-progress`) |
-| `update_meeting` | `{ id, patch: { title?: string, notes?: string } }` | – (an empty title lets the notes name it) |
+| `update_meeting` | `{ id, patch: { title?: string, notes?: string, goal?: string } }` | – (an empty title lets the notes name it) |
+| `meeting_questions` | `{ id }` | `MeetingQuestions` (updates via `meeting-questions`) |
+| `act_on_question` | `{ id, number, act: 'later' \| 'asked' \| 'deleted' }` | – (only on 'live' or 'later' questions) |
+| `show_questions_window` | `{ show: boolean }` | – (shows it only while a meeting records) |
+| `resize_questions_window` | `{ width, height }` (logical px of the content) | – (top-left stays put) |
 | `rename_speaker` | `{ id, speaker: number, name }` | `Meeting` |
 | `delete_meeting` | `{ id }` | – (not while it's recording or being processed) |
 | `summarize_meeting` | `{ id }` | – (writes the notes again in the background) |
@@ -182,5 +197,6 @@ interface SummaryModelInfo { id: string; displayName: string; sizeMb: number; do
 | `meeting-segments` | `{ id, segments: MeetingSegment[], speakers: MeetingSpeaker[] }` (new transcript; speakers are provisional until the meeting ends) |
 | `meeting-progress` | `{ id, phase: 'transcribing' \| 'speakers' \| 'loading' \| 'reading' \| 'writing', fraction: number \| null, text: string \| null }` (`text` = notes so far while writing) |
 | `meeting-changed` | `{ id }` (status, transcript or notes changed: reload it) |
+| `meeting-questions` | `{ id } & MeetingQuestions` (questions, status or goal changed) |
 | `meetings-changed` | – |
 | `summary-models-changed` | – |

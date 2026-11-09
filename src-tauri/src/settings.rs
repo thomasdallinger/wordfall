@@ -71,6 +71,12 @@ pub struct Settings {
     pub summary_model: String,
     /// Meeting recordings are deleted after this many days (0 = kept).
     pub meeting_audio_days: u32,
+    /// Propose questions to ask while a meeting is recorded (needs the summary model).
+    pub meeting_questions: bool,
+    /// Show them in a floating window above other apps, not only in the meeting view.
+    pub meeting_questions_window: bool,
+    /// Where the user dragged the questions window: offset from its top-right spot (logical px).
+    pub questions_window_position: Option<(i32, i32)>,
 }
 
 impl Default for Settings {
@@ -107,6 +113,9 @@ impl Default for Settings {
             meeting_speakers: true,
             summary_model: "qwen3-4b-instruct-2507".into(),
             meeting_audio_days: 14,
+            meeting_questions: true,
+            meeting_questions_window: true,
+            questions_window_position: None,
         }
     }
 }

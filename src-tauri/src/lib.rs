@@ -12,6 +12,7 @@ mod meetings;
 mod metrics;
 mod platform;
 mod postprocess;
+mod questions_window;
 mod session;
 mod settings;
 mod speakers;
@@ -239,7 +240,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// Wordfall's own log lines on stderr, for the headless checks (the app writes them to a file).
-fn init_stderr_logging() {
+pub(crate) fn init_stderr_logging() {
     struct Stderr;
     impl log::Log for Stderr {
         fn enabled(&self, m: &log::Metadata) -> bool {
@@ -508,6 +509,10 @@ pub fn run() {
             commands::start_meeting,
             commands::stop_meeting,
             commands::update_meeting,
+            commands::meeting_questions,
+            commands::act_on_question,
+            commands::show_questions_window,
+            commands::resize_questions_window,
             commands::rename_speaker,
             commands::delete_meeting,
             commands::summarize_meeting,

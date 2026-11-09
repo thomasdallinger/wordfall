@@ -6,6 +6,7 @@
 //! in memory is the truth and every edit goes through it; otherwise edits load and save the file.
 
 mod pipeline;
+mod questions;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ use crate::{
     vocab, Core,
 };
 pub use pipeline::ME;
+pub use questions::{Act as QuestionAct, Question};
 use pipeline::{ChannelProcessor, Ctx, EchoFilter, LiveSpeakers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -89,6 +91,10 @@ pub struct Meeting {
     pub status: Status,
     /// The user's own notes, typed during or after the meeting.
     pub notes: String,
+    /// What the user wants out of the meeting; live questions steer towards it.
+    pub goal: String,
+    /// Questions proposed while it was recorded (see `questions.rs`).
+    pub questions: Vec<Question>,
     pub segments: Vec<Segment>,
     pub speakers: Vec<Speaker>,
     /// Markdown notes written by the language model.
@@ -140,6 +146,26 @@ pub struct Meetings {
     live: Mutex<Option<Live>>,
     /// One summary at a time: the model needs several GB.
     summarizing: Mutex<()>,
+    /// What the live questions of the meeting being recorded are doing (see `QuestionStatus`).
+    question_status: Mutex<Option<(String, QuestionStatus)>>,
+}
+
+/// What the live questions are doing, for the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QuestionStatus {
+    /// Turned off in Settings, or the meeting isn't being recorded.
+    Off,
+    /// No summary model is downloaded.
+    NoModel,
+    /// Loading the model.
+    Starting,
+    /// Waiting for enough new talk.
+    Listening,
+    /// Reading the latest talk.
+    Thinking,
+    /// The model failed; questions stopped for this meeting.
+    Failed,
 }
 
 impl Meetings {
@@ -393,11 +419,23 @@ pub fn start(app: &AppHandle) -> anyhow::Result<String> {
             }
         });
     }
+    if settings.meeting_questions {
+        let (app3, shared3, stop3, settings3) = (app.clone(), shared.clone(), stop.clone(), settings.clone());
+        thread::Builder::new().name("wordfall-questions".into()).spawn(move || {
+            ask_questions(&app3, &shared3, &stop3, &settings3);
+        })?;
+        if settings.meeting_questions_window {
+            crate::questions_window::open(app);
+        }
+    } else {
+        set_question_status(app, &id, QuestionStatus::Off);
+    }
     let app2 = app.clone();
     thread::Builder::new().name("wordfall-meeting".into()).spawn(move || {
         let busy = crate::platform::busy("Meeting");
         record(&app2, &shared, mic, system, &stop, limit, &settings);
         drop(busy);
+        crate::questions_window::close(&app2);
         finish(&app2, &shared, &settings);
     })?;
     emit_state(app);
@@ -409,6 +447,151 @@ pub fn stop(app: &AppHandle) {
     if let Some(l) = app.state::<Core>().meetings.live.lock().as_ref() {
         l.stop.store(true, Ordering::SeqCst);
     }
+}
+
+// ---------- live questions ----------
+
+/// A run of the questions model waits for this much new talk…
+const QUESTION_WORDS: usize = 30;
+/// …and this much meeting time since the last run.
+const QUESTION_GAP_MS: u64 = 30_000;
+/// Runs that may fail in a row before questions stop for the meeting.
+const QUESTION_FAILURES: u32 = 3;
+
+fn word_count(segments: &[Segment]) -> usize {
+    segments.iter().map(|s| s.text.split_whitespace().count()).sum()
+}
+
+fn set_question_status(app: &AppHandle, id: &str, status: QuestionStatus) {
+    *app.state::<Core>().meetings.question_status.lock() = Some((id.to_string(), status));
+    emit_questions(app, id);
+}
+
+/// The live questions of a meeting, what the model is doing, and the goal they steer towards.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveQuestions {
+    pub questions: Vec<Question>,
+    pub status: QuestionStatus,
+    pub goal: String,
+}
+
+pub fn questions_of(app: &AppHandle, id: &str) -> anyhow::Result<LiveQuestions> {
+    let m = get(app, id)?;
+    let status = match app.state::<Core>().meetings.question_status.lock().as_ref() {
+        Some((sid, s)) if sid == id && m.status == Status::Recording => *s,
+        _ => QuestionStatus::Off,
+    };
+    Ok(LiveQuestions { questions: m.questions, status, goal: m.goal })
+}
+
+/// Tells every window the questions (or the goal) changed: `meeting-questions`.
+pub fn emit_questions(app: &AppHandle, id: &str) {
+    if let Ok(q) = questions_of(app, id) {
+        let mut payload = json!(q);
+        payload["id"] = json!(id);
+        let _ = app.emit("meeting-questions", payload);
+    }
+}
+
+/// The user acted on a question (Later, Asked, Delete).
+pub fn act_on_question(app: &AppHandle, id: &str, number: u32, act: QuestionAct) -> anyhow::Result<()> {
+    let mut result = Ok(());
+    edit(app, id, |m| {
+        let now = m.duration_ms;
+        result = questions::act(&mut m.questions, number, act, now);
+    })?;
+    result?;
+    emit_questions(app, id);
+    Ok(())
+}
+
+/// While the meeting records: runs the questions model whenever enough new talk has come in.
+fn ask_questions(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBool, settings: &Settings) {
+    let c = app.state::<Core>();
+    let id = meeting.lock().id.clone();
+    let model = llm::entry(&settings.summary_model).and_then(|e| llm::locate(&c.model_dirs.read().own, e));
+    let Some(model) = model else {
+        set_question_status(app, &id, QuestionStatus::NoModel);
+        return;
+    };
+    set_question_status(app, &id, QuestionStatus::Listening);
+    let mut worker: Option<llm::Worker> = None;
+    let mut words_then = 0;
+    let mut last_run: Option<u64> = None;
+    let mut failures = 0;
+    while !stop.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_secs(1));
+        let (now_ms, words, expired) = {
+            let mut m = meeting.lock();
+            let now = m.duration_ms;
+            let expired = questions::expire(&mut m.questions, now);
+            (now, word_count(&m.segments), expired)
+        };
+        if expired {
+            emit_questions(app, &id);
+        }
+        let due = words.saturating_sub(words_then) >= QUESTION_WORDS
+            && last_run.is_none_or(|t| now_ms.saturating_sub(t) >= QUESTION_GAP_MS);
+        if !due || c.sessions.dictation_busy() || stop.load(Ordering::SeqCst) {
+            continue;
+        }
+        if worker.is_none() {
+            set_question_status(app, &id, QuestionStatus::Starting);
+            match llm::Worker::spawn(&model, &c.dir.join("llm.log"), questions::CTX) {
+                Ok(w) => worker = Some(w),
+                Err(e) => {
+                    log::error!("the questions model did not start: {e:#}");
+                    set_question_status(app, &id, QuestionStatus::Failed);
+                    return;
+                }
+            }
+        }
+        set_question_status(app, &id, QuestionStatus::Thinking);
+        let snapshot = meeting.lock().clone();
+        let language = pipeline::meeting_language(&snapshot.segments);
+        let input = questions::Input {
+            goal: &snapshot.goal,
+            notes: &snapshot.notes,
+            language: language.as_deref(),
+            segments: &snapshot.segments,
+            speakers: &snapshot.speakers,
+            questions: &snapshot.questions,
+            now_ms,
+        };
+        let started = Instant::now();
+        let result = questions::run(worker.as_mut().expect("started above"), &input);
+        words_then = words;
+        last_run = Some(now_ms);
+        match result {
+            Ok(outcome) => {
+                failures = 0;
+                let changed = outcome.is_some_and(|o| {
+                    let mut m = meeting.lock();
+                    let now = m.duration_ms;
+                    let changed = questions::apply(&mut m.questions, o, now);
+                    if changed {
+                        save(&c.dir, &m);
+                    }
+                    changed
+                });
+                let live = questions::live_count(&meeting.lock().questions);
+                log::info!("meeting questions: read the talk in {:.1}s, {live} open{}", started.elapsed().as_secs_f32(), if changed { ", changed" } else { "" });
+            }
+            Err(e) => {
+                failures += 1;
+                log::warn!("meeting questions failed ({failures} in a row): {e:#}");
+                worker = None;
+                if failures >= QUESTION_FAILURES {
+                    set_question_status(app, &id, QuestionStatus::Failed);
+                    return;
+                }
+            }
+        }
+        set_question_status(app, &id, QuestionStatus::Listening);
+    }
+    drop(worker);
+    set_question_status(app, &id, QuestionStatus::Off);
 }
 
 struct Chan {
@@ -814,7 +997,7 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
         let path = llm::locate(&c.model_dirs.read().own, entry)
             .ok_or_else(|| anyhow::anyhow!("{} isn't downloaded", entry.display_name))?;
         let started = Instant::now();
-        let mut worker = llm::Worker::spawn(&path, &c.dir.join("llm.log"))?;
+        let mut worker = llm::Worker::spawn(&path, &c.dir.join("llm.log"), llm::NOTES_CTX)?;
         let lines = pipeline::transcript_lines(&snapshot.segments, &snapshot.speakers);
         let used: Vec<u32> = snapshot.segments.iter().map(|s| s.speaker).collect();
         let speakers: Vec<String> =
@@ -824,6 +1007,7 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
             .unwrap_or_default();
         let input = llm::SummaryInput {
             title: snapshot.title_from_user.then_some(snapshot.title.as_str()).filter(|t| !t.trim().is_empty()),
+            goal: Some(snapshot.goal.as_str()).filter(|g| !g.trim().is_empty()),
             notes: &snapshot.notes,
             transcript: &lines,
             speakers: &speakers,
@@ -843,6 +1027,12 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
             }
         })?;
         log::info!("meeting notes written in {:.1}s", started.elapsed().as_secs_f32());
+        // What the live questions left open, as the user saw them (not retold by the model).
+        let heading = llm::open_questions_heading(llm::language_name(snapshot.language.as_deref()));
+        let summary = match questions::open_section(&snapshot.questions, heading) {
+            Some(open) => format!("{summary}\n\n{open}"),
+            None => summary,
+        };
         Ok((summary, entry.id.to_string()))
     })();
     let mut m = meeting.lock();
@@ -868,9 +1058,56 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
 
 // ---------- `wordfall --meeting` ----------
 
-/// `wordfall --meeting <mic.wav> [--system <system.wav>] [--no-summary]`: runs a recorded meeting
-/// through the same pipeline as a live one (fed in real-time-sized pieces) and prints the
-/// transcript and notes.
+/// Live questions for `wordfall --meeting … --questions`: run at the same pace as in a live meeting
+/// (by meeting time), printing what changes. Nobody presses anything, so questions stay until the
+/// talk answers them or they expire.
+struct CliQuestions {
+    worker: llm::Worker,
+    words_then: usize,
+    last_run: Option<u64>,
+}
+
+impl CliQuestions {
+    fn step(&mut self, meeting: &mut Meeting, now_ms: u64) -> anyhow::Result<()> {
+        let before = meeting.questions.clone();
+        questions::expire(&mut meeting.questions, now_ms);
+        let words = word_count(&meeting.segments);
+        let due = words.saturating_sub(self.words_then) >= QUESTION_WORDS
+            && self.last_run.is_none_or(|t| now_ms.saturating_sub(t) >= QUESTION_GAP_MS);
+        if due {
+            self.words_then = words;
+            self.last_run = Some(now_ms);
+            let language = pipeline::meeting_language(&meeting.segments);
+            let input = questions::Input {
+                goal: &meeting.goal,
+                notes: &meeting.notes,
+                language: language.as_deref(),
+                segments: &meeting.segments,
+                speakers: &meeting.speakers,
+                questions: &meeting.questions,
+                now_ms,
+            };
+            let started = Instant::now();
+            let outcome = questions::run(&mut self.worker, &input)?;
+            eprintln!("[{:>6.1}s] (questions read the talk in {:.1}s)", now_ms as f32 / 1000.0, started.elapsed().as_secs_f32());
+            if let Some(o) = outcome {
+                questions::apply(&mut meeting.questions, o, now_ms);
+            }
+        }
+        for q in &meeting.questions {
+            match before.iter().find(|b| b.number == q.number) {
+                None => eprintln!("[{:>6.1}s] + Q{} ({:?}) {}", now_ms as f32 / 1000.0, q.number, q.kind, q.text),
+                Some(b) if b.state != q.state => eprintln!("[{:>6.1}s] Q{} {:?}", now_ms as f32 / 1000.0, q.number, q.state),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `wordfall --meeting <mic.wav> [--system <system.wav>] [--no-summary] [--questions] [--goal "…"]`:
+/// runs a recorded meeting through the same pipeline as a live one (fed in real-time-sized pieces)
+/// and prints the transcript and notes; with `--questions`, also the live questions as they come.
 pub fn cli(args: &[String]) -> anyhow::Result<()> {
     use crate::{store::Store, transcribe::{catalog_entry, Engine}};
     let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
@@ -914,6 +1151,16 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     let mut embeddings = Vec::new();
     let mut live = LiveSpeakers::new(embedder.is_some(), &meeting.speakers);
     let mut echo = EchoFilter::default();
+    meeting.goal = arg("--goal").unwrap_or_default();
+    meeting.notes = arg("--notes").unwrap_or_default();
+    let mut asker = if args.iter().any(|a| a == "--questions") {
+        crate::init_stderr_logging();
+        let entry = llm::entry(&settings.summary_model).ok_or_else(|| anyhow::anyhow!("unknown summary model"))?;
+        let path = llm::locate(&model_dirs.own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
+        Some(CliQuestions { worker: llm::Worker::spawn(&path, &data_dir.join("llm.log"), questions::CTX)?, words_then: 0, last_run: None })
+    } else {
+        None
+    };
     let mut pos = 0;
     while pos < longest {
         let end = (pos + step).min(longest);
@@ -951,8 +1198,12 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
                 embeddings.push(h.embedding);
             }
         }
+        if let Some(a) = asker.as_mut() {
+            a.step(&mut meeting, end as u64 / 16)?;
+        }
         pos = end;
     }
+    drop(asker);
     meeting.duration_ms = longest as u64 / 16;
     let transcribed = started.elapsed();
     for (seg, why) in pipeline::drop_echo(&mut meeting.segments, &mut embeddings, &echo) {
@@ -964,6 +1215,12 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     println!("--- transcript ({:.1}s for {:.0}s of audio) ---", transcribed.as_secs_f32(), longest as f32 / 16_000.0);
     for l in &lines {
         println!("{l}");
+    }
+    if !meeting.questions.is_empty() {
+        println!("--- questions ---");
+        for q in &meeting.questions {
+            println!("Q{} [{}] {:?} ({:?}): {}", q.number, pipeline::clock(q.at_ms), q.state, q.kind, q.text);
+        }
     }
     if args.iter().any(|a| a == "--no-summary") {
         return Ok(());
@@ -1007,10 +1264,12 @@ fn print_notes(
     let entry = llm::entry(&settings.summary_model).ok_or_else(|| anyhow::anyhow!("unknown summary model"))?;
     let path = llm::locate(&settings.model_dirs(data_dir).own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
     let t = Instant::now();
-    let mut worker = llm::Worker::spawn(&path, &data_dir.join("llm.log"))?;
+    let mut worker = llm::Worker::spawn(&path, &data_dir.join("llm.log"), llm::NOTES_CTX)?;
     let notes = arg("--notes").unwrap_or_default();
+    let goal = arg("--goal");
     let input = llm::SummaryInput {
         title: None,
+        goal: goal.as_deref().filter(|g| !g.trim().is_empty()),
         notes: &notes,
         transcript: lines,
         speakers,

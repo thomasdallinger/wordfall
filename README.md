@@ -24,7 +24,8 @@ Local speech recognition for macOS and Windows. Nothing leaves your computer.</p
 - **Meeting notes.** Start a meeting from *Meetings*: Wordfall records you and the other participants (the
   computer's audio, so Zoom, Teams and Meet work with headphones), transcribes as it goes, tells speakers apart,
   and writes notes with decisions and action items when you stop, with a language model that runs on your
-  computer. Jot down your own notes during the meeting and the notes are built around them.
+  computer. Jot down your own notes during the meeting and the notes are built around them. While you talk, it
+  proposes questions to ask, steered by the meeting's goal, in a small window that stays above the call.
 - **No hallucinated "Thank you."** Voice activity detection drops silence, hum and typing before decoding.
 - **Measured, not guessed.** A built-in benchmark harness scores engines and settings on accuracy and
   latency (see [`bench/`](bench/README.md) and [results](docs/benchmark-results.md)).
@@ -168,6 +169,13 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   by itself after 3 hours (*Settings → Meetings → Stop automatically after*).
 - **During:** type rough notes under *My notes*; the *Transcript* tab fills in a few seconds behind the talk.
   Dictation keeps working and goes first.
+- **Questions to ask:** give the meeting a *Goal* (under its title) and, every half minute or so of new talk, the
+  notes model reads the last minutes and proposes up to three questions: what was vague (*Understand*), what to
+  test (*Challenge*), what was left open (*Follow-up*). They show next to the transcript and in a small window
+  at the top right that stays above the call without taking the keyboard (*Float* brings it back if you hide it).
+  *Asked*, *Later* and *Delete* sort them; a question the talk answers says so and leaves, one nobody touches
+  expires after 5 minutes, and the ones kept for later end up under *Open questions* in the notes. Turn it off in
+  *Settings → Meetings → Suggest questions to ask*.
 - **After:** the last seconds are transcribed, speakers are labelled (click a name to rename someone), and the
   notes are written: about a minute for an hour of meeting on a recent GPU or Apple Silicon Mac, a few minutes for
   three hours. Notes are in the language the meeting was held in. *Write the notes again* picks up renamed speakers
@@ -177,8 +185,8 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   recorded). Without headphones, your microphone also hears the call; Wordfall drops those echoed lines.
 - **Models:** the notes model is downloaded in *Settings → Meetings* (Qwen3 4B, 2.5 GB, is the default; Gemma 3 12B
   and Qwen3 30B write better notes on machines with more memory). It runs in a helper process (`wordfall-llm`,
-  llama.cpp with Metal / Vulkan) that only lives while notes are written, so its memory is free the rest of the
-  time. Speakers are told apart with a 30 MB voice model (3D-Speaker CAM++), fetched with the first meeting.
+  llama.cpp with Metal / Vulkan) that only lives while notes or questions are written, so its memory is free the
+  rest of the time (with questions on, a second one with a small context runs while a meeting records). Speakers are told apart with a 30 MB voice model (3D-Speaker CAM++), fetched with the first meeting.
 - **Files:** each meeting is a folder under `meetings/` in the data folder (`meeting.json`, `mic.wav`,
   `system.wav`). Recordings are deleted after 2 weeks by default; notes and transcripts stay until you delete them.
 
@@ -201,7 +209,9 @@ npm run check                   # svelte-check / TypeScript
 (cd src-tauri && cargo test)    # Rust unit tests
 src-tauri/target/release/wordfall bench     # accuracy/latency regression check
 src-tauri/target/release/wordfall --meeting mic.wav --system system.wav [--notes "…"] [--no-summary]
-                                # a recorded meeting through the live pipeline, then notes
+                                [--questions] [--goal "…"]
+                                # a recorded meeting through the live pipeline (with the live
+                                # questions as they'd come), then notes
 src-tauri/target/release/wordfall --meeting-notes transcript.txt [--language de] [--notes "…"]
                                 # notes for a transcript as --meeting prints it (no audio)
 ```
