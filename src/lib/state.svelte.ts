@@ -8,6 +8,7 @@ import type {
   DictEntry,
   HistoryRecord,
   MeetingProgress,
+  MeetingMap,
   MeetingQuestions,
   MeetingSegment,
   MeetingSpeaker,
@@ -66,6 +67,8 @@ class AppState {
   meetingProgress = $state<Record<string, MeetingProgress>>({});
   /** Live questions per meeting id (loaded on demand, kept fresh by `meeting-questions`). */
   meetingQuestions = $state<Record<string, MeetingQuestions>>({});
+  /** System map per meeting id (loaded on demand, kept fresh by `meeting-map`). */
+  meetingMaps = $state<Record<string, MeetingMap>>({});
   /** The meeting open in the Meetings view (null = the list). */
   meetingId = $state<string | null>(null);
   #meetingListeners = new Set<(e: MeetingEvent) => void>();
@@ -142,6 +145,7 @@ class AppState {
     if (kind !== 'widget') {
       subs.push(
         on('meeting-questions', ({ id, ...q }) => (this.meetingQuestions[id] = q)),
+        on('meeting-map', ({ id, ...m }) => (this.meetingMaps[id] = m)),
         on('meeting-changed', ({ id }) => {
           delete this.meetingProgress[id];
           this.#meetingEvent({ kind: 'changed', id });
@@ -223,6 +227,34 @@ class AppState {
       this.meetingQuestions[id] = await api.meetingQuestions(id);
     } catch {
       // The meeting is gone; nothing to show.
+    }
+  }
+
+  async loadMap(id: string) {
+    try {
+      this.meetingMaps[id] = await api.meetingMap(id);
+    } catch {
+      // The meeting is gone; nothing to show.
+    }
+  }
+
+  /** Renames a box on the map (`name`) or deletes it (`null`); shown at once, put back if it fails. */
+  async editMapNode(id: string, node: number, name: string | null) {
+    const m = this.meetingMaps[id]?.map;
+    if (m && name === null) {
+      m.nodes = m.nodes.filter((n) => n.id !== node);
+      m.edges = m.edges.filter((e) => e.from !== node && e.to !== node);
+      m.open = m.open.filter((o) => o.node !== node);
+    } else if (m && name !== null) {
+      const n = m.nodes.find((x) => x.id === node);
+      if (n) n.name = name.trim();
+    }
+    try {
+      if (name === null) await api.deleteMapNode(id, node);
+      else await api.renameMapNode(id, node, name);
+    } catch (e) {
+      void this.loadMap(id);
+      this.error(name === null ? 'The box is still there' : 'The name was not saved', e);
     }
   }
 

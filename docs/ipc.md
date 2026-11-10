@@ -46,8 +46,10 @@ interface Settings {
   meetingSpeakers: boolean;      // tell speakers apart (30 MB CAM++ voice model, fetched on first meeting)
   summaryModel: string;          // id from list_summary_models, e.g. "qwen3-4b-instruct-2507"
   meetingAudioDays: number;      // meeting WAVs are deleted after this many days; 0 = kept (default 14)
+  meetingLiveHelp: boolean;      // live help while a meeting records; false turns questions and map off (no model runs; default true)
   meetingQuestions: boolean;     // propose questions to ask while a meeting records (needs the summary model; default true)
   meetingQuestionsWindow: boolean; // also show them in the floating `questions` window (default true)
+  meetingMap: boolean;           // build a system map while a meeting records (same model process as the questions; default true)
 }
 
 interface HistoryRecord {
@@ -100,7 +102,7 @@ interface MeetingSpeaker { id: number; name: string; renamed: boolean }
 interface Meeting {
   id: string; title: string; titleFromUser: boolean; startedAt: string; endedAt: string | null; durationMs: number;
   status: MeetingStatus; notes: string /* the user's own */; goal: string /* steers the questions */;
-  questions: MeetingQuestion[]; segments: MeetingSegment[]; speakers: MeetingSpeaker[];
+  questions: MeetingQuestion[]; systemMap: SystemMap; segments: MeetingSegment[]; speakers: MeetingSpeaker[];
   summary: string | null /* Markdown: "# Title", summary, ## decisions / action items / notes */;
   summaryModel: string | null; language: string | null; error: string | null;
   systemAudio: boolean; stoppedByLimit: boolean; hasAudio: boolean;
@@ -112,6 +114,14 @@ type QuestionState = 'live' | 'later' | 'asked' | 'answered' | 'expired' | 'dele
 type QuestionStatus = 'off' | 'no-model' | 'starting' | 'listening' | 'thinking' | 'failed';
 interface MeetingQuestion { number: number; text: string; kind: QuestionKind; state: QuestionState; atMs: number; changedMs: number }
 interface MeetingQuestions { questions: MeetingQuestion[]; status: QuestionStatus; goal: string }
+// System map: built while a meeting records, a run per question run (talk since the last run + the user's notes);
+// its open points steer the questions; added below the notes as "## System map" (see system_map.rs `section`).
+type MapNodeKind = 'ours' | 'customer' | 'outside' | 'person';
+interface MapNode { id: number; name: string; kind: MapNodeKind; known: string[]; atMs: number }
+interface MapEdge { from: number; to: number; what: string; how: string } // how: "API", "CSV", "mail", "by hand", … or "unknown"
+interface MapOpenPoint { number: number; node: number; text: string }
+interface SystemMap { nodes: MapNode[]; edges: MapEdge[]; open: MapOpenPoint[] }
+interface MeetingMap { map: SystemMap; status: QuestionStatus } // status of the live model shared with the questions
 interface MeetingItem { id: string; title: string; startedAt: string; durationMs: number; status: MeetingStatus; hasSummary: boolean; preview: string }
 interface ActiveMeeting { id: string; startedAt: string; stopsAt: string | null }
 interface SummaryModelInfo { id: string; displayName: string; sizeMb: number; downloaded: boolean; badge: string; description: string; recommended: boolean }
@@ -166,6 +176,9 @@ interface SummaryModelInfo { id: string; displayName: string; sizeMb: number; do
 | `stop_meeting` | – | – (the rest is transcribed, speakers labelled, then notes written; follow `meeting-progress`) |
 | `update_meeting` | `{ id, patch: { title?: string, notes?: string, goal?: string } }` | – (an empty title lets the notes name it) |
 | `meeting_questions` | `{ id }` | `MeetingQuestions` (updates via `meeting-questions`) |
+| `meeting_map` | `{ id }` | `MeetingMap` (updates via `meeting-map`) |
+| `rename_map_node` | `{ id, node: number, name }` | – (fails if another box has that name) |
+| `delete_map_node` | `{ id, node: number }` | – (its flows and open points go too; the model won't add it again) |
 | `act_on_question` | `{ id, number, act: 'later' \| 'asked' \| 'deleted' }` | – (only on 'live' or 'later' questions) |
 | `show_questions_window` | `{ show: boolean }` | – (shows it only while a meeting records) |
 | `resize_questions_window` | `{ width, height }` (logical px of the content) | – (top-left stays put) |
@@ -198,5 +211,6 @@ interface SummaryModelInfo { id: string; displayName: string; sizeMb: number; do
 | `meeting-progress` | `{ id, phase: 'transcribing' \| 'speakers' \| 'loading' \| 'reading' \| 'writing', fraction: number \| null, text: string \| null }` (`text` = notes so far while writing) |
 | `meeting-changed` | `{ id }` (status, transcript or notes changed: reload it) |
 | `meeting-questions` | `{ id } & MeetingQuestions` (questions, status or goal changed) |
+| `meeting-map` | `{ id } & MeetingMap` (the system map or the live model's status changed) |
 | `meetings-changed` | – |
 | `summary-models-changed` | – |

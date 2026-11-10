@@ -6,6 +6,7 @@
   import Page from '../../lib/components/Page.svelte';
   import QuestionStack from '../../lib/components/QuestionStack.svelte';
   import Segmented from '../../lib/components/Segmented.svelte';
+  import SystemMap from '../../lib/components/SystemMap.svelte';
   import { api } from '../../lib/api';
   import { clock, dayLabel, duration, formatTime } from '../../lib/format';
   import { notesAsText, renderNotes } from '../../lib/markdown';
@@ -14,7 +15,7 @@
 
   let { id }: { id: string } = $props();
 
-  type Tab = 'summary' | 'notes' | 'transcript';
+  type Tab = 'summary' | 'notes' | 'transcript' | 'map';
 
   let meeting = $state<Meeting | null>(null);
   let tab = $state<Tab>('notes');
@@ -31,7 +32,9 @@
 
   const recording = $derived(meeting?.status === 'recording');
   const questions = $derived(app.meetingQuestions[id] ?? null);
-  const showQuestions = $derived(recording && (app.settings?.meetingQuestions ?? false));
+  const showQuestions = $derived(recording && !!app.settings?.meetingLiveHelp && !!app.settings?.meetingQuestions);
+  const liveMap = $derived(app.meetingMaps[id] ?? null);
+  const showMap = $derived(recording && !!app.settings?.meetingLiveHelp && !!app.settings?.meetingMap);
   const busy = $derived(meeting?.status === 'processing' || meeting?.status === 'summarizing');
   const progress = $derived(app.meetingProgress[id] ?? null);
   const live = $derived(app.activeMeeting?.id === id ? app.activeMeeting : null);
@@ -42,6 +45,7 @@
     if (!recording) t.push({ value: 'summary', label: 'Notes' });
     t.push({ value: 'notes', label: 'My notes' });
     t.push({ value: 'transcript', label: 'Transcript' });
+    if (!recording && meeting?.systemMap?.nodes.length) t.push({ value: 'map', label: 'System map' });
     return t;
   });
 
@@ -72,7 +76,10 @@
       if (!notesDirty) notesDraft = m.notes;
       if (document.activeElement?.id !== 'meeting-title') titleDraft = m.title;
       if (document.activeElement?.id !== 'meeting-goal') goalDraft = m.goal;
-      if (m.status === 'recording') void app.loadQuestions(id);
+      if (m.status === 'recording') {
+        void app.loadQuestions(id);
+        void app.loadMap(id);
+      }
       if (initial) tab = m.status === 'recording' ? 'notes' : m.summary || m.status !== 'done' ? 'summary' : 'transcript';
       if (tab === 'summary' && m.status === 'recording') tab = 'notes';
     } catch (e) {
@@ -231,7 +238,7 @@
   });
 </script>
 
-<Page title={meeting?.title || (recording ? 'Meeting in progress' : 'Untitled meeting')}>
+<Page title={meeting?.title || (recording ? 'Meeting in progress' : 'Untitled meeting')} wide={showQuestions || showMap}>
   {#snippet lead()}
     <button class="icon-btn back" aria-label="Back to all meetings" title="All meetings" onclick={() => (app.meetingId = null)}>
       <ChevronLeftIcon size={18} strokeWidth={1.5} />
@@ -340,6 +347,15 @@
 
     <div class={['columns', { 'with-questions': showQuestions }]}>
       <div class="main">
+        {#if showMap}
+          <section class="map-panel" aria-labelledby="map-title">
+            <div class="panel-head">
+              <h2 id="map-title">System map</h2>
+              {#if liveMap?.status === 'thinking'}<span class="sub" role="status">Reading the talk…</span>{/if}
+            </div>
+            <SystemMap meetingId={id} map={liveMap?.map ?? meeting.systemMap} status={liveMap?.status ?? 'listening'} editable />
+          </section>
+        {/if}
         <div class="tabs">
           <Segmented label="Show" options={tabs} value={tab} onchange={(v) => (tab = v)} />
         </div>
@@ -372,6 +388,8 @@
               ? 'Jot down what matters to you, in a few words. When the meeting ends, the notes are built around these points and filled in from the transcript.'
               : 'Your own notes. Write the notes again to work in changes.'}
           ></textarea>
+        {:else if tab === 'map'}
+          <SystemMap meetingId={id} map={meeting.systemMap} />
         {:else}
           <div class="transcript" bind:this={scroller} {@attach onPageScroll}>
             {#if turns.length === 0}
@@ -586,6 +604,19 @@
     height: 28px;
     margin-bottom: 8px;
   }
+  .map-panel {
+    margin-top: 20px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 28px;
+    margin-bottom: 8px;
+  }
+  .panel-head h2,
   .questions-head h2 {
     font-size: 13px;
     font-weight: 700;

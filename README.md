@@ -25,7 +25,8 @@ Local speech recognition for macOS and Windows. Nothing leaves your computer.</p
   computer's audio, so Zoom, Teams and Meet work with headphones), transcribes as it goes, tells speakers apart,
   and writes notes with decisions and action items when you stop, with a language model that runs on your
   computer. Jot down your own notes during the meeting and the notes are built around them. While you talk, it
-  proposes questions to ask, steered by the meeting's goal, in a small window that stays above the call.
+  proposes questions to ask, steered by the meeting's goal, in a small window that stays above the call, and draws a
+  rough map of the systems and people that come up, how data flows between them and what is still unknown.
 - **No hallucinated "Thank you."** Voice activity detection drops silence, hum and typing before decoding.
 - **Measured, not guessed.** A built-in benchmark harness scores engines and settings on accuracy and
   latency (see [`bench/`](bench/README.md) and [results](docs/benchmark-results.md)).
@@ -176,6 +177,14 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   *Asked*, *Later* and *Delete* sort them; a question the talk answers says so and leaves, one nobody touches
   expires after 5 minutes, and the ones kept for later end up under *Open questions* in the notes. Turn it off in
   *Settings → Meetings → Suggest questions to ask*.
+- **System map:** at the same pace, the same model updates a map of the systems (yours, the customer's, outside
+  services), the people and roles, what flows between them and how (API, CSV, mail, by hand), and what is still
+  unknown. It reads only the talk since its last update. Steer it from *My notes* ("focus on the ERP export"); what
+  the notes want found out becomes open points, and open points steer the questions. Click a box to see what is
+  known; rename it, or delete a wrong one. The map is added below the notes as a `## System map` section in a fixed
+  shape that other programs can read. Every change cites the transcript line it comes from and is checked against
+  it, so the map doesn't pick up connections nobody mentioned. Turn it off in *Settings → Meetings → Draw a system
+  map*, or turn off both questions and map with *Live help while you talk*.
 - **After:** the last seconds are transcribed, speakers are labelled (click a name to rename someone), and the
   notes are written: about a minute for an hour of meeting on a recent GPU or Apple Silicon Mac, a few minutes for
   three hours. Notes are in the language the meeting was held in. *Write the notes again* picks up renamed speakers
@@ -209,9 +218,14 @@ npm run check                   # svelte-check / TypeScript
 (cd src-tauri && cargo test)    # Rust unit tests
 src-tauri/target/release/wordfall bench     # accuracy/latency regression check
 src-tauri/target/release/wordfall --meeting mic.wav --system system.wav [--notes "…"] [--no-summary]
-                                [--questions] [--goal "…"]
+                                [--questions] [--goal "…"] [--map] [--note-at "90:text"] [--map-json f]
+                                [--llm <id>] [--save-transcript f]
                                 # a recorded meeting through the live pipeline (with the live
-                                # questions as they'd come), then notes
+                                # questions and system map as they'd come, notes typed at a
+                                # given second, the cost of each run), then notes
+src-tauri/target/release/wordfall --transcript saved.json --map [--questions] [--llm <id>] …
+                                # the live model on a transcript saved with --save-transcript,
+                                # at meeting pace, without speech recognition (for comparing)
 src-tauri/target/release/wordfall --meeting-notes transcript.txt [--language de] [--notes "…"]
                                 # notes for a transcript as --meeting prints it (no audio)
 ```
@@ -237,7 +251,8 @@ Layout:
   - `postprocess.rs`: filler removal (language-aware), dictionary
   - `lists.rs`: spoken enumerations → numbered / bulleted lists
   - `session.rs`: record → transcribe → paste pipeline
-  - `meetings/`: meeting recording, live transcription, echo removal, speaker labels, storage, notes
+  - `meetings/`: meeting recording, live transcription, echo removal, speaker labels, storage, notes, live
+    questions (`questions.rs`) and the system map (`system_map.rs`)
   - `speakers.rs`, `fbank.rs`: voice embeddings (CAM++ via tract) and clustering
   - `llm.rs`: notes-model catalog, prompts, and the client for `src/bin/wordfall-llm.rs` (llama.cpp in its own
     process: it brings a ggml that clashes with whisper.cpp's)

@@ -641,6 +641,24 @@ pub fn act_on_question(app: AppHandle, id: String, number: u32, act: meetings::Q
     meetings::act_on_question(&app, &id, number, act).map_err(err)
 }
 
+/// The system map of a meeting and what the live model is doing (updates: `meeting-map`).
+#[tauri::command]
+pub fn meeting_map(app: AppHandle, id: String) -> CmdResult<meetings::LiveMap> {
+    meetings::map_of(&app, &id).map_err(err)
+}
+
+/// Renames a box on the system map.
+#[tauri::command]
+pub fn rename_map_node(app: AppHandle, id: String, node: u32, name: String) -> CmdResult<()> {
+    meetings::edit_map_node(&app, &id, node, Some(&name)).map_err(err)
+}
+
+/// Deletes a wrong box from the system map (the model won't add it again).
+#[tauri::command]
+pub fn delete_map_node(app: AppHandle, id: String, node: u32) -> CmdResult<()> {
+    meetings::edit_map_node(&app, &id, node, None).map_err(err)
+}
+
 /// Shows or hides the floating Questions window (only while a meeting is recorded).
 #[tauri::command]
 pub fn show_questions_window(app: AppHandle, show: bool) {

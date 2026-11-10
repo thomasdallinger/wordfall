@@ -107,6 +107,18 @@ pub struct Worker {
     events: mpsc::Receiver<Value>,
     pub ctx: u32,
     next_id: u64,
+    /// What the last chat cost.
+    pub last: Option<ChatStats>,
+}
+
+/// Tokens read and written by one chat, and how long it took.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChatStats {
+    pub prompt_tokens: u64,
+    /// Of those, already held by the slot's kept context (not read again).
+    pub kept_tokens: u64,
+    pub tokens: u64,
+    pub ms: u64,
 }
 
 pub enum Event<'a> {
@@ -143,7 +155,7 @@ impl Worker {
                 }
             }
         })?;
-        let mut w = Self { child, stdin, events, ctx: 0, next_id: 1 };
+        let mut w = Self { child, stdin, events, ctx: 0, next_id: 1, last: None };
         w.send(json!({ "op": "load", "model": model.display().to_string(), "ctx": ctx }))?;
         let ready = w.next_event(Duration::from_secs(300))?;
         match ready["event"].as_str() {
@@ -197,6 +209,23 @@ impl Worker {
         user: &str,
         max_tokens: u32,
         grammar: Option<&str>,
+        on_event: impl FnMut(Event),
+    ) -> anyhow::Result<String> {
+        self.chat_at(system, user, max_tokens, grammar, None, None, on_event)
+    }
+
+    /// Like `chat_shaped`, at a sampling `temperature` (the helper's default when `None`; 0 =
+    /// greedy). With a `slot`, the helper keeps the context for the next request of that slot and
+    /// reads only where its prompt differs from this one's (keep what doesn't change at the start).
+    #[allow(clippy::too_many_arguments)]
+    pub fn chat_at(
+        &mut self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        grammar: Option<&str>,
+        temperature: Option<f32>,
+        slot: Option<&str>,
         mut on_event: impl FnMut(Event),
     ) -> anyhow::Result<String> {
         let id = self.next_id;
@@ -207,6 +236,12 @@ impl Worker {
         });
         if let Some(g) = grammar {
             request["grammar"] = json!(g);
+        }
+        if let Some(t) = temperature {
+            request["temperature"] = json!(t);
+        }
+        if let Some(s) = slot {
+            request["slot"] = json!(s);
         }
         self.send(request)?;
         loop {
@@ -220,6 +255,12 @@ impl Worker {
                 }
                 Some("token") => on_event(Event::Token(ev["text"].as_str().unwrap_or(""))),
                 Some("done") => {
+                    self.last = Some(ChatStats {
+                        prompt_tokens: ev["promptTokens"].as_u64().unwrap_or(0),
+                        kept_tokens: ev["keptTokens"].as_u64().unwrap_or(0),
+                        tokens: ev["tokens"].as_u64().unwrap_or(0),
+                        ms: ev["ms"].as_u64().unwrap_or(0),
+                    });
                     log::info!(
                         "summary step: {} prompt tokens, {} written, {} ms",
                         ev["promptTokens"], ev["tokens"], ev["ms"]

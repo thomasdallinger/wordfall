@@ -27,6 +27,7 @@ import type {
   Stats,
   Suggestion,
   SummaryModelInfo,
+  SystemMap,
 } from './types';
 
 type Handler = (payload: never) => void;
@@ -84,8 +85,10 @@ const settings: Settings = {
   meetingSpeakers: true,
   summaryModel: 'qwen3-4b-instruct-2507',
   meetingAudioDays: 14,
+  meetingLiveHelp: true,
   meetingQuestions: true,
   meetingQuestionsWindow: true,
+  meetingMap: true,
 };
 
 const missing = params.get('perm') === 'missing';
@@ -508,15 +511,54 @@ const sampleSegments: MeetingSegment[] = [
   startMs: startMs as number, endMs: (startMs as number) + 6000, channel: channel as 'mic' | 'system', speaker: speaker as number, text: text as string,
 }));
 
+/** The sample meeting's system map as it grows, one step per run of the model. */
+const MAP_STEPS: ((m: SystemMap) => void)[] = [
+  (m) => {
+    m.nodes.push({ id: 1, name: 'Billing page', kind: 'ours', known: ['New page, launch planned for November 20'], atMs: 8_000 });
+    m.nodes.push({ id: 2, name: 'Legal', kind: 'person', known: ['Reviews the pricing text, feedback by Thursday'], atMs: 16_000 });
+    m.edges.push({ from: 2, to: 1, what: 'approved pricing text', how: 'unknown' });
+    m.open.push({ number: 1, node: 2, text: 'Who signs off if the feedback is late?' });
+  },
+  (m) => {
+    m.nodes.push({ id: 3, name: 'Payment provider', kind: 'outside', known: ['Changes its API on the 15th'], atMs: 40_000 });
+    m.nodes.push({ id: 4, name: 'Old billing system', kind: 'customer', known: ['Holds ten years of invoices'], atMs: 42_000 });
+    m.edges.push({ from: 1, to: 3, what: 'payments', how: 'API' });
+    m.edges.push({ from: 4, to: 1, what: 'old invoices', how: 'migration script' });
+    m.open.push({ number: 2, node: 4, text: 'Which format do the old invoices come out in?' });
+  },
+  (m) => {
+    m.nodes.push({ id: 5, name: 'Anna', kind: 'person', known: ['Writes the migration script this week'], atMs: 60_000 });
+    m.nodes.push({ id: 6, name: 'Invoice archive', kind: 'customer', known: ['Read-only, keeps invoices downloadable'], atMs: 64_000 });
+    m.edges.push({ from: 4, to: 6, what: 'invoices older than a year', how: 'CSV' });
+    m.edges.push({ from: 1, to: 6, what: 'download links', how: 'unknown' });
+    m.open.push({ number: 3, node: 3, text: 'Is the sandbox on the new API version yet?' });
+  },
+  (m) => {
+    m.nodes.push({ id: 7, name: 'Support team', kind: 'person', known: ['Gets a short guide on Friday'], atMs: 90_000 });
+    m.edges.push({ from: 1, to: 7, what: 'failed payments', how: 'mail' });
+  },
+];
+
+function sampleMap(steps: number): SystemMap {
+  const m: SystemMap = { nodes: [], edges: [], open: [] };
+  for (const step of MAP_STEPS.slice(0, steps)) step(m);
+  return m;
+}
+
 const meetings: Meeting[] = params.get('empty') === '1' ? [] : [{
   id: 'm-sample', title: 'Billing page launch plan', titleFromUser: false,
   startedAt: new Date(Date.now() - 26 * 3600_000).toISOString(), endedAt: new Date(Date.now() - 25 * 3600_000).toISOString(),
   durationMs: 34 * 60_000, status: 'done', notes: 'launch date?\nlegal — pricing text', goal: '', questions: [], segments: sampleSegments,
+  systemMap: sampleMap(MAP_STEPS.length),
   speakers: [{ id: 0, name: 'Me', renamed: false }, { id: 1, name: 'Anna', renamed: true }, { id: 2, name: 'Speaker 2', renamed: false }],
   summary: SAMPLE_SUMMARY, summaryModel: 'qwen3-4b-instruct-2507', language: 'en', error: null,
   systemAudio: true, stoppedByLimit: false, hasAudio: true,
 }];
 let activeMeeting: Snapshot['meeting'] = null;
+
+function emitMap(m: Meeting) {
+  emit('meeting-map', { id: m.id, map: clone(m.systemMap), status: questionStatus });
+}
 let meetingTimer: ReturnType<typeof setInterval> | null = null;
 let questionStatus: QuestionStatus = 'off';
 
@@ -551,13 +593,15 @@ function startMeeting(): string {
   const m: Meeting = {
     id: `m-${Date.now()}`, title: '', titleFromUser: false, startedAt: new Date().toISOString(), endedAt: null, durationMs: 0,
     status: 'recording', notes: '', goal: '', questions: [], segments: [], speakers: [{ id: 0, name: 'Me', renamed: false }], summary: null,
+    systemMap: { nodes: [], edges: [], open: [] },
     summaryModel: null, language: 'en', error: null, systemAudio: true, stoppedByLimit: false, hasAudio: true,
   };
   meetings.unshift(m);
   activeMeeting = { id: m.id, startedAt: m.startedAt, stopsAt: new Date(Date.now() + settings.meetingMaxMinutes * 60_000).toISOString() };
   emit('meeting-state', { active: activeMeeting });
   emit('meetings-changed', null);
-  questionStatus = settings.meetingQuestions ? 'listening' : 'off';
+  questionStatus = settings.meetingLiveHelp && (settings.meetingQuestions || settings.meetingMap) ? 'listening' : 'off';
+  let mapSteps = 0;
   if (params.get('meeting') === 'live' && settings.meetingQuestions) {
     // A meeting already under way: some talk and questions to look at.
     m.segments = sampleSegments.map((x) => ({ ...x }));
@@ -567,18 +611,26 @@ function startMeeting(): string {
     proposeQuestion(m);
     proposeQuestion(m);
     m.questions[2].state = 'later';
+    if (settings.meetingMap) {
+      mapSteps = MAP_STEPS.length - 1;
+      m.systemMap = sampleMap(mapSteps);
+    }
   }
   let i = 0;
   meetingTimer = setInterval(() => {
     emit('meeting-levels', { mic: Math.random() * 0.7, system: Math.random() * 0.5 });
-    if (settings.meetingQuestions && i % 50 === 20) {
+    const live = settings.meetingLiveHelp && (settings.meetingQuestions || settings.meetingMap);
+    if (live && i % 50 === 20) {
       questionStatus = 'thinking';
       emitQuestions(m);
+      emitMap(m);
     }
-    if (settings.meetingQuestions && i % 50 === 35) {
+    if (live && i % 50 === 35) {
       questionStatus = 'listening';
-      proposeQuestion(m);
+      if (settings.meetingMap && mapSteps < MAP_STEPS.length) MAP_STEPS[mapSteps++](m.systemMap);
+      if (settings.meetingQuestions) proposeQuestion(m);
       emitQuestions(m);
+      emitMap(m);
     }
     if (++i % 25 === 0) {
       const src = sampleSegments[(i / 25 - 1) % sampleSegments.length];
@@ -598,6 +650,7 @@ async function stopMeeting() {
   activeMeeting = null;
   questionStatus = 'off';
   emitQuestions(m);
+  emitMap(m);
   m.durationMs = Date.now() - Date.parse(m.startedAt);
   m.status = 'processing';
   emit('meeting-state', { active: null });
@@ -788,6 +841,30 @@ export async function mockInvoke(cmd: string, a: Args): Promise<unknown> {
       if (!m) throw new Error('That meeting no longer exists.');
       return { questions: clone(m.questions), status: m.status === 'recording' ? questionStatus : 'off', goal: m.goal };
     }
+    case 'meeting_map': {
+      const m = meetings.find((x) => x.id === a.id);
+      if (!m) throw new Error('That meeting no longer exists.');
+      return { map: clone(m.systemMap), status: m.status === 'recording' ? questionStatus : 'off' };
+    }
+    case 'rename_map_node': {
+      const m = meetings.find((x) => x.id === a.id)!;
+      const n = m.systemMap.nodes.find((x) => x.id === a.node);
+      if (!n) throw new Error('That box is gone.');
+      if (!String(a.name).trim()) throw new Error("A name can't be empty.");
+      n.name = String(a.name).trim();
+      emitMap(m);
+      return;
+    }
+    case 'delete_map_node': {
+      const m = meetings.find((x) => x.id === a.id)!;
+      const map = m.systemMap;
+      if (!map.nodes.some((x) => x.id === a.node)) throw new Error('That box is gone.');
+      map.nodes = map.nodes.filter((x) => x.id !== a.node);
+      map.edges = map.edges.filter((e) => e.from !== a.node && e.to !== a.node);
+      map.open = map.open.filter((o) => o.node !== a.node);
+      emitMap(m);
+      return;
+    }
     case 'act_on_question': {
       const m = meetings.find((x) => x.id === a.id)!;
       const q = m.questions.find((x) => x.number === a.number);
@@ -900,6 +977,9 @@ if (typeof window !== 'undefined') {
     permissions,
     labClips,
     clearLatestReport: () => (latestReport = null),
+    get activeMeeting() {
+      return activeMeeting;
+    },
     get widgetSize() {
       return widgetSize;
     },

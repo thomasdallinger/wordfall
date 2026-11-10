@@ -17,6 +17,7 @@ import type {
   LabStopResult,
   Meeting,
   MeetingItem,
+  MeetingMap,
   MeetingQuestions,
   ModelInfo,
   QuestionAct,
@@ -146,6 +147,11 @@ export const api = {
   /** Live questions and what the model is doing; updates arrive as `meeting-questions`. */
   meetingQuestions: (id: string) => call<MeetingQuestions>('meeting_questions', { id }),
   actOnQuestion: (id: string, number: number, act: QuestionAct) => call<void>('act_on_question', { id, number, act }),
+  /** The system map and what the model is doing; updates arrive as `meeting-map`. */
+  meetingMap: (id: string) => call<MeetingMap>('meeting_map', { id }),
+  renameMapNode: (id: string, node: number, name: string) => call<void>('rename_map_node', { id, node, name }),
+  /** Removes a wrong box; the model won't add it again. */
+  deleteMapNode: (id: string, node: number) => call<void>('delete_map_node', { id, node }),
   /** Shows or hides the floating Questions window (only while a meeting records). */
   showQuestionsWindow: (show: boolean) => call<void>('show_questions_window', { show }),
   /** Fit the Questions window to its content (logical px); its top-left corner stays put. */

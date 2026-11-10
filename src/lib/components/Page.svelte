@@ -12,12 +12,15 @@
     actions,
     children,
     scroller = $bindable(),
+    wide = false,
   }: {
     title: string;
     lead?: Snippet;
     actions?: Snippet;
     children: Snippet;
     scroller?: HTMLElement;
+    /** A wider column, for side-by-side panels (a meeting being recorded). */
+    wide?: boolean;
   } = $props();
 
   let scrolled = $state(false);
@@ -25,7 +28,7 @@
 
 <div class="page" class:scrolled bind:this={scroller} onscroll={(e) => (scrolled = e.currentTarget.scrollTop > 0)}>
   <Toolbar {title} {lead} {actions} />
-  <div class="content">
+  <div class={['content', { wide }]}>
     {@render children()}
   </div>
 </div>
@@ -43,5 +46,8 @@
     max-width: 760px;
     margin: 0 auto;
     padding: 8px 40px 64px;
+  }
+  .content.wide {
+    max-width: 1160px;
   }
 </style>

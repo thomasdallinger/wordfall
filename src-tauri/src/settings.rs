@@ -71,10 +71,16 @@ pub struct Settings {
     pub summary_model: String,
     /// Meeting recordings are deleted after this many days (0 = kept).
     pub meeting_audio_days: u32,
+    /// Live help while a meeting is recorded (questions and system map). Off turns both off,
+    /// whatever their own switches say, and no model process runs while recording.
+    pub meeting_live_help: bool,
     /// Propose questions to ask while a meeting is recorded (needs the summary model).
     pub meeting_questions: bool,
     /// Show them in a floating window above other apps, not only in the meeting view.
     pub meeting_questions_window: bool,
+    /// Build a map of the systems and people that come up while a meeting is recorded (needs the
+    /// summary model; it shares the questions' model process).
+    pub meeting_map: bool,
     /// Where the user dragged the questions window: offset from its top-right spot (logical px).
     pub questions_window_position: Option<(i32, i32)>,
 }
@@ -113,14 +119,26 @@ impl Default for Settings {
             meeting_speakers: true,
             summary_model: "qwen3-4b-instruct-2507".into(),
             meeting_audio_days: 14,
+            meeting_live_help: true,
             meeting_questions: true,
             meeting_questions_window: true,
+            meeting_map: true,
             questions_window_position: None,
         }
     }
 }
 
 impl Settings {
+    /// Questions are proposed while a meeting records.
+    pub fn live_questions(&self) -> bool {
+        self.meeting_live_help && self.meeting_questions
+    }
+
+    /// The system map is built while a meeting records.
+    pub fn live_map(&self) -> bool {
+        self.meeting_live_help && self.meeting_map
+    }
+
     pub fn model_dirs(&self, data_dir: &Path) -> crate::transcribe::ModelDirs {
         crate::transcribe::ModelDirs {
             own: own_models_dir(data_dir),

@@ -47,10 +47,14 @@ export interface Settings {
   summaryModel: string;
   /** Meeting recordings are deleted after this many days (0 = kept). */
   meetingAudioDays: number;
+  /** Live help while a meeting records (questions and system map); off turns both off. */
+  meetingLiveHelp: boolean;
   /** Propose questions to ask while a meeting is recorded (needs the summary model). */
   meetingQuestions: boolean;
   /** Also show them in a floating window above other apps. */
   meetingQuestionsWindow: boolean;
+  /** Build a map of the systems and people that come up while a meeting is recorded. */
+  meetingMap: boolean;
 }
 
 export type MeetingStatus = 'recording' | 'processing' | 'summarizing' | 'done';
@@ -86,6 +90,8 @@ export interface Meeting {
   goal: string;
   /** Questions proposed while it was recorded. */
   questions: MeetingQuestion[];
+  /** Systems, people and how they connect, built while it was recorded. */
+  systemMap: SystemMap;
   segments: MeetingSegment[];
   speakers: MeetingSpeaker[];
   /** Markdown notes written by the language model. */
@@ -140,6 +146,46 @@ export interface MeetingQuestions {
   status: QuestionStatus;
   /** The meeting's goal, which the questions steer towards. */
   goal: string;
+}
+
+/** What a box on the system map is. */
+export type MapNodeKind = 'ours' | 'customer' | 'outside' | 'person';
+
+export interface MapNode {
+  id: number;
+  name: string;
+  kind: MapNodeKind;
+  /** Facts said in the meeting. */
+  known: string[];
+  /** Meeting time it was added at. */
+  atMs: number;
+}
+
+/** Something flows from one box to another: what, and how (API, CSV, mail, by hand, …). */
+export interface MapEdge {
+  from: number;
+  to: number;
+  what: string;
+  how: string;
+}
+
+/** Something about a box that is still unknown. */
+export interface MapOpenPoint {
+  number: number;
+  node: number;
+  text: string;
+}
+
+export interface SystemMap {
+  nodes: MapNode[];
+  edges: MapEdge[];
+  open: MapOpenPoint[];
+}
+
+/** The map and what the live model (shared with the questions) is doing. */
+export interface MeetingMap {
+  map: SystemMap;
+  status: QuestionStatus;
 }
 
 export type MeetingPhase = 'transcribing' | 'speakers' | 'loading' | 'reading' | 'writing';
@@ -329,6 +375,7 @@ export interface EventMap {
   'meeting-changed': { id: string };
   'meeting-progress': MeetingProgress;
   'meeting-questions': { id: string } & MeetingQuestions;
+  'meeting-map': { id: string } & MeetingMap;
   'meeting-levels': { mic?: number; system?: number };
   'meetings-changed': null;
   'summary-models-changed': null;

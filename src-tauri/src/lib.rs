@@ -344,6 +344,13 @@ pub fn run() {
         }
         return;
     }
+    if args.iter().any(|a| a == "--transcript") {
+        if let Err(e) = meetings::cli_transcript(&args) {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--meeting") {
         if let Err(e) = meetings::cli(&args) {
             eprintln!("error: {e:#}");
@@ -511,6 +518,9 @@ pub fn run() {
             commands::update_meeting,
             commands::meeting_questions,
             commands::act_on_question,
+            commands::meeting_map,
+            commands::rename_map_node,
+            commands::delete_map_node,
             commands::show_questions_window,
             commands::resize_questions_window,
             commands::rename_speaker,

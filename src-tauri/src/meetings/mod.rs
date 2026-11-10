@@ -7,6 +7,7 @@
 
 mod pipeline;
 mod questions;
+mod system_map;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ use crate::{
 };
 pub use pipeline::ME;
 pub use questions::{Act as QuestionAct, Question};
+pub use system_map::SystemMap;
 use pipeline::{ChannelProcessor, Ctx, EchoFilter, LiveSpeakers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -95,6 +97,8 @@ pub struct Meeting {
     pub goal: String,
     /// Questions proposed while it was recorded (see `questions.rs`).
     pub questions: Vec<Question>,
+    /// Systems, people and how they connect, built while it was recorded (see `system_map.rs`).
+    pub system_map: SystemMap,
     pub segments: Vec<Segment>,
     pub speakers: Vec<Speaker>,
     /// Markdown notes written by the language model.
@@ -146,11 +150,11 @@ pub struct Meetings {
     live: Mutex<Option<Live>>,
     /// One summary at a time: the model needs several GB.
     summarizing: Mutex<()>,
-    /// What the live questions of the meeting being recorded are doing (see `QuestionStatus`).
+    /// What the live model (questions and system map) of the meeting being recorded is doing.
     question_status: Mutex<Option<(String, QuestionStatus)>>,
 }
 
-/// What the live questions are doing, for the UI.
+/// What the live model is doing (it writes both the questions and the system map), for the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum QuestionStatus {
@@ -164,7 +168,7 @@ pub enum QuestionStatus {
     Listening,
     /// Reading the latest talk.
     Thinking,
-    /// The model failed; questions stopped for this meeting.
+    /// The model failed; questions and map stopped for this meeting.
     Failed,
 }
 
@@ -419,23 +423,31 @@ pub fn start(app: &AppHandle) -> anyhow::Result<String> {
             }
         });
     }
-    if settings.meeting_questions {
-        let (app3, shared3, stop3, settings3) = (app.clone(), shared.clone(), stop.clone(), settings.clone());
-        thread::Builder::new().name("wordfall-questions".into()).spawn(move || {
-            ask_questions(&app3, &shared3, &stop3, &settings3);
+    // Set once the last seconds are transcribed after a stop.
+    let talk_done = Arc::new(AtomicBool::new(false));
+    let assistant = if settings.live_questions() || settings.live_map() {
+        let (app3, shared3, stop3, settings3, done3) = (app.clone(), shared.clone(), stop.clone(), settings.clone(), talk_done.clone());
+        let handle = thread::Builder::new().name("wordfall-questions".into()).spawn(move || {
+            assist(&app3, &shared3, &stop3, &done3, &settings3);
         })?;
-        if settings.meeting_questions_window {
+        if settings.live_questions() && settings.meeting_questions_window {
             crate::questions_window::open(app);
         }
+        Some(handle)
     } else {
         set_question_status(app, &id, QuestionStatus::Off);
-    }
+        None
+    };
     let app2 = app.clone();
     thread::Builder::new().name("wordfall-meeting".into()).spawn(move || {
         let busy = crate::platform::busy("Meeting");
-        record(&app2, &shared, mic, system, &stop, limit, &settings);
+        record(&app2, &shared, mic, system, &stop, &talk_done, limit, &settings);
         drop(busy);
         crate::questions_window::close(&app2);
+        // Its last run lands in the notes, and its model is gone before the notes model loads.
+        if let Some(h) = assistant {
+            let _ = h.join();
+        }
         finish(&app2, &shared, &settings);
     })?;
     emit_state(app);
@@ -449,9 +461,9 @@ pub fn stop(app: &AppHandle) {
     }
 }
 
-// ---------- live questions ----------
+// ---------- live questions and system map ----------
 
-/// A run of the questions model waits for this much new talk…
+/// A run of the live model waits for this much new talk (or a change to the notes)…
 const QUESTION_WORDS: usize = 30;
 /// …and this much meeting time since the last run.
 const QUESTION_GAP_MS: u64 = 30_000;
@@ -465,6 +477,7 @@ fn word_count(segments: &[Segment]) -> usize {
 fn set_question_status(app: &AppHandle, id: &str, status: QuestionStatus) {
     *app.state::<Core>().meetings.question_status.lock() = Some((id.to_string(), status));
     emit_questions(app, id);
+    emit_map(app, id);
 }
 
 /// The live questions of a meeting, what the model is doing, and the goal they steer towards.
@@ -476,13 +489,54 @@ pub struct LiveQuestions {
     pub goal: String,
 }
 
+fn live_status(app: &AppHandle, m: &Meeting) -> QuestionStatus {
+    match app.state::<Core>().meetings.question_status.lock().as_ref() {
+        Some((sid, s)) if *sid == m.id && m.status == Status::Recording => *s,
+        _ => QuestionStatus::Off,
+    }
+}
+
 pub fn questions_of(app: &AppHandle, id: &str) -> anyhow::Result<LiveQuestions> {
     let m = get(app, id)?;
-    let status = match app.state::<Core>().meetings.question_status.lock().as_ref() {
-        Some((sid, s)) if sid == id && m.status == Status::Recording => *s,
-        _ => QuestionStatus::Off,
-    };
+    let status = live_status(app, &m);
     Ok(LiveQuestions { questions: m.questions, status, goal: m.goal })
+}
+
+/// The system map of a meeting and what the live model is doing.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveMap {
+    pub map: SystemMap,
+    pub status: QuestionStatus,
+}
+
+pub fn map_of(app: &AppHandle, id: &str) -> anyhow::Result<LiveMap> {
+    let m = get(app, id)?;
+    let status = live_status(app, &m);
+    Ok(LiveMap { map: m.system_map, status })
+}
+
+/// Tells every window the system map (or the live model's status) changed: `meeting-map`.
+pub fn emit_map(app: &AppHandle, id: &str) {
+    if let Ok(map) = map_of(app, id) {
+        let mut payload = json!(map);
+        payload["id"] = json!(id);
+        let _ = app.emit("meeting-map", payload);
+    }
+}
+
+/// The user renames a box on the map (`name`) or deletes a wrong one.
+pub fn edit_map_node(app: &AppHandle, id: &str, node: u32, name: Option<&str>) -> anyhow::Result<()> {
+    let mut result = Ok(());
+    edit(app, id, |m| {
+        result = match name {
+            Some(name) => m.system_map.rename(node, name),
+            None => m.system_map.delete(node),
+        }
+    })?;
+    result?;
+    emit_map(app, id);
+    Ok(())
 }
 
 /// Tells every window the questions (or the goal) changed: `meeting-questions`.
@@ -506,8 +560,67 @@ pub fn act_on_question(app: &AppHandle, id: &str, number: u32, act: QuestionAct)
     Ok(())
 }
 
-/// While the meeting records: runs the questions model whenever enough new talk has come in.
-fn ask_questions(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBool, settings: &Settings) {
+/// Where the system map's last run stopped reading.
+#[derive(Default)]
+struct MapCursor {
+    /// Segments read so far.
+    seen: usize,
+    /// The notes as that run read them.
+    notes: String,
+}
+
+/// The map's input for the talk since `cursor`. `earlier` holds the last lines before it.
+fn map_input<'a>(m: &'a Meeting, cursor: &MapCursor, language: Option<&'a str>, earlier: &'a mut Vec<String>) -> system_map::Input<'a> {
+    let seen = cursor.seen.min(m.segments.len());
+    let mut before = pipeline::transcript_lines(&m.segments[..seen], &m.speakers);
+    *earlier = before.split_off(before.len().saturating_sub(system_map::EARLIER_LINES));
+    system_map::Input {
+        notes: &m.notes,
+        language,
+        new: &m.segments[seen..],
+        earlier,
+        speakers: &m.speakers,
+        map: &m.system_map,
+        notes_changed: m.notes.trim() != cursor.notes.trim(),
+    }
+}
+
+/// One map run on the meeting being recorded: reads the talk since `cursor`, applies what checks
+/// out, tells the windows.
+fn live_map_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<Meeting>>, cursor: &mut MapCursor) -> anyhow::Result<()> {
+    let c = app.state::<Core>();
+    let snapshot = meeting.lock().clone();
+    let language = pipeline::meeting_language(&snapshot.segments);
+    let mut earlier = Vec::new();
+    let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier);
+    let started = Instant::now();
+    let run = system_map::run(w, &input)?;
+    *cursor = MapCursor { seen: snapshot.segments.len(), notes: snapshot.notes.clone() };
+    let Some(run) = run else { return Ok(()) };
+    let applied = {
+        let mut m = meeting.lock();
+        let now = m.duration_ms;
+        let applied = system_map::apply(&mut m.system_map, run.ops.clone(), &run.evidence(), now);
+        save(&c.dir, &m);
+        applied
+    };
+    emit_map(app, &snapshot.id);
+    log::info!(
+        "system map: read the new talk in {:.1}s ({}), {}",
+        started.elapsed().as_secs_f32(),
+        stats_line(Some(run.cost)),
+        if applied.lines.is_empty() { "no change".to_string() } else { applied.lines.join("; ") }
+    );
+    Ok(())
+}
+
+/// While the meeting records: whenever enough new talk has come in (or the notes changed), the
+/// live model updates the system map with it, then proposes questions, which go after what the
+/// map still doesn't know. One model process serves both.
+///
+/// When the meeting stops, the map reads the last of the talk once more (after `talk_done`: the
+/// last seconds are transcribed), so nothing said at the end is left out.
+fn assist(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBool, talk_done: &AtomicBool, settings: &Settings) {
     let c = app.state::<Core>();
     let id = meeting.lock().id.clone();
     let model = llm::entry(&settings.summary_model).and_then(|e| llm::locate(&c.model_dirs.read().own, e));
@@ -519,19 +632,20 @@ fn ask_questions(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBo
     let mut worker: Option<llm::Worker> = None;
     let mut words_then = 0;
     let mut last_run: Option<u64> = None;
+    let mut cursor = MapCursor::default();
     let mut failures = 0;
     while !stop.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_secs(1));
-        let (now_ms, words, expired) = {
+        let (now_ms, words, expired, notes_changed) = {
             let mut m = meeting.lock();
             let now = m.duration_ms;
             let expired = questions::expire(&mut m.questions, now);
-            (now, word_count(&m.segments), expired)
+            (now, word_count(&m.segments), expired, settings.live_map() && m.notes.trim() != cursor.notes.trim())
         };
         if expired {
             emit_questions(app, &id);
         }
-        let due = words.saturating_sub(words_then) >= QUESTION_WORDS
+        let due = (words.saturating_sub(words_then) >= QUESTION_WORDS || (notes_changed && words > 0))
             && last_run.is_none_or(|t| now_ms.saturating_sub(t) >= QUESTION_GAP_MS);
         if !due || c.sessions.dictation_busy() || stop.load(Ordering::SeqCst) {
             continue;
@@ -548,24 +662,29 @@ fn ask_questions(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBo
             }
         }
         set_question_status(app, &id, QuestionStatus::Thinking);
-        let snapshot = meeting.lock().clone();
-        let language = pipeline::meeting_language(&snapshot.segments);
-        let input = questions::Input {
-            goal: &snapshot.goal,
-            notes: &snapshot.notes,
-            language: language.as_deref(),
-            segments: &snapshot.segments,
-            speakers: &snapshot.speakers,
-            questions: &snapshot.questions,
-            now_ms,
-        };
-        let started = Instant::now();
-        let result = questions::run(worker.as_mut().expect("started above"), &input);
+        let w = worker.as_mut().expect("started above");
         words_then = words;
         last_run = Some(now_ms);
-        match result {
-            Ok(outcome) => {
-                failures = 0;
+        let result = (|| -> anyhow::Result<()> {
+            if settings.live_map() {
+                live_map_step(app, w, meeting, &mut cursor)?;
+            }
+            if settings.live_questions() {
+                let snapshot = meeting.lock().clone();
+                let language = pipeline::meeting_language(&snapshot.segments);
+                let unknowns = snapshot.system_map.unknowns();
+                let input = questions::Input {
+                    goal: &snapshot.goal,
+                    notes: &snapshot.notes,
+                    language: language.as_deref(),
+                    segments: &snapshot.segments,
+                    speakers: &snapshot.speakers,
+                    questions: &snapshot.questions,
+                    unknowns: &unknowns,
+                    now_ms,
+                };
+                let started = Instant::now();
+                let outcome = questions::run(w, &input)?;
                 let changed = outcome.is_some_and(|o| {
                     let mut m = meeting.lock();
                     let now = m.duration_ms;
@@ -576,11 +695,20 @@ fn ask_questions(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBo
                     changed
                 });
                 let live = questions::live_count(&meeting.lock().questions);
-                log::info!("meeting questions: read the talk in {:.1}s, {live} open{}", started.elapsed().as_secs_f32(), if changed { ", changed" } else { "" });
+                log::info!(
+                    "meeting questions: read the talk in {:.1}s ({}), {live} open{}",
+                    started.elapsed().as_secs_f32(),
+                    stats_line(w.last),
+                    if changed { ", changed" } else { "" }
+                );
             }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => failures = 0,
             Err(e) => {
                 failures += 1;
-                log::warn!("meeting questions failed ({failures} in a row): {e:#}");
+                log::warn!("the live model failed ({failures} in a row): {e:#}");
                 worker = None;
                 if failures >= QUESTION_FAILURES {
                     set_question_status(app, &id, QuestionStatus::Failed);
@@ -590,8 +718,21 @@ fn ask_questions(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBo
         }
         set_question_status(app, &id, QuestionStatus::Listening);
     }
+    if let (true, Some(w)) = (settings.live_map(), worker.as_mut()) {
+        let waited = Instant::now();
+        while !talk_done.load(Ordering::SeqCst) && waited.elapsed() < Duration::from_secs(120) {
+            thread::sleep(Duration::from_millis(200));
+        }
+        if let Err(e) = live_map_step(app, w, meeting, &mut cursor) {
+            log::warn!("the system map's last run failed: {e:#}");
+        }
+    }
     drop(worker);
     set_question_status(app, &id, QuestionStatus::Off);
+}
+
+fn stats_line(s: Option<llm::ChatStats>) -> String {
+    s.map(|s| format!("{} prompt tokens ({} kept), {} written, {} ms", s.prompt_tokens, s.kept_tokens, s.tokens, s.ms)).unwrap_or_default()
 }
 
 struct Chan {
@@ -627,12 +768,15 @@ fn load_embedder(app: &AppHandle, settings: &Settings) -> Option<Embedder> {
     }
 }
 
+/// Records until `stop`; sets `talk_done` once the last seconds are transcribed.
+#[allow(clippy::too_many_arguments)]
 fn record(
     app: &AppHandle,
     meeting: &Arc<Mutex<Meeting>>,
     mic: Recording,
     system: Option<Recording>,
     stop: &AtomicBool,
+    talk_done: &AtomicBool,
     limit: Option<Duration>,
     settings: &Settings,
 ) {
@@ -770,6 +914,7 @@ fn record(
             }
         }
         if stopping {
+            talk_done.store(true, Ordering::SeqCst);
             break;
         }
     }
@@ -802,8 +947,14 @@ fn record(
     }
     pipeline::assign_speakers(&mut m.segments, &embeddings, &mut m.speakers, settings.meeting_speakers && embedder.is_some());
     m.language = pipeline::meeting_language(&m.segments);
-    *meeting.lock() = m;
-    save(&c.dir, &meeting.lock());
+    {
+        // Only what this pass changed: the live model may have updated the map or questions meanwhile.
+        let mut g = meeting.lock();
+        g.segments = m.segments;
+        g.speakers = m.speakers;
+        g.language = m.language;
+        save(&c.dir, &g);
+    }
     let _ = app.emit("meeting-changed", json!({ "id": id }));
 }
 
@@ -1033,6 +1184,11 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
             Some(open) => format!("{summary}\n\n{open}"),
             None => summary,
         };
+        // The system map, in the fixed shape other programs read.
+        let summary = match system_map::section(&snapshot.system_map) {
+            Some(map) => format!("{summary}\n\n{map}"),
+            None => summary,
+        };
         Ok((summary, entry.id.to_string()))
     })();
     let mut m = meeting.lock();
@@ -1058,50 +1214,167 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
 
 // ---------- `wordfall --meeting` ----------
 
-/// Live questions for `wordfall --meeting … --questions`: run at the same pace as in a live meeting
-/// (by meeting time), printing what changes. Nobody presses anything, so questions stay until the
-/// talk answers them or they expire.
-struct CliQuestions {
+/// The live model for `wordfall --meeting … --questions / --map`: runs at the same pace as in a live
+/// meeting (by meeting time), printing what changes and what each run cost. Nobody presses anything,
+/// so questions stay until the talk answers them or they expire. `--note-at "90:text"` adds a line to
+/// the notes at that second, as if typed then.
+struct CliAssist {
     worker: llm::Worker,
+    ask: bool,
+    map: bool,
     words_then: usize,
     last_run: Option<u64>,
+    cursor: MapCursor,
+    notes_at: Vec<(u64, String)>,
+    /// (meeting ms, prompt tokens, written, ms) per map run and per questions run.
+    map_runs: Vec<llm::ChatStats>,
+    question_runs: Vec<llm::ChatStats>,
+    /// The map after each run that changed it, for looking at how it grew.
+    snapshots: Vec<serde_json::Value>,
 }
 
-impl CliQuestions {
+impl CliAssist {
     fn step(&mut self, meeting: &mut Meeting, now_ms: u64) -> anyhow::Result<()> {
+        let t = now_ms as f32 / 1000.0;
+        while let Some(i) = self.notes_at.iter().position(|(at, _)| *at <= now_ms) {
+            let (_, note) = self.notes_at.remove(i);
+            eprintln!("[{t:>6.1}s] (note typed) {note}");
+            if !meeting.notes.is_empty() {
+                meeting.notes.push('\n');
+            }
+            meeting.notes.push_str(&note);
+        }
         let before = meeting.questions.clone();
         questions::expire(&mut meeting.questions, now_ms);
         let words = word_count(&meeting.segments);
-        let due = words.saturating_sub(self.words_then) >= QUESTION_WORDS
+        let notes_changed = self.map && meeting.notes.trim() != self.cursor.notes.trim();
+        let due = (words.saturating_sub(self.words_then) >= QUESTION_WORDS || (notes_changed && words > 0))
             && self.last_run.is_none_or(|t| now_ms.saturating_sub(t) >= QUESTION_GAP_MS);
         if due {
             self.words_then = words;
             self.last_run = Some(now_ms);
             let language = pipeline::meeting_language(&meeting.segments);
-            let input = questions::Input {
-                goal: &meeting.goal,
-                notes: &meeting.notes,
-                language: language.as_deref(),
-                segments: &meeting.segments,
-                speakers: &meeting.speakers,
-                questions: &meeting.questions,
-                now_ms,
-            };
-            let started = Instant::now();
-            let outcome = questions::run(&mut self.worker, &input)?;
-            eprintln!("[{:>6.1}s] (questions read the talk in {:.1}s)", now_ms as f32 / 1000.0, started.elapsed().as_secs_f32());
-            if let Some(o) = outcome {
-                questions::apply(&mut meeting.questions, o, now_ms);
+            if self.map {
+                self.map_step(meeting, now_ms)?;
+            }
+            if self.ask {
+                let unknowns = meeting.system_map.unknowns();
+                let input = questions::Input {
+                    goal: &meeting.goal,
+                    notes: &meeting.notes,
+                    language: language.as_deref(),
+                    segments: &meeting.segments,
+                    speakers: &meeting.speakers,
+                    questions: &meeting.questions,
+                    unknowns: &unknowns,
+                    now_ms,
+                };
+                let started = Instant::now();
+                let outcome = questions::run(&mut self.worker, &input)?;
+                if outcome.is_some() {
+                    let stats = self.worker.last.unwrap_or_default();
+                    self.question_runs.push(stats);
+                    eprintln!("[{t:>6.1}s] (questions read the talk in {:.1}s: {})", started.elapsed().as_secs_f32(), stats_line(Some(stats)));
+                }
+                if let Some(o) = outcome {
+                    questions::apply(&mut meeting.questions, o, now_ms);
+                }
             }
         }
         for q in &meeting.questions {
             match before.iter().find(|b| b.number == q.number) {
-                None => eprintln!("[{:>6.1}s] + Q{} ({:?}) {}", now_ms as f32 / 1000.0, q.number, q.kind, q.text),
-                Some(b) if b.state != q.state => eprintln!("[{:>6.1}s] Q{} {:?}", now_ms as f32 / 1000.0, q.number, q.state),
+                None => eprintln!("[{t:>6.1}s] + Q{} ({:?}) {}", q.number, q.kind, q.text),
+                Some(b) if b.state != q.state => eprintln!("[{t:>6.1}s] Q{} {:?}", q.number, q.state),
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// One map run on the talk since the last one, printing what it changed.
+    fn map_step(&mut self, meeting: &mut Meeting, now_ms: u64) -> anyhow::Result<()> {
+        let t = now_ms as f32 / 1000.0;
+        let language = pipeline::meeting_language(&meeting.segments);
+        let mut earlier = Vec::new();
+        let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier);
+        let started = Instant::now();
+        let run = system_map::run(&mut self.worker, &input)?;
+        self.cursor = MapCursor { seen: meeting.segments.len(), notes: meeting.notes.clone() };
+        let Some(run) = run else { return Ok(()) };
+        self.map_runs.push(run.cost);
+        eprintln!("[{t:>6.1}s] (map read the new talk in {:.1}s: {})", started.elapsed().as_secs_f32(), stats_line(Some(run.cost)));
+        if std::env::var_os("WORDFALL_MAP_RAW").is_some() {
+            eprintln!("[{t:>6.1}s] map answer:\n{}", run.answer.trim_end());
+        }
+        let applied = system_map::apply(&mut meeting.system_map, run.ops.clone(), &run.evidence(), now_ms);
+        for l in &applied.lines {
+            eprintln!("[{t:>6.1}s] map {l}");
+        }
+        self.snapshots.push(json!({ "atMs": now_ms, "notes": meeting.notes, "map": meeting.system_map }));
+        Ok(())
+    }
+
+    /// From `--questions`, `--map`, `--note-at "90:text"` and `--llm <id>` (in `settings`).
+    fn from_args(args: &[String], settings: &Settings, data_dir: &Path) -> anyhow::Result<Option<Self>> {
+        let (ask, map) = (args.iter().any(|a| a == "--questions"), args.iter().any(|a| a == "--map"));
+        if !ask && !map {
+            return Ok(None);
+        }
+        let mut notes_at = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            if a == "--note-at" {
+                let v = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--note-at needs \"seconds:text\""))?;
+                let (at, text) = v.split_once(':').ok_or_else(|| anyhow::anyhow!("--note-at needs \"seconds:text\""))?;
+                notes_at.push((at.trim().parse::<u64>()? * 1000, text.trim().to_string()));
+            }
+        }
+        crate::init_stderr_logging();
+        let entry = llm::entry(&settings.summary_model).ok_or_else(|| anyhow::anyhow!("unknown summary model"))?;
+        let path = llm::locate(&settings.model_dirs(data_dir).own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
+        eprintln!("live model: {}", entry.display_name);
+        Ok(Some(Self {
+            worker: llm::Worker::spawn(&path, &data_dir.join("llm.log"), questions::CTX)?,
+            ask,
+            map,
+            words_then: 0,
+            last_run: None,
+            cursor: MapCursor::default(),
+            notes_at,
+            map_runs: Vec::new(),
+            question_runs: Vec::new(),
+            snapshots: Vec::new(),
+        }))
+    }
+
+    /// At the end: the map reads what was said since its last run, as in a live meeting; then the
+    /// cost report, and the map's snapshots to `map_json`.
+    fn done(&mut self, meeting: &mut Meeting, now_ms: u64, map_json: Option<&str>) -> anyhow::Result<()> {
+        if self.map && self.cursor.seen < meeting.segments.len() {
+            self.map_step(meeting, now_ms)?;
+        }
+        eprintln!("--- live model cost ---\n{}", self.report());
+        if let Some(path) = map_json {
+            std::fs::write(path, serde_json::to_string_pretty(&self.snapshots)?)?;
+        }
+        Ok(())
+    }
+
+    /// Totals per kind of run: runs, prompt tokens, written tokens, time (sum and mean).
+    fn report(&self) -> String {
+        let line = |name: &str, runs: &[llm::ChatStats]| {
+            if runs.is_empty() {
+                return format!("{name}: no runs");
+            }
+            let n = runs.len() as u64;
+            let (p, w, ms) = runs.iter().fold((0, 0, 0), |(p, w, ms), s| (p + s.prompt_tokens, w + s.tokens, ms + s.ms));
+            let kept: u64 = runs.iter().map(|s| s.kept_tokens).sum();
+            let max_ms = runs.iter().map(|s| s.ms).max().unwrap_or(0);
+            format!(
+                "{name}: {n} runs, {p} prompt ({kept} kept) + {w} written tokens in all ({} + {} per run), {:.1} s per run (max {:.1} s), {:.1} s in all",
+                p / n, w / n, ms as f32 / n as f32 / 1000.0, max_ms as f32 / 1000.0, ms as f32 / 1000.0
+            )
+        };
+        format!("{}\n{}", line("map", &self.map_runs), line("questions", &self.question_runs))
     }
 }
 
@@ -1113,7 +1386,10 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let mic_path = arg("--meeting").ok_or_else(|| anyhow::anyhow!("missing mic WAV"))?;
     let data_dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data dir"))?.join("com.wordfall.app");
-    let settings = Settings::load(&data_dir);
+    let mut settings = Settings::load(&data_dir);
+    if let Some(m) = arg("--llm") {
+        settings.summary_model = m;
+    }
     let model_dirs = settings.model_dirs(&data_dir);
     let entry = catalog_entry(&settings.model).ok_or_else(|| anyhow::anyhow!("unknown model"))?;
     let (path, _) = model_dirs.locate(entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
@@ -1153,14 +1429,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     let mut echo = EchoFilter::default();
     meeting.goal = arg("--goal").unwrap_or_default();
     meeting.notes = arg("--notes").unwrap_or_default();
-    let mut asker = if args.iter().any(|a| a == "--questions") {
-        crate::init_stderr_logging();
-        let entry = llm::entry(&settings.summary_model).ok_or_else(|| anyhow::anyhow!("unknown summary model"))?;
-        let path = llm::locate(&model_dirs.own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
-        Some(CliQuestions { worker: llm::Worker::spawn(&path, &data_dir.join("llm.log"), questions::CTX)?, words_then: 0, last_run: None })
-    } else {
-        None
-    };
+    let mut asker = CliAssist::from_args(args, &settings, &data_dir)?;
     let mut pos = 0;
     while pos < longest {
         let end = (pos + step).min(longest);
@@ -1203,7 +1472,13 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
         }
         pos = end;
     }
-    drop(asker);
+    if let Some(path) = arg("--save-transcript") {
+        // What the live model saw, for replaying it with `--transcript` (no speech recognition).
+        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers }))?)?;
+    }
+    if let Some(mut a) = asker {
+        a.done(&mut meeting, longest as u64 / 16, arg("--map-json").as_deref())?;
+    }
     meeting.duration_ms = longest as u64 / 16;
     let transcribed = started.elapsed();
     for (seg, why) in pipeline::drop_echo(&mut meeting.segments, &mut embeddings, &echo) {
@@ -1222,11 +1497,63 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
             println!("Q{} [{}] {:?} ({:?}): {}", q.number, pipeline::clock(q.at_ms), q.state, q.kind, q.text);
         }
     }
+    if !meeting.notes.is_empty() {
+        println!("--- my notes ---\n{}", meeting.notes);
+    }
+    let mut extra: Vec<String> = Vec::new();
+    let heading = llm::open_questions_heading(llm::language_name(meeting.language.as_deref()));
+    extra.extend(questions::open_section(&meeting.questions, heading));
+    extra.extend(system_map::section(&meeting.system_map));
     if args.iter().any(|a| a == "--no-summary") {
+        if let Some(map) = system_map::section(&meeting.system_map) {
+            println!("--- system map ---\n{map}");
+        }
         return Ok(());
     }
     let speakers: Vec<String> = meeting.speakers.iter().map(|s| s.name.clone()).collect();
-    print_notes(&data_dir, &settings, &lines, &speakers, meeting.language.as_deref(), meeting.duration_ms / 60_000, args)
+    print_notes(&data_dir, &settings, &lines, &speakers, meeting.language.as_deref(), meeting.duration_ms / 60_000, &meeting.notes, &extra, args)
+}
+
+/// `wordfall --transcript <saved.json> --map [--questions] [--note-at "90:text"] [--llm <id>] [--map-json f]`:
+/// the live model on a transcript `--meeting … --save-transcript` saved, with the segments arriving
+/// at the pace they were said (no speech recognition, so runs are quick and comparable). Prints
+/// what changes, the cost of each run and the map's section.
+pub fn cli_transcript(args: &[String]) -> anyhow::Result<()> {
+    let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let path = arg("--transcript").ok_or_else(|| anyhow::anyhow!("missing transcript file"))?;
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data dir"))?.join("com.wordfall.app");
+    let mut settings = Settings::load(&data_dir);
+    if let Some(m) = arg("--llm") {
+        settings.summary_model = m;
+    }
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)?;
+    let segments: Vec<Segment> = serde_json::from_value(saved["segments"].clone())?;
+    let mut meeting = Meeting { id: "cli".into(), started_at: chrono::Utc::now().to_rfc3339(), ..Default::default() };
+    meeting.speakers = serde_json::from_value(saved["speakers"].clone())?;
+    meeting.goal = arg("--goal").unwrap_or_default();
+    meeting.notes = arg("--notes").unwrap_or_default();
+    let mut asker = CliAssist::from_args(args, &settings, &data_dir)?.ok_or_else(|| anyhow::anyhow!("add --map and/or --questions"))?;
+    let end_ms = segments.iter().map(|s| s.end_ms).max().unwrap_or(0) + 8_000;
+    // As in `cli`: every 8 s of meeting time, what has been transcribed by then (about 3 s after it was said).
+    let (mut next, mut t) = (0, 8_000u64);
+    while t <= end_ms {
+        while next < segments.len() && segments[next].end_ms + 3_000 <= t {
+            meeting.segments.push(segments[next].clone());
+            next += 1;
+        }
+        asker.step(&mut meeting, t)?;
+        t += 8_000;
+    }
+    meeting.segments.extend(segments[next..].iter().cloned());
+    asker.done(&mut meeting, end_ms, arg("--map-json").as_deref())?;
+    if !meeting.questions.is_empty() {
+        println!("--- questions ---");
+        for q in &meeting.questions {
+            println!("Q{} [{}] {:?} ({:?}): {}", q.number, pipeline::clock(q.at_ms), q.state, q.kind, q.text);
+        }
+    }
+    println!("--- system map ---\n{}", system_map::section(&meeting.system_map).unwrap_or_default());
+    Ok(())
 }
 
 /// `wordfall --meeting-notes <transcript.txt> [--language de] [--minutes 30] [--notes "…"]`: writes
@@ -1248,9 +1575,12 @@ pub fn cli_notes(args: &[String]) -> anyhow::Result<()> {
         }
     }
     let minutes = arg("--minutes").and_then(|m| m.parse().ok()).unwrap_or(1);
-    print_notes(&data_dir, &settings, &lines, &speakers, arg("--language").as_deref(), minutes, args)
+    let notes = arg("--notes").unwrap_or_default();
+    print_notes(&data_dir, &settings, &lines, &speakers, arg("--language").as_deref(), minutes, &notes, &[], args)
 }
 
+/// Writes and prints the notes, with `extra` sections below them as the app adds them.
+#[allow(clippy::too_many_arguments)]
 fn print_notes(
     data_dir: &Path,
     settings: &Settings,
@@ -1258,6 +1588,8 @@ fn print_notes(
     speakers: &[String],
     language: Option<&str>,
     minutes: u64,
+    notes: &str,
+    extra: &[String],
     args: &[String],
 ) -> anyhow::Result<()> {
     let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
@@ -1265,19 +1597,21 @@ fn print_notes(
     let path = llm::locate(&settings.model_dirs(data_dir).own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
     let t = Instant::now();
     let mut worker = llm::Worker::spawn(&path, &data_dir.join("llm.log"), llm::NOTES_CTX)?;
-    let notes = arg("--notes").unwrap_or_default();
     let goal = arg("--goal");
     let input = llm::SummaryInput {
         title: None,
         goal: goal.as_deref().filter(|g| !g.trim().is_empty()),
-        notes: &notes,
+        notes,
         transcript: lines,
         speakers,
         language,
         when: &chrono::Local::now().format("%A %-d %B %Y, %H:%M").to_string(),
         minutes,
     };
-    let summary = llm::summarize(&mut worker, &input, |_| {})?;
+    let mut summary = llm::summarize(&mut worker, &input, |_| {})?;
+    for section in extra {
+        summary = format!("{summary}\n\n{section}");
+    }
     println!("--- notes ({:.1}s, language {language:?}) ---\n{summary}", t.elapsed().as_secs_f32());
     Ok(())
 }

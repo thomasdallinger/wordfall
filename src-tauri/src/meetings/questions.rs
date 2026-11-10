@@ -179,7 +179,7 @@ fn content_words(text: &str) -> HashSet<String> {
 }
 
 /// Whether two questions ask much the same (most of their content words are shared).
-fn similar(a: &str, b: &str) -> bool {
+pub(super) fn similar(a: &str, b: &str) -> bool {
     let (a, b) = (content_words(a), content_words(b));
     if a.is_empty() || b.is_empty() {
         return a == b;
@@ -195,6 +195,8 @@ pub struct Input<'a> {
     pub segments: &'a [Segment],
     pub speakers: &'a [Speaker],
     pub questions: &'a [Question],
+    /// What the system map still doesn't know ("Name: what"); questions go after it first.
+    pub unknowns: &'a [String],
     pub now_ms: u64,
 }
 
@@ -234,6 +236,13 @@ fn user_prompt(input: &Input, transcript: &str, room: usize) -> String {
     let notes: String = input.notes.trim().chars().take(1200).collect();
     if !notes.is_empty() {
         p.push_str(&format!("My own notes so far:\n{notes}\n\n"));
+    }
+    if !input.unknowns.is_empty() {
+        p.push_str("Still unknown about the systems and people involved (good questions find these out):\n");
+        for u in input.unknowns.iter().take(8) {
+            p.push_str(&format!("- {u}\n"));
+        }
+        p.push('\n');
     }
     let open: Vec<&Question> = input.questions.iter().filter(|q| q.state.is_open()).collect();
     if !open.is_empty() {
@@ -366,7 +375,7 @@ pub fn run(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Out
     let language = llm::language_name(input.language);
     let system = system_prompt(language, !input.goal.trim().is_empty());
     let grammar = grammar(&open, room);
-    let answer = worker.chat_shaped(&system, &user_prompt(input, &transcript, room), ANSWER_TOKENS, Some(&grammar), |_| {})?;
+    let answer = worker.chat_at(&system, &user_prompt(input, &transcript, room), ANSWER_TOKENS, Some(&grammar), None, Some("questions"), |_| {})?;
     let parsed = parse(&answer);
     let answered = verified(&parsed.answered, input);
     for (n, quote) in parsed.answered.iter().filter(|(n, _)| !answered.contains(n)) {
@@ -435,7 +444,7 @@ mod tests {
         right.speaker = 0;
         let segments = vec![seg(10_000, "The launch is on the first of March."), right, seg(70_000, "Anna will do the onboarding, yes.")];
         let questions = vec![q(1, "When is the launch?", State::Live, 60_000), q(2, "Who does the onboarding?", State::Live, 60_000)];
-        let input = Input { goal: "", notes: "", language: None, segments: &segments, speakers: &[], questions: &questions, now_ms: 80_000 };
+        let input = Input { goal: "", notes: "", language: None, segments: &segments, speakers: &[], questions: &questions, unknowns: &[], now_ms: 80_000 };
         let claimed = vec![
             (1, "the first of March".to_string()),                   // said, but before the question
             (2, "Anna will do the onboarding".to_string()),          // said after it

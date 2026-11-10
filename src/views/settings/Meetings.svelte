@@ -93,6 +93,15 @@
     </Row>
 
     <Row
+      id="meet-live"
+      label="Live help while you talk"
+      help="Questions to ask and a map of the systems that come up, written by the summary model during the meeting. Off: nothing runs while you record, and the model's memory stays free."
+    >
+      <Switch labelledby="meet-live" checked={s.meetingLiveHelp} onchange={(v) => app.updateSettings({ meetingLiveHelp: v })} />
+    </Row>
+
+    {#if s.meetingLiveHelp}
+    <Row
       id="meet-questions"
       label="Suggest questions to ask"
       help="While you talk, the summary model reads the last few minutes and proposes up to three questions: what was vague, what to challenge, what was left open. Give the meeting a goal to steer them. Questions you keep for later end up in the notes."
@@ -112,6 +121,15 @@
           onchange={(v) => app.updateSettings({ meetingQuestionsWindow: v })}
         />
       </Row>
+    {/if}
+
+    <Row
+      id="meet-map"
+      label="Draw a system map"
+      help="While you talk, the summary model maps the systems, people and roles that come up, what flows between them and how (API, CSV, mail, by hand), and what is still unknown. Say in your notes what to focus on. What is still unknown steers the questions, and the map is added below the notes."
+    >
+      <Switch labelledby="meet-map" checked={s.meetingMap} onchange={(v) => app.updateSettings({ meetingMap: v })} />
+    </Row>
     {/if}
 
     <Row id="meet-keep" label="Keep recordings for" help="The audio of each meeting, for re-checking the transcript. Notes and transcripts are kept until you delete them.">
