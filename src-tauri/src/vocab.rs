@@ -57,6 +57,11 @@ fn capitalize(s: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
+/// The term of a vocabulary entry: an entry may say what it stands for ("PO = purchase order").
+pub fn term_of(entry: &str) -> &str {
+    entry.split_once('=').map_or(entry, |(term, _)| term).trim()
+}
+
 pub struct Sources<'a> {
     pub dictionary: &'a [String],
     pub user_terms: &'a [String],
@@ -75,7 +80,9 @@ pub fn terms(mode: PromptMode, src: &Sources) -> Vec<String> {
     if mode == PromptMode::None {
         return list;
     }
-    src.dictionary.iter().chain(src.user_terms).for_each(|t| push(t));
+    // A replacement is pushed as written; only the user's terms may say what they stand for.
+    src.dictionary.iter().for_each(|t| push(t));
+    src.user_terms.iter().for_each(|t| push(term_of(t)));
     if matches!(mode, PromptMode::Projects | PromptMode::Glossary) {
         src.projects.iter().for_each(|t| push(t));
     }
@@ -89,4 +96,23 @@ pub fn terms(mode: PromptMode, src: &Sources) -> Vec<String> {
 /// lists sometimes get echoed back on silent audio.
 pub fn prompt(terms: &[String]) -> Option<String> {
     (!terms.is_empty()).then(|| format!("Terms used in this note: {}.", terms.join(", ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_take_the_term_of_an_entry_with_a_meaning() {
+        let user = ["PO = purchase order".to_string(), "Zephyrix".to_string()];
+        let src = Sources { dictionary: &[], user_terms: &user, projects: &[] };
+        assert_eq!(terms(PromptMode::Dictionary, &src), ["PO", "Zephyrix"]);
+    }
+
+    #[test]
+    fn dictionary_replacements_are_hints_as_written() {
+        let dictionary = ["E = mc²".to_string(), "Mit freundlichen Grüßen".to_string()];
+        let src = Sources { dictionary: &dictionary, user_terms: &[], projects: &[] };
+        assert_eq!(terms(PromptMode::Dictionary, &src), ["E = mc²", "Mit freundlichen Grüßen"]);
+    }
 }

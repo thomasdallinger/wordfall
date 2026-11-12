@@ -64,6 +64,10 @@ enum Request {
         #[serde(default)]
         slot: Option<String>,
     },
+    /// Drop the context kept for `slot` (no answer).
+    Forget {
+        slot: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -170,6 +174,11 @@ fn run() -> anyhow::Result<()> {
                 let Some(l) = loaded.as_mut() else { anyhow::bail!("no model loaded") };
                 if let Err(e) = chat(&backend, l, id, &messages, max_tokens, temperature.unwrap_or(0.4), grammar.as_deref(), slot.as_deref()) {
                     send(json!({ "event": "error", "id": id, "message": format!("{e:#}") }));
+                }
+            }
+            Request::Forget { slot } => {
+                if let Some(l) = loaded.as_mut() {
+                    l.slots.remove(&slot);
                 }
             }
         }

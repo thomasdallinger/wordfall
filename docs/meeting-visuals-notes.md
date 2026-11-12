@@ -1,0 +1,30 @@
+# Screens and photos: choices made on this branch
+
+One line per choice; the simplest option that fit was taken each time.
+
+- Why: speech recognition misheard a document abbreviation again and again in a real meeting and the notes named the topic wrong; a screen or a photo of the printout spells it.
+- Phase 1 is OCR only (Apple Vision, `VNRecognizeTextRequest`, accurate, language correction, the user's languages + English, dictionary words as custom words); a vision LLM is a later step.
+- No new Apple crate: Vision through raw `objc2::msg_send!`, ImageIO (resize, rotate upright, JPEG) and `CGWindowListCopyWindowInfo` through C functions; `objc2-vision` / `objc2-screen-capture-kit` weren't needed.
+- Images are read upright at up to 3200 px (ImageIO applies the EXIF rotation; without it Vision reads rotated text but its boxes scramble the rows) and kept at 1600 px plus a 480 px thumbnail.
+- Rows: OCR boxes that overlap vertically by half the smaller height are one row, left to right, cells joined with " | ", so a table row stays one line.
+- Data: `Meeting.visuals` (`id`, `atMs`, `untilMs`, `source` screen|photo, `label`, `text` a row per line, `image` path); `#[serde(default)]`, so old `meeting.json` files load.
+- Storage: `visuals/<uuid>.jpg` and `-thumb.jpg` in the meeting folder (uuid names, so two images read at once don't race for an id); deleted with the recordings, the text stays.
+- Prompt lines: `[mm:ss] Screen: row / row / …` and `[mm:ss] Photo: …`, merged into the transcript by time, a visual before talk at the same second, a speaker's turn broken where a visual comes in.
+- Caps: notes 800 characters per visual and at most a quarter of the talk (≤ 12,000); questions 500 per visual, ≤ 1,500, only visuals on screen in the last 8 minutes; past the cap each visual gets less text (down to 200), then screens are thinned evenly over the meeting and photos are kept.
+- One sentence in the notes' and questions' system prompts (`llm::SHOWN`), only when such lines are present: they are not speech, they are the source for exact names, numbers and kinds of documents.
+- Visuals are never speakers: the notes' speaker list comes from the segments only.
+- Window chrome: rows that repeat on at least four in five screen visuals (from three on; digits ignored, so a clock doesn't matter) are left out of the prompt and of change detection; computed from the stored visuals, so it applies to earlier ones too.
+- Change detection: words of three letters or more (or numbers of two digits or more); the same screen if Jaccard ≥ 0.85 or ≥ 90 % of the frame's words are in the current visual (a menu covers part); new if ≥ 8 words; otherwise nothing (blank share, transition).
+- Screen capture: `screencapture -x -o -t png -l<window>` every 10 s (works for covered windows, no deprecated API); skipped while dictating; at most 240 distinct screens per meeting.
+- One window, picked by the user under the meeting's title (meeting apps first: Zoom, Teams, Webex, Slack, FaceTime, …, then browser windows titled Meet/Teams/Zoom); nothing is read until a window is picked; Pause stops reading.
+- Permission: `CGPreflightScreenCaptureAccess` false, or three empty frames while every window title is hidden, means macOS hands out wallpaper only: the meeting says so and links to System Settings; a grant needs Quit and Reopen.
+- Setting "Read shared screens" is off by default; "Offer photos from Downloads" is on (it only asks).
+- Phone photos: AirDrop lands in ~/Downloads; a watch (every 3 s, while recording and 30 minutes after) offers images whose names weren't there when the meeting started, once their size stops changing; Add / Ignore in the meeting, a toast elsewhere; never added without asking. A newer meeting ends the older watch.
+- Adding images: drop on the meeting page (Tauri's drag-drop paths), *Add image…* (dialog plugin, image filter), ⌘V outside text fields (Rust reads the clipboard: copied image files first, else the picture, written as PNG with the `image` crate).
+- Time of a photo: now while recording, else the meeting's end; click its time to move it to when it was talked about (clamped to the meeting's length).
+- Thumbnails go to the UI as data URLs (`base64`), cached per visual in the page; the full picture opens in the system viewer.
+- Windows: same functions as stubs (no OCR, no screen reading yet; `Windows.Media.Ocr` later); the UI hides the rows and the tab there unless a meeting already has visuals.
+- Export: no new Markdown section; `## System map` stays last and unchanged.
+- Final pass label: the re-transcription after Stop reports `meeting-progress` phase `improving` with a fraction ("Improving the transcript… 40 %") instead of "Transcribing the last few seconds…". The scan for speech is shown as the first 5 %, the decoding as the other 95 %, split by the length of speech each channel decodes (a silent channel takes seconds, so it gets almost none of the bar); with speech on both channels the microphone part fills more slowly per percent than the system part, so the bar can run up to about 20 points ahead of the time taken.
+- Live map: reads the visuals added since its last run (`pipeline::timeline_lines(…, visuals::MAP)`: 400 characters per visual, ≤ 1,200); a Screen or Photo line is an ordinary L# to cite (see system-map-notes.md).
+- Test hooks: `--screen-text "90:f.txt"` and `--image "90:f.png"` for `--meeting`, `--transcript` and `--meeting-notes` (which also takes a `meeting.json`); `--ocr f` prints the rows and the time; `cargo test --lib reads_a_window -- --ignored --nocapture` lists windows and reads one.

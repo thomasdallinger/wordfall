@@ -305,6 +305,12 @@ struct Loaded {
     /// Encoder context the state was last used with. whisper.cpp keeps buffers sized for it,
     /// and switching sizes on a live state corrupts later runs, so a change means a new state.
     state_audio_ctx: i32,
+    /// Whether the last decode on `state` drew from whisper.cpp's random generator, which beam
+    /// search does at every step. whisper.cpp 1.8.3 seeds the first decoder's generator only when
+    /// a state is created (fixed upstream in ggml-org/whisper.cpp#4025, not yet in whisper-rs), so
+    /// on a reused state every beam decode depends on all the decodes before it. Such a state is
+    /// replaced before the next decode.
+    state_drawn: bool,
     /// Separate state for language detection, pinned to a short encoder window (created on first use).
     detect: Option<WhisperState>,
     ctx: WhisperContext,
@@ -318,6 +324,24 @@ const DETECT_AUDIO_CTX: i32 = 256;
 const DETECT_CONFIDENT: f32 = 0.9;
 
 impl Loaded {
+    /// Gets `state` ready for a decode at `audio_ctx`: a new one when the encoder size changes or
+    /// the last decode drew from the random generator.
+    fn ready_state(&mut self, audio_ctx: i32) -> anyhow::Result<()> {
+        if audio_ctx != self.state_audio_ctx || self.state_drawn {
+            self.state = self.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
+            self.state_audio_ctx = audio_ctx;
+            self.state_drawn = false;
+        }
+        Ok(())
+    }
+
+    /// Decodes `audio` on `state` (made ready by `ready_state`).
+    fn full(&mut self, params: FullParams, audio: &[f32], opts: &DecodeOptions) -> anyhow::Result<()> {
+        self.state_drawn = draws_at_random(opts);
+        self.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
+        Ok(())
+    }
+
     /// Probability per language id for the start of `audio`.
     fn ensure_detect_state(&mut self) -> anyhow::Result<()> {
         if self.detect.is_none() {
@@ -463,7 +487,7 @@ impl Engine {
         // Warm-up pass so the first real dictation doesn't pay for Metal/Vulkan shader compilation.
         let _ = warm(&mut state, 0);
         let mut loaded = self.loaded.lock();
-        *loaded = Some(Loaded { english_only, state, state_audio_ctx: 0, detect: None, ctx });
+        *loaded = Some(Loaded { english_only, state, state_audio_ctx: 0, state_drawn: false, detect: None, ctx });
         *self.loaded_id.lock() = Some(id.to_string());
         drop(loaded);
         *self.last_used.lock() = Some(Instant::now());
@@ -489,7 +513,10 @@ impl Engine {
         let started = Instant::now();
         let mut guard = self.loaded.lock();
         let loaded = guard.as_mut()?;
-        let _ = warm(&mut loaded.state, loaded.state_audio_ctx);
+        let audio_ctx = loaded.state_audio_ctx;
+        if loaded.ready_state(audio_ctx).is_ok() {
+            let _ = warm(&mut loaded.state, audio_ctx);
+        }
         if let Some(detect) = loaded.detect.as_mut() {
             let _ = detect_on(detect, &WARM_SILENCE, thread_count(&DecodeOptions::default()) as usize);
         }
@@ -541,14 +568,11 @@ impl Engine {
         };
 
         let audio_ctx = audio_ctx_for(opts, audio.len());
-        if audio_ctx != loaded.state_audio_ctx {
-            loaded.state = loaded.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
-            loaded.state_audio_ctx = audio_ctx;
-        }
+        loaded.ready_state(audio_ctx)?;
         let previous = self.last_language.lock().clone();
         let lang = choose_language(loaded, audio, languages, previous.as_deref(), opts, audio_ctx)?;
         let params = full_params(opts, Some(lang.as_str()), prompt, audio_ctx);
-        loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
+        loaded.full(params, audio, opts)?;
         let language = if lang == "auto" {
             whisper_rs::get_lang_str(loaded.state.full_lang_id_from_state()).map(str::to_string)
         } else {
@@ -649,11 +673,11 @@ pub struct TimedText {
 }
 
 impl Engine {
-    /// Where there is speech in `audio`, as sample ranges: Silero VAD when available, otherwise
-    /// the energy gate (one range at most).
+    /// Where there is speech in meeting `audio`, as sample ranges: Silero VAD when available,
+    /// otherwise the meeting's energy gate (one range at most).
     pub fn speech_regions(&self, audio: &[f32]) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
         if self.silero_path.lock().is_none() {
-            return Ok(crate::vad::trim(audio).into_iter().collect());
+            return Ok(crate::vad::trim_meeting(audio).into_iter().collect());
         }
         self.silero_segments(audio)
     }
@@ -680,14 +704,11 @@ impl Engine {
             audio
         };
         // Meetings always use the full window: timestamps and long utterances need it.
-        if loaded.state_audio_ctx != 0 {
-            loaded.state = loaded.ctx.create_state().map_err(|e| anyhow::anyhow!("whisper state: {e:?}"))?;
-            loaded.state_audio_ctx = 0;
-        }
+        loaded.ready_state(0)?;
         let lang = choose_language(loaded, audio, languages, previous, opts, 0)?;
         let mut params = full_params(opts, Some(lang.as_str()), prompt, 0);
         params.set_no_timestamps(false);
-        loaded.state.full(params, audio).map_err(|e| anyhow::anyhow!("transcription failed: {e:?}"))?;
+        loaded.full(params, audio, opts)?;
         let language = if lang == "auto" {
             whisper_rs::get_lang_str(loaded.state.full_lang_id_from_state()).map(str::to_string)
         } else {
@@ -805,6 +826,13 @@ pub fn pick_language<'a>(allowed: &'a [String], previous: Option<&str>, prob: im
     }
 }
 
+/// Whether a decode with `opts` draws from whisper.cpp's random generator whatever the audio:
+/// beam search samples its candidates at every step. (Greedy decoding draws only when the
+/// temperature fallback fires, which is rare and not worth a new state for every dictation.)
+fn draws_at_random(opts: &DecodeOptions) -> bool {
+    opts.beam_size > 1
+}
+
 fn full_params<'a, 'b>(opts: &DecodeOptions, lang: Option<&'a str>, prompt: Option<&str>, audio_ctx: i32) -> FullParams<'a, 'b> {
     let strategy = if opts.beam_size > 1 {
         SamplingStrategy::BeamSearch { beam_size: opts.beam_size, patience: -1.0 }
@@ -891,5 +919,31 @@ mod tests {
     fn previous_language_outside_the_set_is_ignored() {
         let allowed = langs(&["en", "de"]);
         assert_eq!(pick_language(&allowed, Some("fr"), probs(&[("en", 0.4), ("de", 0.5)])), "de");
+    }
+
+    /// Beam search gives the same text for the same clip however much the engine decoded before
+    /// (whisper.cpp's beam search draws its candidates from a generator that a reused state
+    /// carries over). Needs the app's model and a speech clip of a minute or so:
+    /// `WORDFALL_CLIP=<wav> cargo test --release --lib beam_search_repeats_itself -- --ignored`.
+    #[test]
+    #[ignore]
+    fn beam_search_repeats_itself() {
+        let Ok(clip) = std::env::var("WORDFALL_CLIP") else { return };
+        let data = dirs::data_dir().unwrap().join("com.wordfall.app");
+        let settings = crate::settings::Settings::load(&data);
+        let entry = catalog_entry(&settings.model).unwrap();
+        let engine = Engine::default();
+        engine.load(entry, &settings.model_dirs(&data).locate(entry).unwrap().0).unwrap();
+        let audio = crate::audio::read_wav_16k(Path::new(&clip)).unwrap();
+        let opts = DecodeOptions { beam_size: 5, ..DecodeOptions::default() };
+        let decode = || {
+            let (timed, _) = engine.transcribe_timed(&audio, &settings.languages, None, None, &opts).unwrap();
+            timed.into_iter().map(|t| t.text).collect::<Vec<_>>().join(" ")
+        };
+        let first = decode();
+        assert!(!first.is_empty());
+        for _ in 0..2 {
+            assert_eq!(decode(), first);
+        }
     }
 }

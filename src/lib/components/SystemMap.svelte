@@ -7,19 +7,23 @@
    * The meeting's system map, drawn roughly: systems in a column per kind (ours, the customer's,
    * outside services), people and roles in a row below, a line for each flow labelled with what
    * flows and how (dashed when how is unknown), and what is still open. Click a box to see what is
-   * known about it; while the meeting records, rename it or delete it if it's wrong.
+   * known about it; while the meeting records, rename it or delete it if it's wrong. Names said but
+   * not (yet) on the map are listed in one quiet line under it, so nothing is overlooked.
    */
   let {
     meetingId,
     map,
     status = 'off',
     editable = false,
+    alsoMentioned = [],
   }: {
     meetingId: string;
     map: SystemMap;
     /** What the live model is doing (shared with the questions). */
     status?: QuestionStatus;
     editable?: boolean;
+    /** Names said but not on the map, the latest first. */
+    alsoMentioned?: string[];
   } = $props();
 
   const uid = $props.id();
@@ -296,6 +300,9 @@
       </div>
     {/if}
   {/if}
+  {#if alsoMentioned.length > 0}
+    <p class="also">Also mentioned: {alsoMentioned.join(', ')}</p>
+  {/if}
 </div>
 
 <style>
@@ -468,6 +475,13 @@
   .more {
     font-size: 12px;
     color: var(--ink-3);
+  }
+  .also {
+    margin-top: 12px;
+    max-width: 72ch;
+    font-size: 12px;
+    line-height: 18px;
+    color: var(--ink-2);
   }
   @keyframes arrive {
     from {

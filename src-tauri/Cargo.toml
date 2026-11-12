@@ -40,6 +40,9 @@ whisper-rs = { version = "0.16", features = ["raw-api"] } # raw-api: ggml device
 sys-locale = "0.3"
 cpal = "0.15"
 arboard = "3"
+# Meeting visuals: a pasted image is written as PNG before it's read; thumbnails go to the UI as data URLs.
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }

@@ -27,7 +27,10 @@ Voice Lab + verified dictations (`--tier lab --tier history`) before big decisio
 
 Harness bugs found and fixed along the way: a reused whisper state breaks after the encoder context
 changes (now a fresh state on change), whisper.cpp ignores built-in VAD with external states (now run
-explicitly), and the scorer counted "2.30pm" vs "2:30 PM" as two errors.
+explicitly), and the scorer counted "2.30pm" vs "2:30 PM" as two errors. Later: whisper.cpp's beam
+search draws its candidates from a random generator that a reused state carries over (whisper.cpp
+#4025), so beam results depended on what the state decoded before (±1.5 pt WER between identical
+passes); a state is now replaced after every beam decode. Beam figures from before are one draw each.
 
 ## Step 3: engine bake-off (all with Silero VAD / no prompt unless noted)
 

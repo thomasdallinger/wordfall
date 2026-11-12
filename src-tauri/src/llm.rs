@@ -214,6 +214,12 @@ impl Worker {
         self.chat_at(system, user, max_tokens, grammar, None, None, on_event)
     }
 
+    /// Drops the context the helper keeps for `slot` (see `chat_at`), so its memory is free for
+    /// the next request. The helper answers nothing; requests are handled in order.
+    pub fn forget(&mut self, slot: &str) -> anyhow::Result<()> {
+        self.send(json!({ "op": "forget", "slot": slot }))
+    }
+
     /// Like `chat_shaped`, at a sampling `temperature` (the helper's default when `None`; 0 =
     /// greedy). With a `slot`, the helper keeps the context for the next request of that slot and
     /// reads only where its prompt differs from this one's (keep what doesn't change at the start).
@@ -318,8 +324,13 @@ pub struct SummaryInput<'a> {
     /// What the user wanted out of the meeting, if they said.
     pub goal: Option<&'a str>,
     pub notes: &'a str,
-    /// "[mm:ss] Speaker: text" lines.
+    /// "[mm:ss] Speaker: text" lines, with "[mm:ss] Screen: …" / "[mm:ss] Photo: …" lines of what
+    /// was shown merged in (see `meetings::visuals`).
     pub transcript: &'a [String],
+    /// Some transcript lines are text read from a screen or a photo.
+    pub shown: bool,
+    /// The user's terms the meeting used ("PO = what it stands for" where the user said).
+    pub glossary: &'a [String],
     pub speakers: &'a [String],
     pub language: Option<&'a str>,
     /// e.g. "Monday 9 November 2026, 14:00"
@@ -360,14 +371,25 @@ pub fn language_name(code: Option<&str>) -> &'static str {
     }
 }
 
-fn system_prompt(language: &str) -> String {
-    format!(
+fn system_prompt(language: &str, shown: bool) -> String {
+    let mut p = format!(
         "You are a meticulous note-taker. You turn meeting transcripts into clear, well-organised meeting notes \
          in Markdown. Write in {language}. Use only what the transcript and the user's own notes say: never invent \
          names, numbers, dates, decisions or tasks. The transcript comes from speech recognition, so it has mistakes; \
          quietly correct obvious ones. \"Me\" is the person who recorded the meeting and reads these notes."
-    )
+    );
+    if shown {
+        p.push_str(SHOWN);
+    }
+    p
 }
+
+/// Told when visuals are in the transcript: their text is spelled right where speech recognition
+/// mishears (a document's abbreviation heard as a name is spelled on the printout).
+pub const SHOWN: &str = " Lines marked \"Screen:\" or \"Photo:\" are not speech: they are text read from a shared screen or \
+     a photo shown during the meeting, at that point in time. Treat them as the source for the exact names, numbers \
+     and kinds of document being discussed, and use them to name topics correctly where the speech recognition \
+     misheard them.";
 
 /// Section headings in the notes' language (others are translated by the model).
 fn headings(language: &str) -> [&'static str; 3] {
@@ -424,6 +446,12 @@ fn final_prompt(input: &SummaryInput, language: &str, body_label: &str, body: &s
         p.push_str(&format!("Speakers as labelled below: {}.
 ", input.speakers.join(", ")));
     }
+    if !input.glossary.is_empty() {
+        p.push_str(&format!(
+            "Terms from my vocabulary used in this meeting, each a thing of its own, in their exact spelling: {}.\n",
+            input.glossary.join("; ")
+        ));
+    }
     if let Some(goal) = input.goal {
         p.push_str(&format!("What I wanted out of the meeting: {}
 ", goal.trim()));
@@ -477,7 +505,7 @@ const OVERHEAD: usize = 1024;
 /// parts first (notes per part), then the part notes are combined.
 pub fn summarize(worker: &mut Worker, input: &SummaryInput, mut progress: impl FnMut(Progress)) -> anyhow::Result<String> {
     let language = language_name(input.language);
-    let system = system_prompt(language);
+    let system = system_prompt(language, input.shown);
     let transcript = input.transcript.join("\n");
     let notes_tokens = worker.count(input.notes)?;
     let budget = (worker.ctx as usize).saturating_sub(FINAL_TOKENS as usize + OVERHEAD + notes_tokens);
@@ -650,6 +678,13 @@ Summary.
             "## Action items\n- [ ] **Speaker 1**: Prepare the release candidate by Wednesday.\n\
              - [ ] **Me**: Write the help articles.\n- [ ] **Speaker 1**: Write the release notes."
         );
+    }
+
+    #[test]
+    fn the_system_prompt_explains_screen_and_photo_lines_only_when_there_are_some() {
+        assert!(!system_prompt("German", false).contains("Screen:"));
+        let p = system_prompt("German", true);
+        assert!(p.contains("\"Screen:\" or \"Photo:\" are not speech") && p.contains("exact names, numbers"));
     }
 
     #[test]

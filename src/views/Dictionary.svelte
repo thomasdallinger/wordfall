@@ -247,12 +247,13 @@
       <h2 id="words-title">Words to recognise</h2>
     </div>
     <p class="block-help">
-      Names and terms the model should expect. Nothing gets replaced; it just leans toward these spellings when it's
-      unsure.
+      Names and terms the model should expect. In dictation nothing gets replaced; it just leans toward these spellings
+      when it's unsure. After a meeting, words that sound like one of them are checked and corrected. Write
+      “PO = purchase order” to say what an abbreviation stands for.
     </p>
     {#if hintsOff}
       <p class="off status-warn">
-        Hints are switched off, so this list isn't used right now.
+        Hints are switched off for dictation, so it doesn't use this list right now. Meetings still do.
         <button class="link" onclick={() => app.go('settings', 'accuracy')}>Turn them on</button>
       </p>
     {/if}
@@ -265,7 +266,7 @@
         word = '';
       }}
     >
-      <input class="field" placeholder="A name or term, like “Kubernetes”" bind:value={word} aria-label="Word to recognise" />
+      <input class="field" placeholder="Like “Kubernetes” or “PO = purchase order”" bind:value={word} aria-label="Word to recognise" />
       <button class="btn" type="submit" disabled={!word.trim()}>Add</button>
     </form>
 

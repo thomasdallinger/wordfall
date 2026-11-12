@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use tract_onnx::prelude::*;
 
 use crate::fbank::{Fbank, NUM_BINS};
@@ -20,11 +21,17 @@ const WINDOW: usize = 200;
 /// Shorter speech gives unreliable embeddings; those segments take a neighbour's speaker.
 const MIN_SAMPLES: usize = 12_800;
 /// Average cosine similarity above which two groups of segments are the same voice.
-const SAME_VOICE: f32 = 0.55;
+pub const SAME_VOICE: f32 = 0.55;
 /// A first pass merges near-identical segments so the full clustering stays small.
 const PRE_MERGE: f32 = 0.75;
-/// Voices with less speech than this are folded into the closest other voice (coughs, noise).
-const MIN_VOICE_MS: u64 = 4_000;
+/// A voice needs this much speech to stand on its own...
+const MIN_VOICE_MS: u64 = 20_000;
+/// ...or this share of the channel's speech in a long recording...
+const MIN_VOICE_SHARE: u64 = 50; // 1/50 = 2 %
+/// ...but never more than this share in a short one, where 20 s can be a real person's part.
+const SHORT_SHARE: u64 = 10; // 1/10 = 10 %
+/// A voice heard in a single segment isn't one (a laugh, two people at once).
+const MIN_VOICE_SEGMENTS: usize = 2;
 
 /// Downloads the speaker model (30 MB) into `dir` if it isn't there yet.
 pub async fn ensure_model(dir: &Path) -> anyhow::Result<PathBuf> {
@@ -165,18 +172,9 @@ pub fn cluster(items: &[Item]) -> (Vec<usize>, usize) {
         }
         merge(&mut clusters, best.0, best.1);
     }
-    // Pass 3: fold voices with very little speech into the closest one.
-    while clusters.len() > 1 {
-        let Some((small, _)) = clusters.iter().enumerate().filter(|(_, c)| c.ms < MIN_VOICE_MS).min_by_key(|(_, c)| c.ms) else {
-            break;
-        };
-        let target = (0..clusters.len())
-            .filter(|&c| c != small)
-            .max_by(|&a, &b| cosine_sim(&clusters[small].sum, &clusters[a].sum).total_cmp(&cosine_sim(&clusters[small].sum, &clusters[b].sum)))
-            .expect("more than one cluster");
-        let (a, b) = (small.min(target), small.max(target));
-        merge(&mut clusters, a, b);
-    }
+    // Pass 3: voices with little speech are odd segments (laughter, two people at once, someone
+    // far away) rather than people; each of their segments goes to the voice it sounds most like.
+    dissolve_minor(&mut clusters, items);
 
     let mut label: Vec<Option<usize>> = vec![None; items.len()];
     for (c, cl) in clusters.iter().enumerate() {
@@ -211,6 +209,53 @@ pub fn cluster(items: &[Item]) -> (Vec<usize>, usize) {
     (out, order.len())
 }
 
+/// Least speech a voice needs to stay a voice, given the channel's `total` speech.
+fn min_voice_ms(total: u64) -> u64 {
+    (total / MIN_VOICE_SHARE).max(MIN_VOICE_MS.min(total / SHORT_SHARE))
+}
+
+/// Dissolves the clusters with too little speech (the biggest always stays) and moves each of
+/// their segments to the most similar remaining voice, one at a time: an odd cluster often
+/// gathers bits of several people.
+fn dissolve_minor(clusters: &mut Vec<Cluster>, items: &[Item]) {
+    let total: u64 = clusters.iter().map(|c| c.ms).sum();
+    let min_ms = min_voice_ms(total);
+    let Some(biggest) = (0..clusters.len()).max_by_key(|&c| clusters[c].ms) else { return };
+    let keep: Vec<bool> = clusters
+        .iter()
+        .enumerate()
+        .map(|(c, cl)| c == biggest || (cl.ms >= min_ms && cl.members.len() >= MIN_VOICE_SEGMENTS))
+        .collect();
+    let mut kept: Vec<Cluster> = Vec::new();
+    let mut gone: Vec<Cluster> = Vec::new();
+    for (c, cl) in std::mem::take(clusters).into_iter().enumerate() {
+        if keep[c] {
+            kept.push(cl);
+        } else {
+            gone.push(cl);
+        }
+    }
+    // Targets against the voices as they were, so the order of the moves doesn't matter.
+    let moves: Vec<(usize, usize)> = gone
+        .iter()
+        .flat_map(|cl| cl.members.iter().copied())
+        .map(|m| {
+            let e = items[m].embedding.expect("clustered segments have embeddings");
+            let target = (0..kept.len()).max_by(|&a, &b| cosine_sim(&kept[a].sum, e).total_cmp(&cosine_sim(&kept[b].sum, e))).unwrap_or(0);
+            (m, target)
+        })
+        .collect();
+    for (m, t) in moves {
+        let it = &items[m];
+        let ms = it.end_ms.saturating_sub(it.start_ms).max(1);
+        let cl = &mut kept[t];
+        cl.sum.iter_mut().zip(it.embedding.unwrap_or_default()).for_each(|(s, x)| *s += x * ms as f32);
+        cl.members.push(m);
+        cl.ms += ms;
+    }
+    *clusters = kept;
+}
+
 /// Merges cluster `b` into `a` (`a < b`).
 fn merge(clusters: &mut Vec<Cluster>, a: usize, b: usize) {
     let other = clusters.remove(b);
@@ -220,13 +265,90 @@ fn merge(clusters: &mut Vec<Cluster>, a: usize, b: usize) {
     cl.ms += other.ms;
 }
 
-/// Index of the cluster with the most speech (the microphone's owner).
-pub fn dominant(labels: &[usize], items: &[Item], n: usize) -> usize {
-    let mut ms = vec![0u64; n.max(1)];
-    for (l, it) in labels.iter().zip(items) {
-        ms[*l] += it.end_ms.saturating_sub(it.start_ms);
+/// Where the voice print is kept, in the app's data folder.
+pub const VOICE_FILE: &str = "voice.json";
+/// Speech a dictation needs (after silence is cut) before it teaches the voice print.
+pub const PRINT_MIN_SAMPLES: usize = 3 * 16_000;
+/// After this many dictations the print is good; from then on it learns at most...
+const PRINT_SETTLED: u32 = 30;
+/// ...once in this long (seconds), enough to follow a new microphone.
+const PRINT_EVERY_S: u64 = 3_600;
+/// Dictations the running mean remembers at full weight.
+const PRINT_MEMORY: u32 = 100;
+
+/// The user's voice, learnt from their dictations, to find them among a meeting's voices. Only
+/// the average embedding is kept, never audio.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoicePrint {
+    /// Speaker model the embedding comes from; a print from another model means nothing.
+    pub model: String,
+    pub embedding: Vec<f32>,
+    /// Dictations it was learnt from.
+    pub count: u32,
+    /// When it last learnt (Unix seconds).
+    pub updated: u64,
+}
+
+impl VoicePrint {
+    pub fn load(dir: &Path) -> Option<Self> {
+        crate::storage::read_json::<Self>(&dir.join(VOICE_FILE)).filter(|p| p.model == MODEL_FILE && !p.embedding.is_empty())
     }
-    (0..ms.len()).max_by_key(|&c| ms[c]).unwrap_or(0)
+
+    pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
+        crate::storage::write_json(&dir.join(VOICE_FILE), self)
+    }
+
+    /// Whether the next dictation should teach the print (it's cheap, but not free).
+    pub fn wants(print: Option<&Self>, now: u64) -> bool {
+        print.is_none_or(|p| p.count < PRINT_SETTLED || now >= p.updated + PRINT_EVERY_S)
+    }
+
+    /// `print` with one more dictation's embedding averaged in.
+    pub fn learn(print: Option<Self>, embedding: &[f32], now: u64) -> Self {
+        match print.filter(|p| p.embedding.len() == embedding.len()) {
+            Some(p) => {
+                let n = p.count.min(PRINT_MEMORY) as f32;
+                let mean = p.embedding.iter().zip(embedding).map(|(m, x)| (m * n + x) / (n + 1.0)).collect();
+                Self { embedding: mean, count: p.count + 1, updated: now, ..p }
+            }
+            None => Self { model: MODEL_FILE.into(), embedding: embedding.to_vec(), count: 1, updated: now },
+        }
+    }
+}
+
+fn now_s() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Whether a dictation now could teach the voice print in `data_dir`: it wants to learn (see
+/// `VoicePrint::wants`) and the speaker model in `model_dir` is there. Cheap: check it before
+/// finding the dictation's speech.
+pub fn print_wants_voice(data_dir: &Path, model_dir: &Path) -> bool {
+    VoicePrint::wants(VoicePrint::load(data_dir).as_ref(), now_s()) && model_path(model_dir).is_some()
+}
+
+/// Deletes the voice print in `data_dir` (nothing to do if there is none).
+pub fn forget_voice(data_dir: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(data_dir.join(VOICE_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Teaches the voice print in `data_dir` a dictation's `speech` (silence already cut out), if
+/// there's enough of it and the print wants to learn. Returns whether it learnt. Slow-ish (loads
+/// the speaker model): call it after the dictation's text is delivered, off the hot path.
+pub fn learn_voice(data_dir: &Path, model_dir: &Path, speech: &[f32]) -> anyhow::Result<bool> {
+    let now = now_s();
+    let print = VoicePrint::load(data_dir);
+    if speech.len() < PRINT_MIN_SAMPLES || !VoicePrint::wants(print.as_ref(), now) {
+        return Ok(false);
+    }
+    let Some(model) = model_path(model_dir) else { return Ok(false) };
+    let Some(e) = Embedder::load(&model)?.embed(speech)? else { return Ok(false) };
+    VoicePrint::learn(print, &e, now).save(data_dir)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -262,11 +384,114 @@ mod tests {
         let items = vec![
             Item { embedding: Some(&a), start_ms: 0, end_ms: 5000 },
             Item { embedding: None, start_ms: 5200, end_ms: 5600 },
+            Item { embedding: Some(&a), start_ms: 6_000, end_ms: 11_000 },
             Item { embedding: Some(&b), start_ms: 20_000, end_ms: 26_000 },
+            Item { embedding: Some(&b), start_ms: 27_000, end_ms: 33_000 },
         ];
         let (labels, n) = cluster(&items);
         assert_eq!(n, 2);
-        assert_eq!(labels, [0, 0, 1]);
+        assert_eq!(labels, [0, 0, 0, 1, 1]);
+    }
+
+    fn unit(dims: &[(usize, f32)]) -> Vec<f32> {
+        let mut v = vec![0.0; 16];
+        for &(i, x) in dims {
+            v[i] = x;
+        }
+        v
+    }
+
+    #[test]
+    fn voices_with_little_talk_are_dissolved_segment_by_segment() {
+        // Two people talk for minutes; a third "voice" is two odd segments (overlap, laughter)
+        // that sound alike but each leans towards a different real voice.
+        let (a, b) = (unit(&[(0, 1.0)]), unit(&[(1, 1.0)]));
+        let (odd_a, odd_b) = (unit(&[(2, 1.0), (0, 0.5)]), unit(&[(2, 1.0), (1, 0.5)]));
+        let mut embs: Vec<&Vec<f32>> = Vec::new();
+        for i in 0..20 {
+            embs.push(if i % 2 == 0 { &a } else { &b });
+        }
+        embs.insert(7, &odd_a);
+        embs.insert(15, &odd_b);
+        let items: Vec<Item> = embs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| Item { embedding: Some(e), start_ms: i as u64 * 10_000, end_ms: i as u64 * 10_000 + 9_000 })
+            .collect();
+        let (labels, n) = cluster(&items);
+        assert_eq!(n, 2);
+        assert_eq!(labels[7], labels[0], "leans towards the first voice");
+        assert_eq!(labels[15], labels[1], "leans towards the second voice");
+    }
+
+    #[test]
+    fn a_short_recording_keeps_a_second_voice_with_a_fair_share() {
+        // 50 s of talk: 14 s of a second person is little in absolute terms but a real voice.
+        let (a, b) = (voice(0), voice(2));
+        let mut items: Vec<Item> = (0..6).map(|i| Item { embedding: Some(&a), start_ms: i * 7_000, end_ms: i * 7_000 + 6_000 }).collect();
+        items.extend((0..2).map(|i| Item { embedding: Some(&b), start_ms: 50_000 + i * 8_000, end_ms: 50_000 + i * 8_000 + 7_000 }));
+        assert_eq!(cluster(&items).1, 2);
+    }
+
+    #[test]
+    fn min_talk_grows_with_the_recording() {
+        assert_eq!(min_voice_ms(30_000), 3_000);
+        assert_eq!(min_voice_ms(600_000), 20_000);
+        assert_eq!(min_voice_ms(3_000_000), 60_000);
+    }
+
+    #[test]
+    fn voice_print_is_a_running_mean_of_dictations() {
+        let p = VoicePrint::learn(None, &[1.0, 0.0], 100);
+        assert_eq!((p.count, p.updated), (1, 100));
+        let p = VoicePrint::learn(Some(p), &[0.0, 1.0], 200);
+        assert_eq!(p.count, 2);
+        assert!((p.embedding[0] - 0.5).abs() < 1e-6 && (p.embedding[1] - 0.5).abs() < 1e-6);
+        // A print of another size (another model) starts over.
+        let p = VoicePrint::learn(Some(p), &[0.0, 0.0, 1.0], 300);
+        assert_eq!((p.count, p.embedding.len()), (1, 3));
+    }
+
+    #[test]
+    fn voice_print_learns_less_often_once_settled() {
+        assert!(VoicePrint::wants(None, 0));
+        let mut p = VoicePrint::learn(None, &[1.0], 1_000);
+        assert!(VoicePrint::wants(Some(&p), 1_001));
+        p.count = PRINT_SETTLED;
+        assert!(!VoicePrint::wants(Some(&p), 1_001));
+        assert!(VoicePrint::wants(Some(&p), 1_000 + PRINT_EVERY_S));
+    }
+
+    #[test]
+    fn voice_print_of_another_model_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("wordfall-voice-{}", std::process::id()));
+        let mut p = VoicePrint::learn(None, &[0.6, 0.8], 1);
+        p.save(&dir).unwrap();
+        assert_eq!(VoicePrint::load(&dir).map(|p| p.count), Some(1));
+        p.model = "other.onnx".into();
+        p.save(&dir).unwrap();
+        assert!(VoicePrint::load(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_settled_print_or_no_speaker_model_wants_no_voice() {
+        let dir = std::env::temp_dir().join(format!("wordfall-voice-wants-{}", std::process::id()));
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        assert!(!print_wants_voice(&dir, &models), "no speaker model: nothing to learn with");
+        // A model file of the right size counts as downloaded.
+        std::fs::File::create(models.join(MODEL_FILE)).unwrap().set_len(MODEL_BYTES).unwrap();
+        assert!(print_wants_voice(&dir, &models), "no print yet");
+        let mut p = VoicePrint::learn(None, &[0.6, 0.8], now_s());
+        p.count = PRINT_SETTLED;
+        p.save(&dir).unwrap();
+        assert!(!print_wants_voice(&dir, &models), "settled and learnt just now");
+        forget_voice(&dir).unwrap();
+        assert!(!dir.join(VOICE_FILE).exists());
+        forget_voice(&dir).unwrap();
+        assert!(print_wants_voice(&dir, &models), "forgotten: learns again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

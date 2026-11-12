@@ -3,7 +3,7 @@
 // download and permission flows so every screen can be exercised.
 //
 // URL flags (dev only): ?perm=missing  ?mic=denied  ?fn=bad  ?onboarding=1  ?model=loading  ?ptt=unavailable  ?empty=1
-//                       ?platform=windows (see platform.ts)
+//                       ?platform=windows (see platform.ts)  ?screen=on (read shared screens)  ?screenperm=missing
 import { PRODUCT } from './brand';
 import { IS_WINDOWS } from './platform';
 import type {
@@ -19,9 +19,12 @@ import type {
   QuestionKind,
   QuestionStatus,
   MeetingItem,
+  MeetingScreen,
   MeetingSegment,
+  MeetingVisual,
   ModelInfo,
   Permissions,
+  ScreenWindow,
   Settings,
   Snapshot,
   Stats,
@@ -83,12 +86,16 @@ const settings: Settings = {
   meetingMaxMinutes: 180,
   meetingSystemAudio: true,
   meetingSpeakers: true,
+  meetingVoicePrint: true,
+  meetingTermCheck: true,
   summaryModel: 'qwen3-4b-instruct-2507',
   meetingAudioDays: 14,
   meetingLiveHelp: true,
   meetingQuestions: true,
   meetingQuestionsWindow: true,
   meetingMap: true,
+  meetingScreen: params.get('screen') === 'on',
+  meetingPhotoWatch: true,
 };
 
 const missing = params.get('perm') === 'missing';
@@ -96,6 +103,7 @@ const permissions: Permissions = {
   microphone: params.get('mic') === 'denied' ? 'denied' : 'granted',
   accessibility: !missing,
   inputMonitoring: !missing,
+  screen: !missing && params.get('screenperm') !== 'missing',
 };
 
 let fnUsage = params.get('fn') === 'bad'
@@ -225,7 +233,7 @@ let suggestions: Suggestion[] = empty ? [] : [
 ];
 
 // Hint-only words and project folder names (vocabulary hints).
-let vocabulary: string[] = empty ? [] : ['Kubernetes', 'WebSocket', 'OAuth'];
+let vocabulary: string[] = empty ? [] : ['Kubernetes', 'WebSocket', 'OAuth', 'PO = purchase order'];
 const projects = ['notes-app', 'design-tokens', 'sync-worker', 'photo-tagger', 'invoice-cli'];
 
 const BUILTIN_PROMPTS: [string, LabPrompt['category'], string, string[]?][] = [
@@ -506,9 +514,11 @@ const sampleSegments: MeetingSegment[] = [
   [7_300, 'system', 1, 'Morning. The design is finished, but we are still waiting for the legal review of the pricing text.'],
   [16_000, 'system', 2, 'I talked to legal yesterday. They promised feedback by Thursday.'],
   [22_900, 'mic', 0, 'Good. Then we keep the release date of November 20th. Anna, can you prepare the migration script?'],
-  [31_700, 'system', 1, 'Yes, I will write the migration script this week. It needs about two days, including tests.'],
+  [31_700, 'system', 1, 'Yes, I will write the migration script this week. It needs about two days, including tests. The POs go out after that.'],
 ].map(([startMs, channel, speaker, text]) => ({
   startMs: startMs as number, endMs: (startMs as number) + 6000, channel: channel as 'mic' | 'system', speaker: speaker as number, text: text as string,
+  // The term check fixed a misheard abbreviation here (the user's "PO = purchase order").
+  ...((startMs as number) === 31_700 ? { fixes: [{ heard: 'Peon’s', written: 'POs', at: (text as string).indexOf('POs') }] } : {}),
 }));
 
 /** The sample meeting's system map as it grows, one step per run of the model. */
@@ -539,6 +549,15 @@ const MAP_STEPS: ((m: SystemMap) => void)[] = [
   },
 ];
 
+/** Names each step hears but doesn't draw (hidden candidates in the app), listed as "Also mentioned". */
+const MAP_MENTIONED: string[][] = [['Pricing CMS'], ['Stripe dashboard', 'Zendesk'], ['Old CRM'], ['Status page', 'Help centre']];
+/** Map steps applied so far per meeting (the sample meeting has them all). */
+const mapStepsDone = new Map<string, number>([['m-sample', MAP_STEPS.length]]);
+
+function alsoMentioned(m: Meeting): string[] {
+  return MAP_MENTIONED.slice(0, mapStepsDone.get(m.id) ?? 0).flat().reverse().slice(0, 12);
+}
+
 function sampleMap(steps: number): SystemMap {
   const m: SystemMap = { nodes: [], edges: [], open: [] };
   for (const step of MAP_STEPS.slice(0, steps)) step(m);
@@ -553,11 +572,17 @@ const meetings: Meeting[] = params.get('empty') === '1' ? [] : [{
   speakers: [{ id: 0, name: 'Me', renamed: false }, { id: 1, name: 'Anna', renamed: true }, { id: 2, name: 'Speaker 2', renamed: false }],
   summary: SAMPLE_SUMMARY, summaryModel: 'qwen3-4b-instruct-2507', language: 'en', error: null,
   systemAudio: true, stoppedByLimit: false, hasAudio: true,
+  visuals: [
+    { id: 1, atMs: 200_000, untilMs: 330_000, source: 'screen', label: 'zoom.us: Zoom Meeting',
+      text: 'Billing page launch\nItem | Owner | Due\nMigration script | Speaker 2 | Thu 14 Nov\nPricing text review | Legal | Thu 14 Nov\nRelease | Anna | Mon 18 Nov' },
+    { id: 2, atMs: 725_000, source: 'photo', label: 'IMG_2041.HEIC',
+      text: 'Whiteboard\nRollback plan: keep old prices 30 days\nTrial users: no change until renewal' },
+  ],
 }];
 let activeMeeting: Snapshot['meeting'] = null;
 
 function emitMap(m: Meeting) {
-  emit('meeting-map', { id: m.id, map: clone(m.systemMap), status: questionStatus });
+  emit('meeting-map', { id: m.id, map: clone(m.systemMap), status: questionStatus, alsoMentioned: alsoMentioned(m) });
 }
 let meetingTimer: ReturnType<typeof setInterval> | null = null;
 let questionStatus: QuestionStatus = 'off';
@@ -594,7 +619,7 @@ function startMeeting(): string {
     id: `m-${Date.now()}`, title: '', titleFromUser: false, startedAt: new Date().toISOString(), endedAt: null, durationMs: 0,
     status: 'recording', notes: '', goal: '', questions: [], segments: [], speakers: [{ id: 0, name: 'Me', renamed: false }], summary: null,
     systemMap: { nodes: [], edges: [], open: [] },
-    summaryModel: null, language: 'en', error: null, systemAudio: true, stoppedByLimit: false, hasAudio: true,
+    summaryModel: null, language: 'en', error: null, systemAudio: true, stoppedByLimit: false, hasAudio: true, visuals: [],
   };
   meetings.unshift(m);
   activeMeeting = { id: m.id, startedAt: m.startedAt, stopsAt: new Date(Date.now() + settings.meetingMaxMinutes * 60_000).toISOString() };
@@ -614,6 +639,7 @@ function startMeeting(): string {
     if (settings.meetingMap) {
       mapSteps = MAP_STEPS.length - 1;
       m.systemMap = sampleMap(mapSteps);
+      mapStepsDone.set(m.id, mapSteps);
     }
   }
   let i = 0;
@@ -627,7 +653,10 @@ function startMeeting(): string {
     }
     if (live && i % 50 === 35) {
       questionStatus = 'listening';
-      if (settings.meetingMap && mapSteps < MAP_STEPS.length) MAP_STEPS[mapSteps++](m.systemMap);
+      if (settings.meetingMap && mapSteps < MAP_STEPS.length) {
+        MAP_STEPS[mapSteps++](m.systemMap);
+        mapStepsDone.set(m.id, mapSteps);
+      }
       if (settings.meetingQuestions) proposeQuestion(m);
       emitQuestions(m);
       emitMap(m);
@@ -655,10 +684,20 @@ async function stopMeeting() {
   m.status = 'processing';
   emit('meeting-state', { active: null });
   emit('meeting-changed', { id: m.id });
+  screenState = { status: 'off', window: null };
+  emit('meeting-screen', { id: m.id, ...screenState });
+  for (let f = 0; f <= 1; f += 0.125) {
+    emit('meeting-progress', { id: m.id, phase: 'improving', fraction: f, text: null });
+    await sleep(params.get('slow') === '1' ? 1500 : 250);
+  }
   emit('meeting-progress', { id: m.id, phase: 'speakers', fraction: null, text: null });
   await sleep(1200);
   m.status = 'summarizing';
   emit('meeting-changed', { id: m.id });
+  for (let f = 0; f <= 1; f += 0.25) {
+    emit('meeting-progress', { id: m.id, phase: 'checking', fraction: f, text: null });
+    await sleep(params.get('slow') === '1' ? 1500 : 200);
+  }
   for (let f = 0; f <= 1; f += 0.1) {
     await sleep(200);
     emit('meeting-progress', { id: m.id, phase: 'reading', fraction: f, text: null });
@@ -672,6 +711,74 @@ async function stopMeeting() {
   m.status = 'done';
   emit('meeting-changed', { id: m.id });
   emit('meetings-changed', null);
+}
+
+// ---------------------------------------------------------------- what was shown
+
+/** What the mock "reads" in an image, by its name. */
+function mockText(name: string): string {
+  if (/whiteboard|board/i.test(name)) return 'Whiteboard\nRollback plan: keep old prices 30 days\nTrial users: no change until renewal';
+  if (/paste/i.test(name)) return 'Pricing\nPlan | Monthly | Yearly\nStarter | 9 € | 90 €\nTeam | 29 € | 290 €';
+  return 'Meier Hydraulik GmbH • Industriestraße 12 • 4600 Wels\nPackliste PL-0388\nEmpfänger: Steiner Landtechnik KG | Datum: 05.11.2026\nPos | Artikel | Menge | Karton | Gewicht\n1 | Hydraulikschlauch DN12, 2 m | 40 Stk | 1 | 12 kg\n2 | Kupplungsstecker BG3 | 120 Stk | 2 | 6 kg\n3 | Druckfilter 25 um | 12 Stk | 3 | 9 kg\nBitte melden Sie Fehlmengen innerhalb von drei Tagen.';
+}
+
+/** A stand-in picture: a page with the first rows of its text. */
+function mockPicture(v: MeetingVisual): string {
+  const rows = v.text.split('\n').slice(0, 7);
+  const esc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const dark = v.source === 'screen';
+  const lines = rows
+    .map((r, i) => `<text x="16" y="${30 + i * 18}" font-family="Helvetica" font-size="${i === 0 ? 13 : 9}" font-weight="${i === 0 ? 700 : 400}" fill="${dark ? '#eee' : '#222'}">${esc(r).slice(0, 48)}</text>`)
+    .join('');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="288" height="180"><rect width="288" height="180" fill="${dark ? '#2b2d31' : '#fdfdfb'}"/>${lines}</svg>`;
+  return `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`;
+}
+
+const SCREEN_SOURCES: ScreenWindow[] = [
+  { windowId: 101, app: 'zoom.us', title: 'Zoom Meeting' },
+  { windowId: 102, app: 'Microsoft Teams', title: 'Weekly sync | Microsoft Teams' },
+  { windowId: 103, app: 'Google Chrome', title: 'Q4 billing plan - Google Slides' },
+  { windowId: 104, app: 'Preview', title: 'PL-0388.pdf' },
+];
+let screenState: MeetingScreen = { status: 'off', window: null };
+let screenTimer: ReturnType<typeof setTimeout> | null = null;
+
+function meetingOf(id: string): Meeting {
+  const m = meetings.find((x) => x.id === id);
+  if (!m) throw new Error('That meeting no longer exists.');
+  return m;
+}
+
+function nowMs(m: Meeting) {
+  return m.status === 'recording' ? Date.now() - Date.parse(m.startedAt) : m.durationMs;
+}
+
+function addVisual(m: Meeting, v: Omit<MeetingVisual, 'id'>): MeetingVisual {
+  const visual = { ...v, id: Math.max(0, ...m.visuals.map((x) => x.id)) + 1 };
+  m.visuals.push(visual);
+  emit('meeting-visuals', { id: m.id, visuals: clone(m.visuals) });
+  return visual;
+}
+
+function setScreen(id: string, windowId: number | null, paused: boolean): MeetingScreen {
+  const m = meetingOf(id);
+  if (m.status !== 'recording') throw new Error('Screens are read only while the meeting records.');
+  const window = windowId === null ? null : SCREEN_SOURCES.find((w) => w.windowId === windowId) ?? null;
+  if (windowId !== null && !window) throw new Error('That window is gone. Pick another.');
+  screenState = {
+    window,
+    status: !window ? 'choose' : !permissions.screen ? 'needs-permission' : paused ? 'paused' : 'reading',
+  };
+  emit('meeting-screen', { id, ...screenState });
+  if (screenTimer) clearTimeout(screenTimer);
+  if (screenState.status === 'reading' && window) {
+    // The first read a moment after picking: a new slide is kept.
+    screenTimer = setTimeout(() => {
+      addVisual(m, { atMs: nowMs(m), untilMs: nowMs(m), source: 'screen', label: `${window.app}: ${window.title}`,
+        text: 'Q4 billing plan\nMilestone | Owner | Date\nPricing page live | Anna | 18 Nov\nOld prices end | Finance | 31 Dec' });
+    }, 1500);
+  }
+  return clone(screenState);
 }
 
 // `?meeting=live`: open on a meeting that is being recorded (for the Questions window).
@@ -844,7 +951,7 @@ export async function mockInvoke(cmd: string, a: Args): Promise<unknown> {
     case 'meeting_map': {
       const m = meetings.find((x) => x.id === a.id);
       if (!m) throw new Error('That meeting no longer exists.');
-      return { map: clone(m.systemMap), status: m.status === 'recording' ? questionStatus : 'off' };
+      return { map: clone(m.systemMap), status: m.status === 'recording' ? questionStatus : 'off', alsoMentioned: alsoMentioned(m) };
     }
     case 'rename_map_node': {
       const m = meetings.find((x) => x.id === a.id)!;
@@ -896,6 +1003,45 @@ export async function mockInvoke(cmd: string, a: Args): Promise<unknown> {
       void stopMeeting();
       return;
     }
+    case 'add_meeting_image': {
+      const m = meetingOf(a.id);
+      await sleep(500);
+      const name = String(a.path).split('/').pop() ?? 'image.jpg';
+      return addVisual(m, { atMs: Math.min(a.atMs ?? nowMs(m), nowMs(m)), source: 'photo', label: name, text: mockText(name) });
+    }
+    case 'paste_meeting_image': {
+      const m = meetingOf(a.id);
+      await sleep(400);
+      return [addVisual(m, { atMs: nowMs(m), source: 'photo', label: 'Pasted image.png', text: mockText('paste') })];
+    }
+    case 'delete_meeting_visual': {
+      const m = meetingOf(a.id);
+      if (!m.visuals.some((v) => v.id === a.visual)) throw new Error('That picture is gone.');
+      m.visuals = m.visuals.filter((v) => v.id !== a.visual);
+      emit('meeting-visuals', { id: m.id, visuals: clone(m.visuals) });
+      return;
+    }
+    case 'move_meeting_visual': {
+      const m = meetingOf(a.id);
+      const v = m.visuals.find((x) => x.id === a.visual);
+      if (!v) throw new Error('That picture is gone.');
+      v.atMs = Math.min(a.atMs, nowMs(m));
+      emit('meeting-visuals', { id: m.id, visuals: clone(m.visuals) });
+      return;
+    }
+    case 'meeting_visual_image': {
+      const v = meetingOf(a.id).visuals.find((x) => x.id === a.visual);
+      return v ? mockPicture(v) : null;
+    }
+    case 'open_meeting_visual': return;
+    case 'meeting_screen': {
+      const m = meetingOf(a.id);
+      if (m.status !== 'recording' || !settings.meetingScreen) return { status: 'off', window: null };
+      return clone(screenState.status === 'off' ? { status: 'choose', window: null } : screenState);
+    }
+    case 'meeting_screen_sources': return clone(SCREEN_SOURCES);
+    case 'set_meeting_screen': return setScreen(a.id, a.windowId ?? null, !!a.paused);
+    case 'forget_voice_print': return;
     case 'meeting_folder': return `/Users/you/Library/Application Support/com.wordfall.app/meetings/${a.id}`;
     case 'list_summary_models': return clone(summaryModels);
     case 'download_summary_model': {
@@ -937,7 +1083,7 @@ export async function mockInvoke(cmd: string, a: Args): Promise<unknown> {
     case 'request_permission':
       setTimeout(() => {
         if (a.kind === 'microphone') permissions.microphone = 'granted';
-        else permissions[a.kind as 'accessibility' | 'inputMonitoring'] = true;
+        else permissions[a.kind as 'accessibility' | 'inputMonitoring' | 'screen'] = true;
         emit('permissions-changed', clone(permissions));
       }, 1200);
       return;
@@ -964,6 +1110,12 @@ export async function mockInvoke(cmd: string, a: Args): Promise<unknown> {
 }
 
 /** Browser stand-in for the native folder picker. */
+/** Browser stand-in for the native image picker. */
+export async function mockPickImages(): Promise<string[]> {
+  await sleep(150);
+  return ['/Users/you/Downloads/PL-0388.jpg'];
+}
+
 export async function mockPickFolder(): Promise<string | null> {
   await sleep(150);
   return '/Users/you/Documents/dictation-backup';
@@ -977,6 +1129,11 @@ if (typeof window !== 'undefined') {
     permissions,
     labClips,
     clearLatestReport: () => (latestReport = null),
+    /** As if a photo arrived in Downloads by AirDrop while the meeting records. */
+    offerPhoto: (name = 'IMG_2041.HEIC') => {
+      const m = meetings.find((x) => x.id === activeMeeting?.id) ?? meetings[0];
+      emit('meeting-photo-offer', { id: m.id, path: `/Users/you/Downloads/${name}`, name });
+    },
     get activeMeeting() {
       return activeMeeting;
     },

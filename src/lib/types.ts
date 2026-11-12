@@ -43,6 +43,10 @@ export interface Settings {
   meetingSystemAudio: boolean;
   /** Tell speakers apart in meeting transcripts. */
   meetingSpeakers: boolean;
+  /** Learn the user's voice from dictations (a voice fingerprint in `voice.json`, no audio) to label them Me in meetings. */
+  meetingVoicePrint: boolean;
+  /** After a meeting, fix words that sound like a term of the user's vocabulary or of what was shown, where the summary model agrees. */
+  meetingTermCheck: boolean;
   /** Language model that writes meeting notes. */
   summaryModel: string;
   /** Meeting recordings are deleted after this many days (0 = kept). */
@@ -55,6 +59,10 @@ export interface Settings {
   meetingQuestionsWindow: boolean;
   /** Build a map of the systems and people that come up while a meeting is recorded. */
   meetingMap: boolean;
+  /** While a meeting records, read the text of one window the user picks (a shared screen; macOS). */
+  meetingScreen: boolean;
+  /** Offer images that arrive in Downloads (AirDrop) while a meeting records and 30 minutes after. */
+  meetingPhotoWatch: boolean;
 }
 
 export type MeetingStatus = 'recording' | 'processing' | 'summarizing' | 'done';
@@ -67,6 +75,15 @@ export interface MeetingSegment {
   speaker: number;
   text: string;
   language?: string;
+  /** Misheard terms the term check replaced in `text`, with what was heard (absent when none). */
+  fixes?: TermFix[];
+}
+
+export interface TermFix {
+  heard: string;
+  written: string;
+  /** Where `written` starts in the segment's text (UTF-16 units); absent in meetings checked before it was kept. */
+  at?: number;
 }
 
 export interface MeetingSpeaker {
@@ -94,6 +111,8 @@ export interface Meeting {
   systemMap: SystemMap;
   segments: MeetingSegment[];
   speakers: MeetingSpeaker[];
+  /** What was shown: text read from a shared screen or a photo. */
+  visuals: MeetingVisual[];
   /** Markdown notes written by the language model. */
   summary: string | null;
   summaryModel: string | null;
@@ -103,6 +122,47 @@ export interface Meeting {
   systemAudio: boolean;
   stoppedByLimit: boolean;
   hasAudio: boolean;
+}
+
+/** screen: read from the picked window while recording; photo: an image the user added. */
+export type VisualSource = 'screen' | 'photo';
+
+export interface MeetingVisual {
+  /** 1, 2, … within the meeting. */
+  id: number;
+  /** Meeting time it was first seen, or where the photo was placed. */
+  atMs: number;
+  /** Meeting time a screen was last seen unchanged. */
+  untilMs?: number;
+  source: VisualSource;
+  /** The window ("zoom.us: Zoom Meeting") or the file name. */
+  label: string;
+  /** What was read, a line per row; table cells joined with " | ". */
+  text: string;
+  /** The picture under the meeting's folder; gone once the recordings are deleted. */
+  image?: string;
+}
+
+/** A window that could show a shared screen. `title` is empty without Screen Recording permission. */
+export interface ScreenWindow {
+  windowId: number;
+  app: string;
+  title: string;
+}
+
+/** off: setting off or not recording; choose: no window picked; needs-permission: macOS only hands out wallpaper. */
+export type ScreenStatus = 'off' | 'choose' | 'reading' | 'paused' | 'needs-permission' | 'source-lost';
+
+export interface MeetingScreen {
+  status: ScreenStatus;
+  window: ScreenWindow | null;
+}
+
+/** An image that arrived in Downloads while the meeting records (or soon after); never added without asking. */
+export interface PhotoOffer {
+  id: string;
+  path: string;
+  name: string;
 }
 
 export interface MeetingItem {
@@ -186,14 +246,18 @@ export interface SystemMap {
 export interface MeetingMap {
   map: SystemMap;
   status: QuestionStatus;
+  /** Names said but not (yet) on the map, the latest first (at most 12): listed under the live map. */
+  alsoMentioned: string[];
 }
 
-export type MeetingPhase = 'transcribing' | 'speakers' | 'loading' | 'reading' | 'writing';
+/** improving: the final pass over the whole recording after Stop (minutes on long meetings; has a fraction).
+ *  checking: the summary model checks words that sound like the user's terms (has a fraction). */
+export type MeetingPhase = 'transcribing' | 'improving' | 'speakers' | 'loading' | 'checking' | 'reading' | 'writing';
 
 export interface MeetingProgress {
   id: string;
   phase: MeetingPhase;
-  /** 0..1 while reading the transcript. */
+  /** 0..1 while improving, checking terms or reading the transcript. */
   fraction: number | null;
   /** The notes so far while writing. */
   text: string | null;
@@ -273,12 +337,17 @@ export interface ModelInfo {
 
 export type ModelState = 'unloaded' | 'loading' | 'ready' | 'error';
 export type MicPermission = 'granted' | 'denied' | 'undetermined';
-export type PermissionKind = 'microphone' | 'accessibility' | 'inputMonitoring';
+/** What dictation needs; the attention line and onboarding ask for these. */
+export type DictationPermission = 'microphone' | 'accessibility' | 'inputMonitoring';
+/** `screen` (Screen Recording) is only asked for when the user turns on reading shared screens. */
+export type PermissionKind = DictationPermission | 'screen';
 
 export interface Permissions {
   microphone: MicPermission;
   accessibility: boolean;
   inputMonitoring: boolean;
+  /** Screen Recording (macOS), only needed to read shared screens; always false on Windows. */
+  screen: boolean;
 }
 
 export interface AudioDevice {
@@ -376,6 +445,9 @@ export interface EventMap {
   'meeting-progress': MeetingProgress;
   'meeting-questions': { id: string } & MeetingQuestions;
   'meeting-map': { id: string } & MeetingMap;
+  'meeting-visuals': { id: string; visuals: MeetingVisual[] };
+  'meeting-screen': { id: string } & MeetingScreen;
+  'meeting-photo-offer': PhotoOffer;
   'meeting-levels': { mic?: number; system?: number };
   'meetings-changed': null;
   'summary-models-changed': null;

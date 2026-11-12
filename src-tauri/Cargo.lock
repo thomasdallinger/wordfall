@@ -6404,6 +6404,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "block2",
  "chrono",
  "core-foundation",
@@ -6411,6 +6412,7 @@ dependencies = [
  "cpal",
  "dirs 6.0.0",
  "futures-util",
+ "image",
  "libc",
  "llama-cpp-2",
  "llama-cpp-sys-2",

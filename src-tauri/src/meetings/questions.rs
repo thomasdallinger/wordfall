@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use super::{Segment, Speaker};
+use super::{visuals, Segment, Speaker, Visual};
 use crate::llm;
 
 /// Open questions shown at a time.
@@ -194,17 +194,21 @@ pub struct Input<'a> {
     pub language: Option<&'a str>,
     pub segments: &'a [Segment],
     pub speakers: &'a [Speaker],
+    /// What was shown (screens, photos); merged into the transcript by time.
+    pub visuals: &'a [Visual],
     pub questions: &'a [Question],
     /// What the system map still doesn't know ("Name: what"); questions go after it first.
     pub unknowns: &'a [String],
     pub now_ms: u64,
 }
 
-/// "[mm:ss] Speaker: text" lines of the last minutes of the talk.
+/// "[mm:ss] Speaker: text" lines of the last minutes of the talk, with what was on screen then
+/// ("[mm:ss] Screen: …", "[mm:ss] Photo: …").
 fn recent_lines(input: &Input) -> String {
     let from = input.now_ms.saturating_sub(RECENT_MS);
     let recent: Vec<Segment> = input.segments.iter().filter(|s| s.end_ms >= from).cloned().collect();
-    let lines = super::pipeline::transcript_lines(&recent, input.speakers).join("\n");
+    let shown = visuals::since(input.visuals, from);
+    let lines = super::pipeline::timeline_lines(&recent, input.speakers, &shown, visuals::QUESTIONS).join("\n");
     match lines.char_indices().rev().nth(RECENT_CHARS) {
         // Too long: keep the end, from the start of a line.
         Some((cut, _)) => lines[cut..].split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default(),
@@ -217,14 +221,15 @@ pub fn room(questions: &[Question]) -> usize {
     MAX_LIVE.saturating_sub(live_count(questions)).min(MAX_NEW_PER_RUN)
 }
 
-fn system_prompt(language: &str, goal: bool) -> String {
+fn system_prompt(language: &str, goal: bool, shown: bool) -> String {
     let aim = if goal { "and move the meeting towards its goal" } else { "and move the meeting forward" };
+    let shown = if shown { llm::SHOWN } else { "" };
     format!(
         "You listen to a meeting together with \"Me\", the person who recorded it, and suggest questions Me could \
          ask next. A good question is short (at most 20 words), specific to what was just said, {aim}. Never \
          suggest a question the transcript already answers, or one Me already asked. The transcript comes from \
-         speech recognition and has mistakes. Write the questions in {language}, addressed to the others in the \
-         meeting."
+         speech recognition and has mistakes.{shown} Write the questions in {language}, addressed to the others in \
+         the meeting."
     )
 }
 
@@ -373,7 +378,7 @@ pub fn run(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Out
     let room = room(input.questions);
     let open: Vec<u32> = input.questions.iter().filter(|q| q.state.is_open()).map(|q| q.number).collect();
     let language = llm::language_name(input.language);
-    let system = system_prompt(language, !input.goal.trim().is_empty());
+    let system = system_prompt(language, !input.goal.trim().is_empty(), visuals::any_shown(&transcript.lines().map(str::to_string).collect::<Vec<_>>()));
     let grammar = grammar(&open, room);
     let answer = worker.chat_at(&system, &user_prompt(input, &transcript, room), ANSWER_TOKENS, Some(&grammar), None, Some("questions"), |_| {})?;
     let parsed = parse(&answer);
@@ -439,12 +444,13 @@ mod tests {
             speaker: 1,
             text: text.into(),
             language: None,
+            fixes: Vec::new(),
         };
         let mut right = seg(68_000, "Right.");
         right.speaker = 0;
         let segments = vec![seg(10_000, "The launch is on the first of March."), right, seg(70_000, "Anna will do the onboarding, yes.")];
         let questions = vec![q(1, "When is the launch?", State::Live, 60_000), q(2, "Who does the onboarding?", State::Live, 60_000)];
-        let input = Input { goal: "", notes: "", language: None, segments: &segments, speakers: &[], questions: &questions, unknowns: &[], now_ms: 80_000 };
+        let input = Input { goal: "", notes: "", language: None, segments: &segments, speakers: &[], visuals: &[], questions: &questions, unknowns: &[], now_ms: 80_000 };
         let claimed = vec![
             (1, "the first of March".to_string()),                   // said, but before the question
             (2, "Anna will do the onboarding".to_string()),          // said after it
@@ -453,6 +459,28 @@ mod tests {
             (1, "first of March. Anna will do the".to_string()),     // runs into talk after it, over "Right." in between
         ];
         assert_eq!(verified(&claimed, &input), vec![2, 1]);
+    }
+
+    #[test]
+    fn recent_lines_show_what_is_on_screen() {
+        use super::super::visuals::Source;
+        let seg = |start_ms: u64, text: &str| Segment { start_ms, end_ms: start_ms + 3000, channel: super::super::Channel::System, speaker: 1, text: text.into(), language: None, fixes: Vec::new() };
+        let segments = vec![seg(100_000, "Ganz am Anfang."), seg(690_000, "Die Peckl Isten fehlen noch.")];
+        let shown = |id: u32, at_s: u64, until_s: Option<u64>, text: &str| Visual {
+            id,
+            at_ms: at_s * 1000,
+            until_ms: until_s.map(|u| u * 1000),
+            source: Source::Screen,
+            label: String::new(),
+            text: text.into(),
+            image: None,
+        };
+        // An old slide, and one shown since before the last minutes and still on screen.
+        let visuals = vec![shown(1, 50, Some(90), "Agenda"), shown(2, 230, Some(710), "Packlisten PL-0388")];
+        let input = Input { goal: "", notes: "", language: None, segments: &segments, speakers: &[], visuals: &visuals, questions: &[], unknowns: &[], now_ms: 720_000 };
+        assert_eq!(recent_lines(&input), "[03:50] Screen: Packlisten PL-0388\n[11:30] Speaker 1: Die Peckl Isten fehlen noch.");
+        assert!(system_prompt("German", false, true).contains("\"Screen:\""));
+        assert!(!system_prompt("German", false, false).contains("\"Screen:\""));
     }
 
     #[test]

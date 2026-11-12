@@ -500,6 +500,8 @@ pub enum PermissionKind {
     Microphone,
     Accessibility,
     InputMonitoring,
+    /// Screen Recording, for reading a meeting's shared screen (macOS).
+    Screen,
 }
 
 #[tauri::command]
@@ -508,6 +510,7 @@ pub fn request_permission(kind: PermissionKind) {
         PermissionKind::Microphone => platform::request_microphone(),
         PermissionKind::Accessibility => platform::request_accessibility(),
         PermissionKind::InputMonitoring => platform::request_input_monitoring(),
+        PermissionKind::Screen => platform::request_screen_permission(),
     }
 }
 
@@ -694,15 +697,85 @@ pub fn delete_meeting(app: AppHandle, id: String) -> CmdResult<()> {
     meetings::delete(&app, &id).map_err(err)
 }
 
+/// Deletes the voice print learnt from dictations (`voice.json`); it learns again from the next
+/// dictations while "Learn my voice from dictation" is on.
+#[tauri::command]
+pub fn forget_voice_print(core: State<'_, Core>) -> CmdResult<()> {
+    crate::speakers::forget_voice(&core.dir).map_err(err)?;
+    log::info!("voice print forgotten");
+    Ok(())
+}
+
 #[tauri::command]
 pub fn summarize_meeting(app: AppHandle, id: String) -> CmdResult<()> {
     meetings::summarize(&app, &id).map_err(|e| format!("{e:#}"))
 }
 
+// ---------- what was shown in a meeting ----------
+
+/// Reads an image file (dropped, picked or offered from Downloads) and adds it to a meeting.
+/// `offered`: an image offered from Downloads, which must still be there.
+#[tauri::command]
+pub async fn add_meeting_image(app: AppHandle, id: String, path: String, at_ms: Option<u64>, offered: Option<bool>) -> CmdResult<meetings::Visual> {
+    tauri::async_runtime::spawn_blocking(move || {
+        meetings::add_image(&app, &id, std::path::Path::new(&path), at_ms, offered.unwrap_or(false)).map_err(|e| format!("{e:#}"))
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Adds the image (or image files) on the clipboard to a meeting.
+#[tauri::command]
+pub async fn paste_meeting_image(app: AppHandle, id: String) -> CmdResult<Vec<meetings::Visual>> {
+    tauri::async_runtime::spawn_blocking(move || meetings::paste_image(&app, &id).map_err(|e| format!("{e:#}"))).await.map_err(err)?
+}
+
+#[tauri::command]
+pub fn delete_meeting_visual(app: AppHandle, id: String, visual: u32) -> CmdResult<()> {
+    meetings::delete_visual(&app, &id, visual).map_err(err)
+}
+
+/// Places a visual at another meeting time.
+#[tauri::command]
+pub fn move_meeting_visual(app: AppHandle, id: String, visual: u32, at_ms: u64) -> CmdResult<()> {
+    meetings::move_visual(&app, &id, visual, at_ms).map_err(err)
+}
+
+/// A visual's picture as a data URL (its thumbnail unless `full`); null once it's deleted.
+#[tauri::command]
+pub async fn meeting_visual_image(app: AppHandle, id: String, visual: u32, full: Option<bool>) -> CmdResult<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || meetings::image_data(&app, &id, visual, full.unwrap_or(false)).map_err(err)).await.map_err(err)?
+}
+
+/// Opens a visual's picture in the system's viewer.
+#[tauri::command]
+pub fn open_meeting_visual(app: AppHandle, id: String, visual: u32) -> CmdResult<()> {
+    let path = meetings::image_path(&app, &id, visual).map_err(err)?.ok_or("The picture was deleted with the recordings.")?;
+    platform::open_path(&path).map_err(err)
+}
+
+/// Screen reading of a meeting (updates: `meeting-screen`).
+#[tauri::command]
+pub fn meeting_screen(app: AppHandle, id: String) -> meetings::ScreenState {
+    meetings::screen_of(&app, &id)
+}
+
+/// Windows that could show a shared screen, meeting apps first.
+#[tauri::command]
+pub fn meeting_screen_sources() -> Vec<platform::ScreenWindow> {
+    meetings::screen_sources()
+}
+
+/// Picks the window whose text is read while the meeting records (`windowId` null: none), or pauses it.
+#[tauri::command]
+pub fn set_meeting_screen(app: AppHandle, id: String, window_id: Option<u32>, paused: bool) -> CmdResult<meetings::ScreenState> {
+    meetings::set_screen(&app, &id, window_id, paused).map_err(err)
+}
+
 /// The folder with a meeting's files (for "Show recordings").
 #[tauri::command]
-pub fn meeting_folder(core: State<'_, Core>, id: String) -> String {
-    meetings::root(&core.dir).join(id).display().to_string()
+pub fn meeting_folder(core: State<'_, Core>, id: String) -> CmdResult<String> {
+    Ok(meetings::dir_of(&core.dir, &id).map_err(err)?.display().to_string())
 }
 
 #[tauri::command]

@@ -63,8 +63,9 @@ pub fn prompts(data_dir: &Path, store: &Store, projects: &[String]) -> Vec<LabPr
             wer: None,
         });
     }
-    let words: Vec<&String> = store.dictionary.iter().map(|e| &e.replacement).chain(store.vocabulary.iter()).collect();
-    for w in words.into_iter().take(MAX_PERSONAL) {
+    let words: Vec<String> =
+        store.dictionary.iter().map(|e| e.replacement.clone()).chain(store.vocabulary.iter().map(|v| vocab::term_of(v).to_string())).collect();
+    for w in words.iter().take(MAX_PERSONAL) {
         list.push(LabPrompt {
             id: format!("word-{}", slug(w)),
             category: "personal".into(),

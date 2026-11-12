@@ -10,9 +10,19 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macos_keys;
 #[cfg(target_os = "macos")]
+mod macos_ocr;
+#[cfg(target_os = "macos")]
+mod macos_screen;
+#[cfg(target_os = "macos")]
 mod macos_tap;
 #[cfg(target_os = "macos")]
-pub use {macos::*, macos_keys::run_key_listener, macos_tap::SystemTap};
+pub use {
+    macos::*,
+    macos_keys::run_key_listener,
+    macos_ocr::{normalize_image, ocr},
+    macos_screen::{capture_window, request_screen_permission, screen_permission, screen_windows},
+    macos_tap::SystemTap,
+};
 
 #[cfg(windows)]
 mod windows;
@@ -30,6 +40,30 @@ pub struct Permissions {
     pub microphone: &'static str,
     pub accessibility: bool,
     pub input_monitoring: bool,
+    /// Other apps' windows can be read (macOS Screen Recording; only asked for when the user turns
+    /// on reading shared screens; always false on Windows, which can't read screens yet).
+    pub screen: bool,
+}
+
+/// A window that could show a meeting's shared screen.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenWindow {
+    pub window_id: u32,
+    pub app: String,
+    /// Empty without Screen Recording permission.
+    pub title: String,
+}
+
+/// A box of text found in an image: the text, and where it is (fractions of the image, from the
+/// top left).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrLine {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 /// What the macOS Fn/Globe key does besides dictation (always `ok` elsewhere).

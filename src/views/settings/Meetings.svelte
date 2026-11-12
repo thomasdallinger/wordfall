@@ -51,6 +51,15 @@
     }
   }
 
+  async function forgetVoice() {
+    try {
+      await api.forgetVoicePrint();
+      app.toast('success', 'Your voice was forgotten', s?.meetingVoicePrint ? 'It is learnt again from your next dictations.' : undefined);
+    } catch (e) {
+      app.error('Your voice was not forgotten', e);
+    }
+  }
+
   async function remove(m: SummaryModelInfo) {
     try {
       await api.deleteSummaryModel(m.id);
@@ -90,6 +99,31 @@
       help="Labels who said what (Me, Speaker 1, Speaker 2…). Click a name in a transcript to rename that person. Uses a 30 MB voice model, downloaded with your first meeting."
     >
       <Switch labelledby="meet-speakers" checked={s.meetingSpeakers} onchange={(v) => app.updateSettings({ meetingSpeakers: v })} />
+    </Row>
+
+    {#if s.meetingSpeakers}
+      <Row
+        id="meet-voice"
+        label="Learn my voice from dictation"
+        help="Keeps a fingerprint of your voice, learnt from your dictations, to label you as Me in meetings. It is a short list of numbers that describes how you sound, not a recording, and it stays on {THIS_DEVICE}."
+      >
+        <Switch labelledby="meet-voice" checked={s.meetingVoicePrint} onchange={(v) => app.updateSettings({ meetingVoicePrint: v })} />
+      </Row>
+    {/if}
+
+    <Row id="meet-voice-forget" label="Forget my voice" help="Deletes the voice fingerprint. Meetings already labelled keep their names.">
+      <button class="btn btn-sm" aria-labelledby="meet-voice-forget" onclick={forgetVoice}>Forget</button>
+    </Row>
+
+    <Row
+      id="meet-terms"
+      label="Fix misheard terms"
+      help="Before the notes are written, words that sound like one of your Words to recognise, or like an abbreviation or name on a screen or photo of the meeting, are checked by the summary model and corrected where it agrees. Corrected words are underlined in the transcript; point at one to see what was heard. Add an entry such as “PO = purchase order” to say what an abbreviation stands for: the notes use it too."
+    >
+      <Switch labelledby="meet-terms" checked={s.meetingTermCheck} onchange={(v) => app.updateSettings({ meetingTermCheck: v })} />
+      {#snippet below()}
+        <button class="link" onclick={() => app.go('dictionary')}>Edit Words to recognise</button>
+      {/snippet}
     </Row>
 
     <Row
@@ -132,7 +166,45 @@
     </Row>
     {/if}
 
-    <Row id="meet-keep" label="Keep recordings for" help="The audio of each meeting, for re-checking the transcript. Notes and transcripts are kept until you delete them.">
+    {#if !IS_WINDOWS}
+      <Row
+        id="meet-screen"
+        label="Read shared screens"
+        help="While a meeting records, pick the window that shows the shared screen (Zoom, Teams, Meet). Its text is read on this Mac every 10 seconds, and a picture is kept whenever it changes, so the notes get names, numbers and documents right. Nothing is read until you pick a window, and you can pause it. The text read from the screen is kept with the meeting; the pictures are deleted with the recordings."
+      >
+        <Switch labelledby="meet-screen" checked={s.meetingScreen} onchange={(v) => app.updateSettings({ meetingScreen: v })} />
+      </Row>
+
+      {#if s.meetingScreen}
+        <Row
+          id="meet-screen-permission"
+          label="Screen Recording"
+          help={app.snapshot?.permissions.screen
+            ? 'Allowed. Wordfall only reads the one window you pick, and only while a meeting records.'
+            : 'macOS asks once. After you allow Wordfall in System Settings, quit and reopen it.'}
+        >
+          {#if app.snapshot?.permissions.screen}
+            <span class="status-ok">Allowed</span>
+          {:else}
+            <button class="btn btn-sm" onclick={() => app.requestPermission('screen')}>Allow…</button>
+          {/if}
+        </Row>
+      {/if}
+
+      <Row
+        id="meet-photos"
+        label="Offer photos from Downloads"
+        help="Send a photo of a printout or a whiteboard from your phone with AirDrop while a meeting records, or up to 30 minutes after: Wordfall asks whether to add it to the meeting. Nothing is added without asking."
+      >
+        <Switch labelledby="meet-photos" checked={s.meetingPhotoWatch} onchange={(v) => app.updateSettings({ meetingPhotoWatch: v })} />
+      </Row>
+    {/if}
+
+    <Row
+      id="meet-keep"
+      label="Keep recordings for"
+      help="The audio of each meeting and the pictures of what was shown, for re-checking. Notes, transcripts and the text read from pictures are kept until you delete them."
+    >
       <select
         class="field select"
         aria-labelledby="meet-keep"

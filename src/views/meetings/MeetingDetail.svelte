@@ -2,20 +2,24 @@
   import { ChevronLeftIcon, CopyIcon, EllipsisIcon } from '@lucide/svelte';
   import { onMount, tick } from 'svelte';
   import ConfirmDialog from '../../lib/components/ConfirmDialog.svelte';
+  import MeetingVisuals from '../../lib/components/MeetingVisuals.svelte';
   import Menu from '../../lib/components/Menu.svelte';
   import Page from '../../lib/components/Page.svelte';
   import QuestionStack from '../../lib/components/QuestionStack.svelte';
+  import ScreenPicker from '../../lib/components/ScreenPicker.svelte';
   import Segmented from '../../lib/components/Segmented.svelte';
   import SystemMap from '../../lib/components/SystemMap.svelte';
-  import { api } from '../../lib/api';
+  import { api, isTauri, onFileDrop, pickImages } from '../../lib/api';
   import { clock, dayLabel, duration, formatTime } from '../../lib/format';
+  import { fixedParts, type TextPart } from '../../lib/fixes';
   import { notesAsText, renderNotes } from '../../lib/markdown';
+  import { IS_WINDOWS, primaryMod } from '../../lib/platform';
   import { app } from '../../lib/state.svelte';
   import type { Meeting, MeetingSegment } from '../../lib/types';
 
   let { id }: { id: string } = $props();
 
-  type Tab = 'summary' | 'notes' | 'transcript' | 'map';
+  type Tab = 'summary' | 'notes' | 'transcript' | 'shown' | 'map';
 
   let meeting = $state<Meeting | null>(null);
   let tab = $state<Tab>('notes');
@@ -29,6 +33,10 @@
   let confirm: ConfirmDialog | undefined = $state();
   let scroller: HTMLElement | undefined = $state();
   let followTranscript = true;
+  /** Files are dragged over the window. */
+  let dragging = $state(false);
+  /** Names of images being read. */
+  let reading = $state<string[]>([]);
 
   const recording = $derived(meeting?.status === 'recording');
   const questions = $derived(app.meetingQuestions[id] ?? null);
@@ -40,11 +48,17 @@
   const live = $derived(app.activeMeeting?.id === id ? app.activeMeeting : null);
   const rendered = $derived(meeting?.summary ? renderNotes(meeting.summary) : null);
   const draftNotes = $derived(progress?.phase === 'writing' && progress.text ? renderNotes(progress.text) : null);
+  /** Screens and photos are read on macOS; elsewhere the tab shows only what a Mac read. */
+  const canShow = $derived(!IS_WINDOWS || !!meeting?.visuals?.length);
+  const showScreen = $derived(recording && !IS_WINDOWS && !!app.settings?.meetingScreen);
+  const offers = $derived(app.photoOffers.filter((o) => o.id === id));
+  const percent = $derived(progress?.fraction != null ? Math.round(progress.fraction * 100) : null);
   const tabs = $derived.by(() => {
     const t: { value: Tab; label: string }[] = [];
     if (!recording) t.push({ value: 'summary', label: 'Notes' });
     t.push({ value: 'notes', label: 'My notes' });
     t.push({ value: 'transcript', label: 'Transcript' });
+    if (canShow) t.push({ value: 'shown', label: 'Screens & photos' });
     if (!recording && meeting?.systemMap?.nodes.length) t.push({ value: 'map', label: 'System map' });
     return t;
   });
@@ -53,11 +67,14 @@
   const turns = $derived.by(() => {
     if (!meeting) return [];
     const sorted = [...meeting.segments].sort((a, b) => a.startMs - b.startMs);
-    const out: { speaker: number; startMs: number; text: string }[] = [];
+    const out: { speaker: number; startMs: number; text: string; parts: TextPart[] }[] = [];
     for (const s of sorted) {
       const last = out[out.length - 1];
-      if (last && last.speaker === s.speaker && s.startMs - last.startMs < 120_000) last.text += ` ${s.text}`;
-      else out.push({ speaker: s.speaker, startMs: s.startMs, text: s.text });
+      const parts = fixedParts(s.text, s.fixes);
+      if (last && last.speaker === s.speaker && s.startMs - last.startMs < 120_000) {
+        last.text += ` ${s.text}`;
+        last.parts.push({ text: ' ' }, ...parts);
+      } else out.push({ speaker: s.speaker, startMs: s.startMs, text: s.text, parts });
     }
     return out;
   });
@@ -96,16 +113,82 @@
         meeting.segments = [...meeting.segments, ...e.segments];
         meeting.speakers = e.speakers;
         if (tab === 'transcript' && followTranscript) void tick().then(scrollToEnd);
+      } else if (e.kind === 'visuals' && e.id === id && meeting) {
+        meeting.visuals = e.visuals;
       } else if (e.kind === 'changed' && e.id === id) {
         void load();
       }
     });
+    // Images dropped on the window (Tauri hands over paths; the browser preview uses DOM events).
+    const dropped = onFileDrop(
+      (over) => (dragging = over && canShow),
+      (paths) => canShow && paths.length > 0 && void addPaths(paths),
+    );
     return () => {
       clearInterval(t);
       off();
+      void dropped.then((un) => un());
       if (notesDirty) void saveNotes();
     };
   });
+
+  async function addPaths(paths: string[]) {
+    const names = paths.map((p) => p.split(/[\\/]/).pop() ?? p);
+    reading = [...reading, ...names];
+    tab = 'shown';
+    try {
+      await app.addImages(id, paths);
+    } finally {
+      reading = reading.filter((n) => !names.includes(n));
+    }
+  }
+
+  async function pickAndAdd() {
+    try {
+      const paths = await pickImages('Add images to this meeting');
+      if (paths.length) await addPaths(paths);
+    } catch (e) {
+      app.error('The images were not added', e);
+    }
+  }
+
+  async function paste() {
+    reading = [...reading, 'the pasted image'];
+    tab = 'shown';
+    try {
+      await api.pasteMeetingImage(id);
+    } catch (e) {
+      app.error('Nothing was added', e);
+    } finally {
+      reading = reading.filter((n) => n !== 'the pasted image');
+    }
+  }
+
+  function editable(t: EventTarget | null): boolean {
+    return t instanceof HTMLElement && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT');
+  }
+
+  /** ⌘V outside a text field adds the image on the clipboard. */
+  function onKeydown(e: KeyboardEvent) {
+    if (!canShow || !primaryMod(e) || e.key.toLowerCase() !== 'v' || e.shiftKey || e.altKey || editable(e.target)) return;
+    e.preventDefault();
+    void paste();
+  }
+
+  // Browser preview only: Tauri delivers drops through `onFileDrop`.
+  function onDragOver(e: DragEvent) {
+    if (isTauri || !canShow || !e.dataTransfer?.types.includes('Files')) return;
+    e.preventDefault();
+    dragging = true;
+  }
+
+  function onDrop(e: DragEvent) {
+    if (isTauri || !canShow) return;
+    e.preventDefault();
+    dragging = false;
+    const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name));
+    if (files.length) void addPaths(files.map((f) => f.name));
+  }
 
   function scrollToEnd() {
     const page = scroller?.closest('.page');
@@ -227,10 +310,13 @@
   const phaseLabel = $derived.by(() => {
     if (!meeting) return '';
     if (meeting.status === 'processing') {
-      return progress?.phase === 'speakers' ? 'Telling the speakers apart…' : 'Transcribing the last few seconds…';
+      if (progress?.phase === 'speakers') return 'Telling the speakers apart…';
+      if (progress?.phase === 'improving') return 'Improving the transcript…';
+      return 'Transcribing the last few seconds…';
     }
     if (meeting.status === 'summarizing') {
       if (!progress || progress.phase === 'loading') return 'Starting the summary model…';
+      if (progress.phase === 'checking') return 'Checking your terms in the transcript…';
       if (progress.phase === 'reading') return 'Reading the transcript…';
       return 'Writing the notes…';
     }
@@ -326,6 +412,9 @@
         {#if !meeting.systemAudio}
           <p class="hint">Only your microphone is recorded, so other participants are heard only through your speakers.</p>
         {/if}
+        {#if showScreen}
+          <ScreenPicker meetingId={id} />
+        {/if}
       {:else}
         <p class="status">
           {when}, {duration(meeting.durationMs)}.
@@ -338,12 +427,23 @@
       <div class="progress" role="status">
         <span class="busy-dot" aria-hidden="true"></span>
         <span>{phaseLabel}</span>
-        {#if progress?.phase === 'reading' && progress.fraction != null}
-          <span class="bar" aria-hidden="true"><span style:width="{Math.round(progress.fraction * 100)}%"></span></span>
-          <span class="pct">{Math.round(progress.fraction * 100)}%</span>
+        {#if (progress?.phase === 'reading' || progress?.phase === 'improving' || progress?.phase === 'checking') && percent !== null}
+          <span class="bar" aria-hidden="true"><span style:width="{percent}%"></span></span>
+          <span class="pct">{percent} %</span>
         {/if}
       </div>
+      {#if progress?.phase === 'improving'}
+        <p class="hint">The whole recording is read once more, more carefully than live. This takes a few minutes for an hour.</p>
+      {/if}
     {/if}
+
+    {#each offers as offer (offer.path)}
+      <div class="offer" role="alert">
+        <span><strong>{offer.name}</strong> arrived in Downloads. Add it to this meeting?</span>
+        <button class="btn btn-sm" onclick={() => { tab = 'shown'; void app.answerOffer(offer, true); }}>Add</button>
+        <button class="btn btn-quiet btn-sm" onclick={() => app.answerOffer(offer, false)}>Ignore</button>
+      </div>
+    {/each}
 
     <div class={['columns', { 'with-questions': showQuestions }]}>
       <div class="main">
@@ -353,7 +453,13 @@
               <h2 id="map-title">System map</h2>
               {#if liveMap?.status === 'thinking'}<span class="sub" role="status">Reading the talk…</span>{/if}
             </div>
-            <SystemMap meetingId={id} map={liveMap?.map ?? meeting.systemMap} status={liveMap?.status ?? 'listening'} editable />
+            <SystemMap
+              meetingId={id}
+              map={liveMap?.map ?? meeting.systemMap}
+              status={liveMap?.status ?? 'listening'}
+              alsoMentioned={liveMap?.alsoMentioned ?? []}
+              editable
+            />
           </section>
         {/if}
         <div class="tabs">
@@ -390,6 +496,8 @@
           ></textarea>
         {:else if tab === 'map'}
           <SystemMap meetingId={id} map={meeting.systemMap} />
+        {:else if tab === 'shown'}
+          <MeetingVisuals meetingId={id} visuals={meeting.visuals ?? []} durationMs={meeting.durationMs} {reading} onadd={pickAndAdd} />
         {:else}
           <div class="transcript" bind:this={scroller} {@attach onPageScroll}>
             {#if turns.length === 0}
@@ -420,7 +528,8 @@
                       {speakerName(t.speaker)}
                     </button>
                   {/if}
-                  <p class="words selectable">{t.text}</p>
+                  <!-- prettier-ignore -->
+                  <p class="words selectable">{#each t.parts as part, k (k)}{#if part.heard}<span class="term-fix" title="Corrected from “{part.heard}”">{part.text}</span>{:else}{part.text}{/if}{/each}</p>
                 </div>
               </div>
             {/each}
@@ -448,6 +557,12 @@
     </div>
   {/if}
 </Page>
+
+<svelte:window onkeydown={onKeydown} ondragover={onDragOver} ondragleave={() => (dragging = false)} ondrop={onDrop} />
+
+{#if dragging}
+  <div class="drop" aria-hidden="true"><p>Drop images to add them to this meeting</p></div>
+{/if}
 
 <ConfirmDialog
   bind:this={confirm}
@@ -757,6 +872,13 @@
     height: 24px;
     font-size: 12px;
   }
+  .term-fix {
+    text-decoration: underline dotted;
+    text-decoration-color: var(--ink-3);
+    text-underline-offset: 3px;
+    cursor: help;
+  }
+
   .words {
     max-width: 62ch;
     margin-top: 2px;
@@ -775,6 +897,37 @@
   }
   :global(.danger) {
     color: var(--bad);
+  }
+  .offer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 16px;
+    padding: 8px 10px;
+    border-radius: var(--radius-control);
+    background: var(--surface);
+    box-shadow: inset 0 0 0 1px var(--line);
+    font-size: 13px;
+  }
+  .offer span {
+    flex: 1;
+    min-width: 0;
+  }
+  .drop {
+    position: fixed;
+    inset: 12px;
+    z-index: 50;
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-sheet);
+    border: 2px dashed var(--ink-3);
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    pointer-events: none;
+  }
+  .drop p {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--ink);
   }
   @media (prefers-reduced-motion: reduce) {
     .level,

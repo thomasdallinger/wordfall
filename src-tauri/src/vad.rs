@@ -6,8 +6,25 @@ const RATE: usize = 16_000;
 const FRAME: usize = RATE / 50; // 20 ms
 const PAD: usize = RATE / 4; // keep 250 ms around speech
 
-/// Returns the sample range containing speech, or `None` if the clip looks speech-free.
+/// Below this RMS (-42 dBFS) a dictation frame is never speech: the user talks into the
+/// microphone, and quieter sound is the room.
+const DICTATION_FLOOR: f32 = 0.008;
+/// A meeting's microphone hears voices across the table too, around -47 dBFS in a quiet room;
+/// this minimum (-54 dBFS) only keeps digital silence and hiss from counting.
+const MEETING_FLOOR: f32 = 0.002;
+
+/// The sample range of a dictation containing speech, or `None` if the clip looks speech-free.
 pub fn trim(audio: &[f32]) -> Option<Range<usize>> {
+    trim_above(audio, DICTATION_FLOOR)
+}
+
+/// `trim` for meeting audio, where far, quiet voices count (see `MEETING_FLOOR`).
+pub fn trim_meeting(audio: &[f32]) -> Option<Range<usize>> {
+    trim_above(audio, MEETING_FLOOR)
+}
+
+/// Speech is frames clearly above the room's noise and above `min_rms`.
+fn trim_above(audio: &[f32], min_rms: f32) -> Option<Range<usize>> {
     if audio.len() < FRAME {
         return None;
     }
@@ -19,7 +36,7 @@ pub fn trim(audio: &[f32]) -> Option<Range<usize>> {
     sorted.sort_by(|a, b| a.total_cmp(b));
     // Noise floor = 10th percentile frame; speech must clearly exceed it.
     let floor = sorted[sorted.len() / 10];
-    let threshold = (floor * 4.0).max(0.008);
+    let threshold = (floor * 4.0).max(min_rms);
     let voiced: Vec<bool> = rms.iter().map(|&r| r > threshold).collect();
 
     // Require ~120 ms of voiced frames in a 200 ms window to count as speech
@@ -49,6 +66,7 @@ mod tests {
     #[test]
     fn silence_is_rejected() {
         assert!(trim(&vec![0.0; RATE * 2]).is_none());
+        assert!(trim_meeting(&vec![0.0; RATE * 2]).is_none());
     }
 
     #[test]
@@ -61,6 +79,28 @@ mod tests {
         assert!(r.end >= 2 * RATE && r.end <= 2 * RATE + PAD + FRAME);
     }
 
+    /// Speech at about -47 dBFS (a voice across the table) in a quiet room.
+    fn far_quiet_speech() -> Vec<f32> {
+        let mut clip: Vec<f32> = (0..RATE).map(|i| 0.0005 * (i as f32 * 0.31).sin()).collect();
+        clip.extend(tone(1.0, 0.0063));
+        clip.extend((0..RATE).map(|i| 0.0005 * (i as f32 * 0.31).sin()));
+        clip
+    }
+
+    #[test]
+    fn far_quiet_speech_counts_in_meetings() {
+        assert!(trim_meeting(&far_quiet_speech()).is_some());
+    }
+
+    #[test]
+    fn far_quiet_sound_is_no_dictation() {
+        // Dictation keeps its floor: someone talking across the room isn't the user dictating.
+        assert!(trim(&far_quiet_speech()).is_none());
+        let mut clip = vec![0.0; RATE];
+        clip.extend(tone(1.0, 0.05));
+        assert!(trim(&clip).is_some(), "the user's own voice still counts");
+    }
+
     #[test]
     fn single_click_is_not_speech() {
         let mut clip = vec![0.0; RATE * 2];
@@ -68,5 +108,6 @@ mod tests {
             *s = 0.5;
         }
         assert!(trim(&clip).is_none());
+        assert!(trim_meeting(&clip).is_none());
     }
 }

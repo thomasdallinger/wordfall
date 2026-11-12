@@ -40,6 +40,7 @@ pub fn permissions() -> Permissions {
         microphone: microphone_status(),
         accessibility: unsafe { AXIsProcessTrusted() },
         input_monitoring: unsafe { CGPreflightListenEventAccess() },
+        screen: super::screen_permission(),
     }
 }
 

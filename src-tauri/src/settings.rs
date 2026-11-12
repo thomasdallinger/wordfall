@@ -67,6 +67,16 @@ pub struct Settings {
     pub meeting_system_audio: bool,
     /// Tell speakers apart in meeting transcripts.
     pub meeting_speakers: bool,
+    /// Learn the user's voice from their dictations (an average voice embedding in `voice.json`,
+    /// no audio) and use it to find "Me" among a meeting's voices.
+    pub meeting_voice_print: bool,
+    /// When a meeting ends, transcribe the whole recording again in long windows with beam search
+    /// (more accurate than the live transcript, which it replaces; takes minutes on long meetings).
+    pub meeting_final_pass: bool,
+    /// After a meeting, fix words that sound like a term of the user's vocabulary (Dictionary ›
+    /// Words to recognise) or of what the meeting showed, where the summary model agrees (see
+    /// `meetings/terms.rs`). Needs the summary model.
+    pub meeting_term_check: bool,
     /// Language model that writes meeting notes (see `llm::CATALOG`).
     pub summary_model: String,
     /// Meeting recordings are deleted after this many days (0 = kept).
@@ -83,6 +93,12 @@ pub struct Settings {
     pub meeting_map: bool,
     /// Where the user dragged the questions window: offset from its top-right spot (logical px).
     pub questions_window_position: Option<(i32, i32)>,
+    /// While a meeting records, read the text of one window the user picks (a shared screen)
+    /// every few seconds (macOS; needs Screen Recording permission).
+    pub meeting_screen: bool,
+    /// While a meeting records and for a while after, offer images that arrive in Downloads
+    /// (AirDrop from a phone) to add to it. Never added without asking.
+    pub meeting_photo_watch: bool,
 }
 
 impl Default for Settings {
@@ -117,6 +133,9 @@ impl Default for Settings {
             meeting_max_minutes: 180,
             meeting_system_audio: true,
             meeting_speakers: true,
+            meeting_voice_print: true,
+            meeting_final_pass: true,
+            meeting_term_check: true,
             summary_model: "qwen3-4b-instruct-2507".into(),
             meeting_audio_days: 14,
             meeting_live_help: true,
@@ -124,6 +143,8 @@ impl Default for Settings {
             meeting_questions_window: true,
             meeting_map: true,
             questions_window_position: None,
+            meeting_screen: false,
+            meeting_photo_watch: true,
         }
     }
 }

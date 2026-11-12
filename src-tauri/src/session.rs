@@ -310,7 +310,41 @@ fn process(app: &AppHandle, active: Active) -> anyhow::Result<()> {
     }
     let _ = app.emit("transcription-complete", json!({ "record": record }));
     let _ = app.emit("history-changed", ());
+    if settings.meeting_speakers && settings.meeting_voice_print {
+        learn_voice(app, captured.samples_16k);
+    }
     Ok(())
+}
+
+/// Teaches the user's voice print this dictation (for finding "Me" in meetings), on a thread of
+/// its own once the text is out: it loads the speaker model, which takes a moment.
+fn learn_voice(app: &AppHandle, audio: Vec<f32>) {
+    static LEARNING: AtomicBool = AtomicBool::new(false);
+    if audio.len() < crate::speakers::PRINT_MIN_SAMPLES {
+        return;
+    }
+    // Most dictations teach nothing (the print is settled): don't look for their speech then, it
+    // would hold the voice detector the next dictation needs.
+    let c = core(app);
+    let model_dir = c.model_dirs.read().own.clone();
+    if !crate::speakers::print_wants_voice(&c.dir, &model_dir) || LEARNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    thread::spawn(move || {
+        let c = core(&app);
+        let started = std::time::Instant::now();
+        let learnt = c.engine.speech_regions(&audio).and_then(|regions| {
+            let speech: Vec<f32> = regions.into_iter().flat_map(|r| audio[r].iter().copied()).collect();
+            crate::speakers::learn_voice(&c.dir, &model_dir, &speech)
+        });
+        match learnt {
+            Ok(true) => log::info!("voice print learnt from a dictation in {}ms", started.elapsed().as_millis()),
+            Ok(false) => {}
+            Err(e) => log::warn!("voice print: {e:#}"),
+        }
+        LEARNING.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Keeps only the newest `keep` saved dictation WAVs.

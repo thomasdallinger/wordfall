@@ -5,17 +5,21 @@ import { SILENT_LEVELS } from './levels';
 import { SYSTEM_SETTINGS } from './platform';
 import type {
   AudioDevice,
+  DictationPermission,
   DictEntry,
   HistoryRecord,
   MeetingProgress,
   MeetingMap,
   MeetingQuestions,
+  MeetingScreen,
   MeetingSegment,
   MeetingSpeaker,
+  MeetingVisual,
   ModelInfo,
   Notice,
   NoticeKind,
   PermissionKind,
+  PhotoOffer,
   QuestionAct,
   Settings,
   Snapshot,
@@ -47,6 +51,7 @@ export interface Toast extends Notice {
 export type MeetingEvent =
   | { kind: 'segments'; id: string; segments: MeetingSegment[]; speakers: MeetingSpeaker[] }
   | { kind: 'changed'; id: string }
+  | { kind: 'visuals'; id: string; visuals: MeetingVisual[] }
   | { kind: 'list' };
 
 class AppState {
@@ -69,6 +74,10 @@ class AppState {
   meetingQuestions = $state<Record<string, MeetingQuestions>>({});
   /** System map per meeting id (loaded on demand, kept fresh by `meeting-map`). */
   meetingMaps = $state<Record<string, MeetingMap>>({});
+  /** Screen reading per meeting id (loaded on demand, kept fresh by `meeting-screen`). */
+  meetingScreens = $state<Record<string, MeetingScreen>>({});
+  /** Images that arrived in Downloads, waiting for Add or Ignore. */
+  photoOffers = $state<PhotoOffer[]>([]);
   /** The meeting open in the Meetings view (null = the list). */
   meetingId = $state<string | null>(null);
   #meetingListeners = new Set<(e: MeetingEvent) => void>();
@@ -92,8 +101,8 @@ class AppState {
   );
   missingPermissions = $derived.by(() => {
     const p = this.snapshot?.permissions;
-    if (!p) return [] as PermissionKind[];
-    const out: PermissionKind[] = [];
+    if (!p) return [] as DictationPermission[];
+    const out: DictationPermission[] = [];
     if (p.microphone !== 'granted') out.push('microphone');
     if (!p.accessibility) out.push('accessibility');
     if (!p.inputMonitoring) out.push('inputMonitoring');
@@ -151,6 +160,8 @@ class AppState {
           this.#meetingEvent({ kind: 'changed', id });
         }),
         on('meetings-changed', () => this.#meetingEvent({ kind: 'list' })),
+        on('meeting-visuals', (e) => this.#meetingEvent({ kind: 'visuals', ...e })),
+        on('meeting-screen', ({ id, ...sc }) => (this.meetingScreens[id] = sc)),
       );
     }
     if (kind === 'dashboard') {
@@ -170,6 +181,13 @@ class AppState {
         on('meeting-levels', (l) => (this.meetingLevels = { mic: l.mic ?? 0, system: l.system ?? 0 })),
         on('meeting-progress', (p) => (this.meetingProgress[p.id] = p)),
         on('meeting-segments', (e) => this.#meetingEvent({ kind: 'segments', ...e })),
+        on('meeting-photo-offer', (offer) => {
+          if (this.photoOffers.some((o) => o.path === offer.path)) return;
+          this.photoOffers = [...this.photoOffers, offer];
+          if (this.view !== 'meetings' || this.meetingId !== offer.id) {
+            this.toast('info', `${offer.name} arrived in Downloads`, 'Open the meeting to add it.');
+          }
+        }),
       );
     }
     this.#unlisten = await Promise.all(subs);
@@ -268,6 +286,34 @@ class AppState {
       void this.loadQuestions(id);
       this.error('That didn’t work', e);
     }
+  }
+
+  async loadScreen(id: string) {
+    try {
+      this.meetingScreens[id] = await api.meetingScreen(id);
+    } catch {
+      // The meeting is gone; nothing to show.
+    }
+  }
+
+  /** Adds images (paths) to a meeting, one after another; each is read first (about half a second). `offered`: from a Downloads offer. */
+  async addImages(id: string, paths: string[], offered = false): Promise<number> {
+    let added = 0;
+    for (const path of paths) {
+      try {
+        await api.addMeetingImage(id, path, undefined, offered);
+        added++;
+      } catch (e) {
+        this.error(`${path.split(/[\\/]/).pop()} was not added`, e);
+      }
+    }
+    return added;
+  }
+
+  /** Adds an offered photo, or ignores it. */
+  async answerOffer(offer: PhotoOffer, add: boolean) {
+    this.photoOffers = this.photoOffers.filter((o) => o.path !== offer.path);
+    if (add && (await this.addImages(offer.id, [offer.path], true))) this.toast('success', `${offer.name} added`);
   }
 
   async stopMeeting() {

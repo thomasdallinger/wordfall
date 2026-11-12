@@ -337,6 +337,13 @@ pub fn run() {
         }
         return;
     }
+    if args.iter().any(|a| a == "--ocr") {
+        if let Err(e) = meetings::cli_ocr(&args) {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--meeting-notes") {
         if let Err(e) = meetings::cli_notes(&args) {
             eprintln!("error: {e:#}");
@@ -527,6 +534,16 @@ pub fn run() {
             commands::delete_meeting,
             commands::summarize_meeting,
             commands::meeting_folder,
+            commands::forget_voice_print,
+            commands::add_meeting_image,
+            commands::paste_meeting_image,
+            commands::delete_meeting_visual,
+            commands::move_meeting_visual,
+            commands::meeting_visual_image,
+            commands::open_meeting_visual,
+            commands::meeting_screen,
+            commands::meeting_screen_sources,
+            commands::set_meeting_screen,
             commands::list_summary_models,
             commands::download_summary_model,
             commands::delete_summary_model,

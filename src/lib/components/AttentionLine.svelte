@@ -3,7 +3,7 @@
   import { pttCap } from '../format';
   import { SYSTEM_SETTINGS } from '../platform';
   import { app } from '../state.svelte';
-  import type { PermissionKind } from '../types';
+  import type { DictationPermission as PermissionKind } from '../types';
 
   /** One actionable line when something stops dictation from working. Renders nothing otherwise. */
 

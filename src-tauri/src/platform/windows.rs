@@ -39,7 +39,33 @@ use super::{FnUsage, Permissions};
 pub type AppRef = isize;
 
 pub fn permissions() -> Permissions {
-    Permissions { microphone: microphone_status(), accessibility: true, input_monitoring: true }
+    Permissions { microphone: microphone_status(), accessibility: true, input_monitoring: true, screen: false }
+}
+
+// ---------- shared screens and photos (macOS only for now; Windows.Media.Ocr later) ----------
+
+const NO_VISUALS: &str = "Reading text from screens and photos needs macOS for now.";
+
+pub fn ocr(_path: &Path, _languages: &[String], _words: &[String]) -> anyhow::Result<Vec<super::OcrLine>> {
+    anyhow::bail!(NO_VISUALS)
+}
+
+pub fn normalize_image(_from: &Path, _to: &Path, _max_px: u32) -> anyhow::Result<(u32, u32)> {
+    anyhow::bail!(NO_VISUALS)
+}
+
+pub fn screen_permission() -> bool {
+    false
+}
+
+pub fn request_screen_permission() {}
+
+pub fn screen_windows() -> Vec<super::ScreenWindow> {
+    Vec::new()
+}
+
+pub fn capture_window(_id: u32, _to: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(NO_VISUALS)
 }
 
 const MIC_CONSENT: &str = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
