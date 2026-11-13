@@ -791,6 +791,11 @@ fn assist(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBool, tal
                 let snapshot = meeting.lock().clone();
                 let language = pipeline::meeting_language(&snapshot.segments);
                 let unknowns = snapshot.system_map.unknowns();
+                let (entries, dictionary) = {
+                    let store = c.store.lock();
+                    (store.vocabulary.clone(), store.dictionary.clone())
+                };
+                let vocabulary = meeting_vocabulary(&entries, &dictionary, settings, &snapshot);
                 let input = questions::Input {
                     goal: &snapshot.goal,
                     notes: &snapshot.notes,
@@ -800,25 +805,30 @@ fn assist(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBool, tal
                     visuals: &snapshot.visuals,
                     questions: &snapshot.questions,
                     unknowns: &unknowns,
+                    vocabulary: &vocabulary,
                     now_ms,
                 };
                 let started = Instant::now();
                 let outcome = questions::run(w, &input)?;
-                let changed = outcome.is_some_and(|o| {
+                let misheard = outcome.as_ref().map_or(0, |o| o.misheard.len());
+                let applied = outcome.map(|o| {
                     let mut m = meeting.lock();
                     let now = m.duration_ms;
-                    let changed = questions::apply(&mut m.questions, o, now);
-                    if changed {
+                    let applied = questions::apply(&mut m.questions, o, now);
+                    if applied.changed {
                         save(&c.dir, &m);
                     }
-                    changed
+                    applied
                 });
                 let live = questions::live_count(&meeting.lock().questions);
+                let repeats = applied.as_ref().map_or(0, |a| a.repeats.len());
                 log::info!(
-                    "meeting questions: read the talk in {:.1}s ({}), {live} open{}",
+                    // How many were left out, not what they said: the log outlives the meeting.
+                    "meeting questions: read the talk in {:.1}s ({}), {live} open{}{}",
                     started.elapsed().as_secs_f32(),
                     stats_line(w.last),
-                    if changed { ", changed" } else { "" }
+                    if applied.is_some_and(|a| a.changed) { ", changed" } else { "" },
+                    if repeats + misheard > 0 { format!(", left out {repeats} repeats and {misheard} on misheard words") } else { String::new() }
                 );
             }
             Ok(())
@@ -1561,6 +1571,11 @@ struct CliAssist {
     question_runs: Vec<llm::ChatStats>,
     /// The map after each run that changed it, for looking at how it grew.
     snapshots: Vec<serde_json::Value>,
+    /// The user's words to recognise (or `--vocab`'s), the dictionary and the settings: the
+    /// questions are told the meeting's names (`meeting_vocabulary`), as in the app.
+    words: Vec<String>,
+    dictionary: Vec<crate::store::DictEntry>,
+    settings: Settings,
 }
 
 impl CliAssist {
@@ -1593,6 +1608,7 @@ impl CliAssist {
             }
             if self.ask {
                 let unknowns = meeting.system_map.unknowns();
+                let vocabulary = meeting_vocabulary(&self.words, &self.dictionary, &self.settings, meeting);
                 let input = questions::Input {
                     goal: &meeting.goal,
                     notes: &meeting.notes,
@@ -1602,6 +1618,7 @@ impl CliAssist {
                     visuals: &meeting.visuals,
                     questions: &meeting.questions,
                     unknowns: &unknowns,
+                    vocabulary: &vocabulary,
                     now_ms,
                 };
                 let started = Instant::now();
@@ -1612,13 +1629,18 @@ impl CliAssist {
                     eprintln!("[{t:>6.1}s] (questions read the talk in {:.1}s: {})", started.elapsed().as_secs_f32(), stats_line(Some(stats)));
                 }
                 if let Some(o) = outcome {
-                    questions::apply(&mut meeting.questions, o, now_ms);
+                    for text in &o.misheard {
+                        eprintln!("[{t:>6.1}s] - left out (asks about a word likely misheard): {text}");
+                    }
+                    for (n, text) in questions::apply(&mut meeting.questions, o, now_ms).repeats {
+                        eprintln!("[{t:>6.1}s] - left out (repeats Q{n}): {text}");
+                    }
                 }
             }
         }
         for q in &meeting.questions {
             match before.iter().find(|b| b.number == q.number) {
-                None => eprintln!("[{t:>6.1}s] + Q{} ({:?}) {}", q.number, q.kind, q.text),
+                None => eprintln!("[{t:>6.1}s] + Q{} ({:?}{}) {}", q.number, q.kind, if q.big_picture { ", big picture" } else { "" }, q.text),
                 Some(b) if b.state != q.state => eprintln!("[{t:>6.1}s] Q{} {:?}", q.number, q.state),
                 _ => {}
             }
@@ -1686,6 +1708,11 @@ impl CliAssist {
         let entry = llm::entry(&settings.summary_model).ok_or_else(|| anyhow::anyhow!("unknown summary model"))?;
         let path = llm::locate(&settings.model_dirs(data_dir).own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
         eprintln!("live model: {}", entry.display_name);
+        let store = crate::store::Store::load(data_dir);
+        let words = match args.iter().position(|a| a == "--vocab").and_then(|i| args.get(i + 1)) {
+            Some(f) => std::fs::read_to_string(f).map_err(|e| anyhow::anyhow!("{f}: {e}"))?.lines().map(str::to_string).collect(),
+            None => store.vocabulary,
+        };
         Ok(Some(Self {
             worker: llm::Worker::spawn(&path, &data_dir.join("llm.log"), questions::CTX)?,
             ask,
@@ -1698,6 +1725,9 @@ impl CliAssist {
             tidy_runs: Vec::new(),
             question_runs: Vec::new(),
             snapshots: Vec::new(),
+            words,
+            dictionary: store.dictionary,
+            settings: settings.clone(),
         }))
     }
 
@@ -1907,7 +1937,8 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     if !meeting.questions.is_empty() {
         println!("--- questions ---");
         for q in &meeting.questions {
-            println!("Q{} [{}] {:?} ({:?}): {}", q.number, pipeline::clock(q.at_ms), q.state, q.kind, q.text);
+            let big = if q.big_picture { ", big picture" } else { "" };
+            println!("Q{} [{}] {:?} ({:?}{big}): {}", q.number, pipeline::clock(q.at_ms), q.state, q.kind, q.text);
         }
     }
     if !meeting.notes.is_empty() {
@@ -1973,7 +2004,8 @@ pub fn cli_transcript(args: &[String]) -> anyhow::Result<()> {
     if !meeting.questions.is_empty() {
         println!("--- questions ---");
         for q in &meeting.questions {
-            println!("Q{} [{}] {:?} ({:?}): {}", q.number, pipeline::clock(q.at_ms), q.state, q.kind, q.text);
+            let big = if q.big_picture { ", big picture" } else { "" };
+            println!("Q{} [{}] {:?} ({:?}{big}): {}", q.number, pipeline::clock(q.at_ms), q.state, q.kind, q.text);
         }
     }
     println!("--- system map ---\n{}", system_map::section(&meeting.system_map).unwrap_or_default());

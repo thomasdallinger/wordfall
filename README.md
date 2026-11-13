@@ -178,9 +178,12 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   (a few unclear words are not heard as another language).
 - **Questions to ask:** give the meeting a *Goal* (under its title) and, every half minute or so of new talk, the
   notes model reads the last minutes and proposes up to three questions: what was vague (*Understand*), what to
-  test (*Challenge*), what was left open (*Follow-up*). They show next to the transcript and in a small window
-  at the top right that stays above the call without taking the keyboard (*Float* brings it back if you hide it).
-  *Asked*, *Later* and *Delete* sort them; a question the talk answers says so and leaves, one nobody touches
+  test (*Challenge*), what was left open (*Follow-up*). Every 10 minutes one of them is about the goal and the big
+  picture (who works with it, why, what happens before and after, what comes next) rather than what is on screen.
+  A question that asks again what an earlier one asked, in other words, is left out, and so is one that asks what a
+  word means that nobody showed (likely misheard); names are written as the screen or your notes spell them. They
+  show next to the transcript and in a small window at the top right that stays above the call without taking the
+  keyboard (*Float* brings it back if you hide it). *Asked*, *Later* and *Delete* sort them; a question the talk answers says so and leaves, one nobody touches
   expires after 5 minutes, and the ones kept for later end up under *Open questions* in the notes. Turn it off in
   *Settings → Meetings → Suggest questions to ask*.
 - **System map:** at the same pace, the same model updates a map of the systems (yours, the customer's, outside

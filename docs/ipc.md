@@ -119,7 +119,8 @@ interface Meeting {
 type QuestionKind = 'understand' | 'challenge' | 'follow-up';
 type QuestionState = 'live' | 'later' | 'asked' | 'answered' | 'expired' | 'deleted';
 type QuestionStatus = 'off' | 'no-model' | 'starting' | 'listening' | 'thinking' | 'failed';
-interface MeetingQuestion { number: number; text: string; kind: QuestionKind; state: QuestionState; atMs: number; changedMs: number }
+interface MeetingQuestion { number: number; text: string; kind: QuestionKind; state: QuestionState; atMs: number; changedMs: number;
+  bigPicture?: true /* asked for as the question about the goal and the big picture (one every 10 minutes from the 5th) */ }
 interface MeetingQuestions { questions: MeetingQuestion[]; status: QuestionStatus; goal: string }
 // System map: built while a meeting records, a run per question run (talk since the last run + the user's notes);
 // its open points steer the questions; added below the notes as "## System map" (see system_map.rs `section`).
@@ -130,7 +131,8 @@ interface MapOpenPoint { number: number; node: number; text: string }
 interface SystemMap { nodes: MapNode[]; edges: MapEdge[]; open: MapOpenPoint[] }
 interface MeetingMap { map: SystemMap; status: QuestionStatus; alsoMentioned: string[] } // status of the live model shared with the questions; alsoMentioned: names said but not on the map (hidden candidates), latest first, at most 12
 // What was shown: text read (OCR, macOS) from the shared screen or an image the user added. It enters the notes and
-// the live questions as "[mm:ss] Screen: …" / "[mm:ss] Photo: …" lines merged into the transcript by time (capped).
+// the live questions as "[mm:ss] Screen: …" / "[mm:ss] Photo: …" lines, merged into the transcript by time for the
+// notes, the latest after the transcript for the questions (capped).
 // Pictures (visuals/<uuid>.jpg + -thumb.jpg) are deleted with the recordings; the text stays.
 interface MeetingVisual { id: number; atMs: number; untilMs?: number /* screen last seen unchanged */; source: 'screen' | 'photo';
   label: string /* "zoom.us: Zoom Meeting" or the file name */; text: string /* a line per row, cells joined by " | " */; image?: string }
