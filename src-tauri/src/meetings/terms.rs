@@ -1268,6 +1268,8 @@ pub fn check(
             for part in g.places.chunks(PLACES_PER_QUESTION) {
                 if g.evidence.heard_shown_on > 0 {
                     out.extend(decide(part, &format!("The screens show \"{}\" itself.\nAnswer: no", g.heard)));
+                } else if lone(g, &groups) {
+                    out.extend(decide(part, &format!("\"{}\" is heard once and the screen's {} nowhere else.\nAnswer: no", g.heard, g.term.text)));
                 } else {
                     let answer = worker.chat_at(SYSTEM, &question(g, part), 400, Some(GRAMMAR), Some(0.0), Some(SLOT), |_| {})?;
                     out.extend(decide(part, &answer));
@@ -1282,6 +1284,17 @@ pub fn check(
         log::warn!("could not drop the term check's context: {e:#}");
     }
     asked
+}
+
+/// Whether `g` is a name from the screens heard at one place only, while no other way of hearing it
+/// comes back: speech recognition hears a name said in a meeting the same wrong way each time, so
+/// one place alone is more likely an ordinary word that happens to look like some code on a
+/// screen ("Dress" for a test record's "Doresa"). Terms with a meaning (the user's) are always asked.
+fn lone(g: &Group, groups: &[Group]) -> bool {
+    g.places.len() == 1
+        && g.term.meaning.is_none()
+        && g.evidence.shown_on > 0
+        && !groups.iter().any(|o| std::ptr::eq(o.term, g.term) && o.places.len() >= 2)
 }
 
 /// The texts the accepted decisions change: index, new text and what changed.
@@ -1499,6 +1512,21 @@ mod tests {
         assert_eq!(names(shown_terms(&seen, None)), ["ECAD"]);
         // Few screens: once is enough.
         assert_eq!(names(shown_terms(&Seen { shown: &screens[3..], ..Default::default() }, Some(&dictionary))), ["Brontix", "KW"]);
+    }
+
+    #[test]
+    fn a_screen_name_heard_once_is_not_asked_about() {
+        let t = terms(&["Trevolin", "Doresa"]);
+        let texts = ["Im Dreh Wolin.", "Das Dreh Wolin lädt.", "Der Drevolin auch.", "Er trägt ein Dress."];
+        let shown = ["Trevolin | Doresa", "Trevolin | Doresa"];
+        let found = candidates(&texts, &t, |_, _| false);
+        let gs = groups(&texts, &shown, &found, &t);
+        let lone_of = |heard: &str| gs.iter().find(|g| g.heard == heard).map(|g| lone(g, &gs));
+        // Heard twice the same way: asked. Once, but the name comes back heard otherwise: asked.
+        assert_eq!(lone_of("Dreh Wolin"), Some(false));
+        assert_ne!(lone_of("Drevolin"), Some(true));
+        // Once, and nothing else sounds like that screen word: not asked.
+        assert_eq!(lone_of("Dress"), Some(true), "{:?}", gs.iter().map(|g| (&g.heard, g.places.len())).collect::<Vec<_>>());
     }
 
     #[test]

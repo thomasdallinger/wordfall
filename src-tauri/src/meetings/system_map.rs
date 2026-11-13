@@ -302,14 +302,26 @@ fn variant(a: &str, b: &str) -> bool {
 }
 
 /// Whether `heard` is the name `shown` (on a screen, in the notes) as speech recognition heard it:
-/// a variant (see `variant`), or from four letters on one letter off with the same first letter
-/// ("SKU" is too short; "EDIX" ~ "Edix", "ECAD" ~ "eCard").
+/// a variant (see `variant`), from four letters on one letter off with the same first letter
+/// ("SKU" is too short; "EDIX" ~ "Edix", "ECAD" ~ "eCard"), or what the term check takes for a
+/// mishearing of a written-out name (`terms::Matcher`: "Tego" for "Teegoo"), the whole of `heard`
+/// but its part words.
 fn heard_as(shown: &str, heard: &str) -> bool {
     if variant(shown, heard) {
         return true;
     }
     let (x, y) = (head(shown), head(heard));
-    x.chars().count().min(y.chars().count()) >= 4 && x.chars().next() == y.chars().next() && digits(&x) == digits(&y) && edit_distance(&x, &y) <= 1
+    if x.chars().count().min(y.chars().count()) >= 4 && x.chars().next() == y.chars().next() && digits(&x) == digits(&y) && edit_distance(&x, &y) <= 1 {
+        return true;
+    }
+    // Abbreviations are matched by their letters above; the matcher would take more for them.
+    if !shown.chars().any(char::is_lowercase) {
+        return false;
+    }
+    let term = [super::terms::Term { text: shown.to_string(), meaning: None }];
+    let rest: Vec<&str> = heard.split(|c: char| c.is_whitespace() || c == '-').filter(|w| !w.is_empty() && !PART_WORDS.contains(&w.to_lowercase().as_str())).collect();
+    let rest = rest.join(" ");
+    rest.chars().count() >= 3 && super::terms::Matcher::new(&term).find(&rest).iter().any(|c| compact(&c.heard) == compact(&rest))
 }
 
 /// The spelling a screen or the notes showed for `name` when it was heard otherwise: that spelling
@@ -1659,6 +1671,9 @@ pub struct Input<'a> {
     pub notes_changed: bool,
     /// On a call (the others on system audio) or all in one room on the microphone.
     pub room: Room,
+    /// People whose names the call's video tiles showed (`names::on_screen`); the screens' text
+    /// leaves the tiles out.
+    pub people: &'a [String],
 }
 
 /// What one run reads of a screen: at most this many characters of the rows it hasn't shown yet,
@@ -2131,7 +2146,7 @@ fn closing_lines(input: &Input) -> Vec<String> {
     }
     let mut lines: Vec<(u64, String)> =
         shown.into_iter().map(|(at, t)| (at, format!("[{}] Screen: {}", super::pipeline::clock(at), cut(&t, CLOSING_SCREEN)))).collect();
-    let people = people_on_screen(&screens);
+    let people = if input.people.is_empty() { people_on_screen(&screens) } else { input.people.to_vec() };
     if let (false, Some(first)) = (people.is_empty(), screens.first()) {
         lines.push((first.at_ms, format!("[{}] Screen: {} (a name on most screens)", super::pipeline::clock(first.at_ms), people.join(", "))));
     }
@@ -3130,6 +3145,7 @@ mod tests {
             map: &map,
             notes_changed: false,
             room: Room::Call,
+            people: &[],
         };
         let p = user_prompt(&input, &earlier, &new, "focus on the ERP export", &[3, 4, 5], "English");
         assert!(p.contains("N1 LagerPro (customer system)\nN2 DATEV (outside service)\n"), "{p}");
@@ -3177,6 +3193,15 @@ mod tests {
         assert!(map.nodes[0].aka.contains(&"Navisjon Core".to_string()) && map.nodes[1].aka.contains(&"eCard".to_string()));
         assert_eq!((map.edges[0].from, map.edges[0].to), (1, 3), "the flow moves with the box");
         assert!(map.candidates.is_empty(), "the heard spelling of a box is that box: {:?}", a.lines);
+    }
+
+    #[test]
+    fn a_name_heard_as_an_ordinary_word_takes_the_shown_spelling() {
+        // The term check's sound-alikes: "Tego" is how speech recognition hears "Teegoo".
+        assert!(heard_as("Teegoo", "Tego Modul") && heard_as("Teegoo", "Tego"));
+        assert_eq!(shown_spelling("Tego Modul", &["Teegoo".to_string(), "ECAD".to_string()]).as_deref(), Some("Teegoo Modul"));
+        // Not when only part of the name sounds like it, nor for another word.
+        assert!(!heard_as("Teegoo", "Tego X Line") && !heard_as("Teegoo", "Lagerhaus"));
     }
 
     #[test]

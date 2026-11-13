@@ -684,6 +684,7 @@ fn map_input<'a>(
     language: Option<&'a str>,
     earlier: &'a mut Vec<String>,
     spellings: &'a [String],
+    people: &'a [String],
 ) -> system_map::Input<'a> {
     let seen = cursor.seen.min(m.segments.len());
     let mut before = pipeline::transcript_lines(&m.segments[..seen], &m.speakers);
@@ -701,6 +702,7 @@ fn map_input<'a>(
         map: &m.system_map,
         notes_changed: m.notes.trim() != cursor.notes.trim(),
         room: room_of(m),
+        people,
     }
 }
 
@@ -712,7 +714,7 @@ fn live_map_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<Meeti
     let language = pipeline::meeting_language(&snapshot.segments);
     let mut earlier = Vec::new();
     let spellings = map_spellings(&snapshot);
-    let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier, &spellings);
+    let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier, &spellings, &[]);
     let started = Instant::now();
     let run = system_map::run(w, &input)?;
     cursor.read(&snapshot);
@@ -743,7 +745,8 @@ fn live_closing_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<M
     let language = pipeline::meeting_language(&snapshot.segments);
     let spellings = map_spellings(&snapshot);
     let mut earlier = Vec::new();
-    let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier, &spellings);
+    let people = names::on_screen(&snapshot.screen_names);
+    let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier, &spellings, &people);
     let started = Instant::now();
     let Some(run) = system_map::closing(w, &input)? else { return Ok(()) };
     let applied = {
@@ -1729,7 +1732,7 @@ impl CliAssist {
         let language = pipeline::meeting_language(&meeting.segments);
         let mut earlier = Vec::new();
         let spellings = map_spellings(meeting);
-        let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier, &spellings);
+        let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier, &spellings, &[]);
         let started = Instant::now();
         let run = system_map::run(&mut self.worker, &input)?;
         self.cursor.read(meeting);
@@ -1753,7 +1756,8 @@ impl CliAssist {
         let language = pipeline::meeting_language(&meeting.segments);
         let spellings = map_spellings(meeting);
         let mut earlier = Vec::new();
-        let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier, &spellings);
+        let people = names::on_screen(&meeting.screen_names);
+        let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier, &spellings, &people);
         let started = Instant::now();
         let Some(run) = system_map::closing(&mut self.worker, &input)? else { return Ok(()) };
         self.closing_runs.push(run.cost);

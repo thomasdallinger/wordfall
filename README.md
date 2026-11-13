@@ -221,7 +221,8 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   notes model, all places heard the same way together, with how many screens show the term and whether someone
   spelled it out: it says what the heard words mean there, then whether the term was said, leaving out places where
   they clearly mean something else (its reason goes to the log). A word the screens show themselves is never
-  replaced. It can only accept what was found, never write words of its own. Corrected words are underlined in the
+  replaced, and a name from the screens heard at one place only, with nothing else sounding like it, isn't asked
+  about (a misheard name comes back). It can only accept what was found, never write words of its own. Corrected words are underlined in the
   transcript (point at one to see what was heard). Names from the screens are abbreviations and words the system's
   spell checker doesn't know (macOS), those the talk has something sounding like first, then the most shown, on at
   least two screens (three once a meeting has 30); ordinary words in capitals (OF, TRUTH, CABLE), two words written
