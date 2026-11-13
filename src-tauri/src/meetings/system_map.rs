@@ -22,6 +22,34 @@ use serde::{Deserialize, Serialize};
 use super::{questions::similar, Segment, Speaker};
 use crate::llm;
 
+
+/// People on the call by the names its video tiles showed (`names::on_screen`), as person boxes:
+/// the one already there under a part of the name ("Tobias") gets the full name, the others are
+/// added. A presenter is rarely named in the talk, so the map's runs miss them. Boxes the user
+/// named or deleted stay as they are. Returns what it did, for the log.
+pub fn add_people(map: &mut SystemMap, people: &[String], at_ms: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    for full in people {
+        let words: Vec<String> = full.split_whitespace().map(str::to_lowercase).collect();
+        if words.is_empty() || map.is_dropped(full) {
+            continue;
+        }
+        let part_of = |n: &Node| n.kind == Kind::Person && names(n).any(|a| a.split_whitespace().map(str::to_lowercase).all(|w| words.contains(&w)));
+        if let Some(node) = map.nodes.iter_mut().find(|n| part_of(n)) {
+            if !node.named && norm(&node.name) != norm(full) {
+                let old = std::mem::replace(&mut node.name, full.clone());
+                out.push(format!("{old} is {full} (on a video tile)"));
+                node.aka.push(old);
+            }
+            continue;
+        }
+        let id = map.next_id();
+        map.nodes.push(Node { id, name: full.clone(), kind: Kind::Person, known: Vec::new(), aka: Vec::new(), at_ms, named: false, said: String::new() });
+        out.push(format!("+ {full} (person or role), on a video tile"));
+    }
+    out
+}
+
 /// Node lines one answer may write (boxes, candidates or set-aside names), and new boxes one run may
 /// draw at once.
 const NODE_LINES: usize = 3;
@@ -3193,6 +3221,19 @@ mod tests {
         assert!(map.nodes[0].aka.contains(&"Navisjon Core".to_string()) && map.nodes[1].aka.contains(&"eCard".to_string()));
         assert_eq!((map.edges[0].from, map.edges[0].to), (1, 3), "the flow moves with the box");
         assert!(map.candidates.is_empty(), "the heard spelling of a box is that box: {:?}", a.lines);
+    }
+
+    #[test]
+    fn people_on_the_video_tiles_are_on_the_map() {
+        let mut map = SystemMap::default();
+        put(&mut map, 1, "Tobias", Kind::Person);
+        put(&mut map, 2, "ECAD", Kind::Ours);
+        let people = vec!["Konrad Bauer".to_string(), "Tobias Dorfer".to_string()];
+        let lines = add_people(&mut map, &people, 1_000);
+        assert_eq!(visible(&map), ["Tobias Dorfer", "ECAD", "Konrad Bauer"], "{lines:?}");
+        assert_eq!(map.nodes[2].kind, Kind::Person);
+        // Again: nothing more.
+        assert!(add_people(&mut map, &people, 2_000).is_empty());
     }
 
     #[test]

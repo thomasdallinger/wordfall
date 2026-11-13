@@ -462,7 +462,9 @@ fn system_prompt(language: &str, goal: bool, shown: bool) -> String {
          what Me needs to understand (what something is for, who uses it or decides, why it is so, what happens \
          before and after it, what is still open) rather than details Me can see on screen (where to click, how \
          exactly a view works). Never suggest a question the transcript already answers, one Me already asked, or \
-         one about the same thing as a question suggested before, even in other words. The transcript comes from \
+         one about the same thing as a question suggested before, even in other words. Ask from a new angle each \
+         time: when questions before already asked who is responsible for something or how something is ensured, \
+         ask what something is for, why it is so, or what happens before and after it instead. The transcript comes from \
          speech recognition and has mistakes, in names most of all: a word that makes no sense where it stands, or \
          sounds like one of the meeting's names, is that name or a common word misheard. Write names as the \
          meeting's names are written, and never ask what a word means unless it was shown or written there.{shown} \
@@ -644,6 +646,51 @@ fn verified(parsed: &[(u32, String)], input: &Input) -> Vec<u32> {
         .collect()
 }
 
+/// The names of the meeting's vocabulary that a screen or photo shows.
+fn shown_names(input: &Input) -> Vec<Term> {
+    let screens: Vec<HashSet<String>> = input.visuals.iter().map(|v| word_set(&v.text)).collect();
+    input
+        .vocabulary
+        .iter()
+        .filter(|t| {
+            let words = word_set(&t.text);
+            !words.is_empty() && screens.iter().any(|s| words.iter().all(|w| s.contains(w)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// How often `words` (lower case) come in a row in `text`, as whole words.
+fn uses_of(text: &str, words: &[String]) -> usize {
+    let all: Vec<String> = text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+    if words.is_empty() || all.len() < words.len() {
+        return 0;
+    }
+    all.windows(words.len()).filter(|w| w == &words).count()
+}
+
+/// A proposed question with the names the screens show (`shown`) in their shown spelling where
+/// it has what speech recognition heard for them ("das eCard-Modul" → "das ECAD-Modul"): the live
+/// transcript is corrected only after the meeting (the term check), and the model copies what it
+/// reads. Only heard words the transcript has at least twice (a misheard name comes back the same
+/// way) and no screen shows itself; the sound-alikes are the term check's (`terms::Matcher`).
+fn respell(text: &str, input: &Input, shown: &[Term]) -> String {
+    if shown.is_empty() {
+        return text.to_string();
+    }
+    let found = super::terms::Matcher::new(shown).find(text);
+    let heard_words = |c: &super::terms::Candidate| -> Vec<String> { c.heard.split(|ch: char| !ch.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect() };
+    let accepted: Vec<&super::terms::Candidate> = found
+        .iter()
+        .filter(|c| {
+            let words = heard_words(c);
+            let said: usize = input.segments.iter().map(|s| uses_of(&s.text, &words)).sum();
+            said >= 2 && !input.visuals.iter().any(|v| uses_of(&v.text, &words) > 0)
+        })
+        .collect();
+    super::terms::apply(text, &accepted).0
+}
+
 /// One run: asks the model about the recent transcript. `None` when there's nothing to read.
 pub fn run(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Outcome>> {
     let (from, transcript) = talk_lines(input);
@@ -666,7 +713,9 @@ pub fn run(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Out
     for (n, quote) in parsed.answered.iter().filter(|(n, _)| !answered.contains(n)) {
         log::info!("meeting questions: Q{n} \"{quote}\" was not said after the question; still open");
     }
-    let (misheard, new): (Vec<Proposal>, Vec<Proposal>) = parsed.new.into_iter().partition(|p| misheard(p, input));
+    let shown = shown_names(input);
+    let respelled = parsed.new.into_iter().map(|p| Proposal { text: respell(&p.text, input, &shown), ..p });
+    let (misheard, new): (Vec<Proposal>, Vec<Proposal>) = respelled.partition(|p| misheard(p, input));
     Ok(Some(Outcome { answered, new, misheard: misheard.into_iter().map(|p| p.text).collect() }))
 }
 
@@ -707,6 +756,18 @@ mod tests {
 
     fn proposal(kind: Kind, text: &str) -> Proposal {
         Proposal { kind, text: text.into(), big_picture: false }
+    }
+
+    #[test]
+    fn names_heard_otherwise_take_the_screens_spelling() {
+        let segments = vec![seg(10_000, "Das eCard exportiert ein XML."), seg(20_000, "Im eCard sind Makros."), seg(30_000, "Er trägt ein Dress.")];
+        let visuals = vec![screen(1, 5, Some(40), "ECAD Modul | Makros | Doresa")];
+        let vocabulary = vec![Term { text: "ECAD".into(), meaning: None }, Term { text: "Doresa".into(), meaning: None }];
+        let i = input(&segments, &visuals, &[], &vocabulary, 60_000);
+        let shown = shown_names(&i);
+        assert_eq!(respell("Was macht das eCard-Modul mit den Makros?", &i, &shown), "Was macht das ECAD-Modul mit den Makros?");
+        // Heard once: maybe just a word.
+        assert_eq!(respell("Warum das Dress?", &i, &shown), "Warum das Dress?");
     }
 
     #[test]

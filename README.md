@@ -181,7 +181,9 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   test (*Challenge*), what was left open (*Follow-up*). Every 10 minutes one of them is about the goal and the big
   picture (who works with it, why, what happens before and after, what comes next) rather than what is on screen.
   A question that asks again what an earlier one asked, in other words, is left out, and so is one that asks what a
-  word means that nobody showed (likely misheard); names are written as the screen or your notes spell them. They
+  word means that nobody showed (likely misheard); names are written as the screen or your notes spell them, also
+  where the live transcript still has them misheard (a word heard the same way at least twice that sounds like a
+  name on screen). They
   show next to the transcript and in a small window at the top right that stays above the call without taking the
   keyboard (*Float* brings it back if you hide it). *Asked*, *Later* and *Delete* sort them; a question the talk answers says so and leaves, one nobody touches
   expires after 5 minutes, and the ones kept for later end up under *Open questions* in the notes. Turn it off in
@@ -213,7 +215,8 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   far it is), speakers are labelled (named after the call's video tiles when the shared screen was read and the person talking
   is shown, as Meet, Teams and Zoom do; click a name to rename someone), misheard terms are fixed (below), and the
   notes are written: about a minute for an hour of meeting on a recent GPU or Apple Silicon Mac, a few minutes for
-  three hours. Notes are in the language the meeting was held in. *Write the notes again* picks up renamed speakers, edited notes and new words to
+  three hours. Notes are in the language the meeting was held in, with a *Next steps* section for the next meeting, what it should
+  cover and what is still to be clarified. *Write the notes again* picks up renamed speakers, edited notes and new words to
   recognise.
 - **Your terms:** speech recognition doesn't know your abbreviations and product names and writes something that
   sounds alike, the same way each time. Before the notes are written, places that sound like one of your

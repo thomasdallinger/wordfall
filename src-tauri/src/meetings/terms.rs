@@ -651,8 +651,13 @@ pub fn vocabulary(entries: &[String], replacements: &[String], typed_and_shown: 
 #[derive(Default)]
 pub struct Seen<'a> {
     pub typed: &'a [&'a str],
-    /// One text per screen or photo: a word counts once per screen.
+    /// One text per screen or photo: a word must be on several to be a term (one read of a screen
+    /// misreads the same way however long it stays)…
     pub shown: &'a [&'a str],
+    /// …and the terms the most shown come first, a screen counting as often as `shown`'s text at
+    /// the same place says (`visuals::showings`: a slide that stayed for minutes is shown again and
+    /// again); missing means once.
+    pub shown_weight: &'a [usize],
     /// The transcript: only to tell ordinary words (written in small letters there).
     pub said: &'a [&'a str],
 }
@@ -747,8 +752,10 @@ fn in_code(line: &str, range: &Range<usize>) -> bool {
 struct ShownWord {
     /// Each way it was written and how often, in the order first seen.
     forms: Vec<(String, usize)>,
-    /// On how many screens and photos.
+    /// On how many screens and photos…
     screens: usize,
+    /// …and how often shown (`Seen::shown_weight`).
+    shown: usize,
     typed: bool,
     meaning: Option<String>,
 }
@@ -768,8 +775,9 @@ pub fn shown_terms(seen: &Seen, dictionary: Option<Dictionary>) -> Vec<Term> {
     let (mut plain, mut small): (HashSet<String>, HashSet<String>) = Default::default();
     // On how many screens and photos each word is, whatever it looks like (see `misread`).
     let mut on_screens: HashMap<String, usize> = HashMap::new();
-    let texts = seen.typed.iter().map(|t| (*t, Some(true))).chain(seen.shown.iter().map(|t| (*t, Some(false))));
-    for (text, typed) in texts.chain(seen.said.iter().map(|t| (*t, None))) {
+    let weight = |i: usize| seen.shown_weight.get(i).copied().unwrap_or(1).max(1);
+    let texts = seen.typed.iter().map(|t| (*t, Some(true), 0)).chain(seen.shown.iter().enumerate().map(|(i, t)| (*t, Some(false), weight(i))));
+    for (text, typed, times) in texts.chain(seen.said.iter().map(|t| (*t, None, 0))) {
         let mut here: HashSet<String> = HashSet::new();
         if typed == Some(false) {
             let unique: HashSet<String> = text.lines().flat_map(|l| tokens(l).into_iter().map(move |t| l[t.range].to_lowercase())).collect();
@@ -808,6 +816,7 @@ pub fn shown_terms(seen: &Seen, dictionary: Option<Dictionary>) -> Vec<Term> {
                         entry.typed = true;
                     } else {
                         entry.screens += 1;
+                        entry.shown += times;
                     }
                 }
             }
@@ -851,7 +860,7 @@ pub fn shown_terms(seen: &Seen, dictionary: Option<Dictionary>) -> Vec<Term> {
     };
     let mut kept: Vec<(bool, (usize, ShownWord, String))> = kept.into_iter().enumerate().map(|(i, k)| (heard.contains(&i), k)).collect();
     // What the user typed first, then names heard, then the most shown; else as first seen.
-    kept.sort_by_key(|(heard, (order, w, _))| (!w.typed, !heard, std::cmp::Reverse(w.screens), *order));
+    kept.sort_by_key(|(heard, (order, w, _))| (!w.typed, !heard, std::cmp::Reverse(w.shown), *order));
     let kept: Vec<(usize, ShownWord, String)> = kept.into_iter().map(|(_, k)| k).collect();
     kept.into_iter().take(SHOWN_MAX).map(|(_, w, form)| Term { text: form, meaning: w.meaning }).collect()
 }
@@ -1502,7 +1511,7 @@ mod tests {
         let said = ["Das Bronze-Modul hat ein Eigenschaften-Feld, core."];
         let known = ["Termin", "Eigenschaften", "Überblick", "Admin", "Modul", "Module", "Kasse", "Source", "Truth"];
         let dictionary = |w: &str| known.contains(&w);
-        let seen = Seen { typed: &["Termin mit Zollinka"], shown: &screens, said: &said };
+        let seen = Seen { typed: &["Termin mit Zollinka"], shown: &screens, said: &said, ..Default::default() };
         let names = |v: Vec<Term>| v.into_iter().map(|t| t.text).collect::<Vec<_>>();
         // What the user typed first, then by how many screens show it, in its usual spelling.
         // Ordinary words (also in capitals: written in small letters elsewhere, or common), OCR
@@ -1545,6 +1554,29 @@ mod tests {
         let seen = Seen { shown: &screens, ..Default::default() };
         let names: Vec<String> = shown_terms(&seen, Some(&dictionary)).into_iter().map(|t| t.text).collect();
         assert_eq!(names, ["Brontix"]);
+    }
+
+    #[test]
+    fn a_screen_that_stayed_is_read_once_but_shown_long() {
+        // Thirty screens: a name must be on three. "Premil" (the OCR's "Prefill") is on one slide
+        // that stayed for minutes: one read, however long. "Kelnor" and "Brontix" are on three
+        // screens each, Kelnor's for longer: the most shown first.
+        let mut texts: Vec<&str> = vec!["Formular"; 30];
+        texts[0] = "Premil Overview";
+        texts[1] = "Brontix | Formular 1";
+        texts[2] = "Brontix | Formular 2";
+        texts[3] = "Brontix | Formular 3";
+        texts[4] = "Formular 4 | Kelnor";
+        texts[5] = "Formular 5 | Kelnor";
+        texts[6] = "Formular 6 | Kelnor";
+        let mut weight = vec![1; 30];
+        weight[0] = 5;
+        weight[4] = 3;
+        let known = ["Formular", "Overview"];
+        let dictionary = |w: &str| known.contains(&w);
+        let names = |seen: &Seen| shown_terms(seen, Some(&dictionary)).into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(names(&Seen { shown: &texts, shown_weight: &weight, ..Default::default() }), ["Kelnor", "Brontix"]);
+        assert_eq!(names(&Seen { shown: &texts, ..Default::default() }), ["Brontix", "Kelnor"], "as often shown: as first seen");
     }
 
     #[test]

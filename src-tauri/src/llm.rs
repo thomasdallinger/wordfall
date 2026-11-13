@@ -395,15 +395,15 @@ pub const SHOWN: &str = " Lines marked \"Screen:\" or \"Photo:\" are not speech:
      misheard them.";
 
 /// Section headings in the notes' language (others are translated by the model).
-fn headings(language: &str) -> [&'static str; 3] {
+fn headings(language: &str) -> [&'static str; 4] {
     match language {
-        "German" => ["Entscheidungen", "Aufgaben", "Notizen"],
-        "French" => ["Décisions", "Actions", "Notes"],
-        "Spanish" => ["Decisiones", "Tareas", "Notas"],
-        "Italian" => ["Decisioni", "Compiti", "Note"],
-        "Dutch" => ["Besluiten", "Actiepunten", "Notities"],
-        "Portuguese" => ["Decisões", "Tarefas", "Notas"],
-        _ => ["Decisions", "Action items", "Notes"],
+        "German" => ["Entscheidungen", "Aufgaben", "Nächste Schritte", "Notizen"],
+        "French" => ["Décisions", "Actions", "Prochaines étapes", "Notes"],
+        "Spanish" => ["Decisiones", "Tareas", "Próximos pasos", "Notas"],
+        "Italian" => ["Decisioni", "Compiti", "Prossimi passi", "Note"],
+        "Dutch" => ["Besluiten", "Actiepunten", "Volgende stappen", "Notities"],
+        "Portuguese" => ["Decisões", "Tarefas", "Próximos passos", "Notas"],
+        _ => ["Decisions", "Action items", "Next steps", "Notes"],
     }
 }
 
@@ -421,7 +421,7 @@ pub fn open_questions_heading(language: &str) -> &'static str {
 }
 
 fn format_instructions(language: &str) -> String {
-    let [decisions, actions, notes] = headings(language);
+    let [decisions, actions, next, notes] = headings(language);
     format!(
         "Write the meeting notes in {language}, in exactly this structure, and nothing else:
 
@@ -434,6 +434,9 @@ Two or three sentences: what the meeting was about and what came out of it.
 
 ## {actions}
 - [ ] **Who**: what, and by when only if a date was said. Only what someone said they would do: questions and advice aren't tasks. Leave this section out if there were no tasks.
+
+## {next}
+- How it goes on: the next meeting (when, if said) and every topic someone wants to cover there, and what is still to be clarified and by whom. This is usually said in the last minutes: read them closely. Leave this section out if nothing was said about it.
 
 ## {notes}
 ### A heading per topic

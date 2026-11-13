@@ -217,11 +217,12 @@ pub fn name_speakers(sightings: &[Sighting], segments: &[super::Segment], speake
     }
 }
 
-/// Names on at least `MIN_FRAMES` frames, the most seen first: the people on the call's video
-/// tiles, whether or not a voice could be tied to them yet (for the map's last look, which runs
-/// before the final speakers).
-pub fn on_screen(sightings: &[Sighting]) -> Vec<String> {
-    frames_by_name(sightings).into_iter().filter(|(_, frames)| frames.len() >= MIN_FRAMES).map(|(name, _)| name).collect()
+/// The people on the call's video tiles (for the map's last look, which runs before the final
+/// speakers): the names that follow a voice (`links`). A two-word label of shared content ("Alle
+/// Anlagen", "Anzahl Stützen", a page title) is on screen whoever talks: no person, however often
+/// it is there.
+pub fn on_screen(sightings: &[Sighting], segments: &[super::Segment]) -> Vec<String> {
+    links(sightings, segments).into_iter().map(|(_, name)| name).collect()
 }
 
 /// The people the screen showed with a voice (`links`), for the notes: "Me" by the name on screen
@@ -239,13 +240,10 @@ mod tests {
     }
 
     #[test]
-    fn people_on_screen_are_names_on_several_frames() {
-        let mut sightings = Vec::new();
-        for (i, rows) in [vec!["Ada Lovelace"], vec!["Ada Lovelace", "Alan Turing"], vec!["Ada Lovelace"], vec!["Alan Turing"], vec!["Grace Hopper"]].iter().enumerate() {
-            record(&mut sightings, &rows.iter().map(|r| r.to_string()).collect::<Vec<_>>(), i as u64 * 10_000);
-        }
-        // On three frames or more; once or twice is a page that went by.
-        assert_eq!(on_screen(&sightings), ["Ada Lovelace"]);
+    fn people_on_screen_are_the_names_that_follow_a_voice() {
+        let (sightings, segments) = spotlight_call(tile);
+        // The page title ("Power Center") and the silent participant's tile are there whoever talks.
+        assert_eq!(on_screen(&sightings, &segments), ["Konrad Bauer", "Oskar Ebersberger", "Anna Berg"]);
     }
 
     #[test]

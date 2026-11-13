@@ -341,6 +341,18 @@ fn compare(shown: &[&str], rows: &[String], chrome: &HashSet<String>) -> (Seen, 
     }
 }
 
+/// How many times a visual counts as shown when words on it are counted: a photo once; a screen
+/// once and once more for each full minute it stayed (at most `SHOWINGS_MAX`). Frames of the same
+/// screen are one visual, so a slide left up for minutes would otherwise count as often as a
+/// form that flashed by.
+pub fn showings(v: &Visual) -> usize {
+    match v.source {
+        Source::Photo => 1,
+        Source::Screen => (1 + (v.last_ms().saturating_sub(v.at_ms) / 60_000) as usize).min(SHOWINGS_MAX),
+    }
+}
+const SHOWINGS_MAX: usize = 5;
+
 /// At most this many distinct screens are kept per meeting (four hours of a slide a minute).
 pub const MAX_SCREENS: usize = 240;
 

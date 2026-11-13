@@ -666,14 +666,10 @@ fn room_of(m: &Meeting) -> system_map::Room {
 }
 
 /// Names as the meeting's screens, photos, notes and goal spell them (the meeting's vocabulary, see
-/// `terms::vocabulary`): the map takes these spellings for names heard otherwise.
-fn map_spellings(m: &Meeting) -> Vec<String> {
-    let mut typed: Vec<&str> = vec![&m.notes, &m.goal];
-    if m.title_from_user {
-        typed.push(&m.title);
-    }
-    typed.extend(m.visuals.iter().map(|v| v.text.as_str()));
-    terms::vocabulary(&[], &[], &typed).into_iter().map(|t| t.text).collect()
+/// `seen_vocabulary`, without the user's words for other meetings): the map takes these spellings
+/// for names heard otherwise.
+fn map_spellings(m: &Meeting, languages: &[String]) -> Vec<String> {
+    seen_vocabulary(&[], &[], languages, m).into_iter().map(|t| t.text).collect()
 }
 
 /// The map's input for the talk since `cursor`. `earlier` holds the last lines before it,
@@ -713,7 +709,7 @@ fn live_map_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<Meeti
     let snapshot = meeting.lock().clone();
     let language = pipeline::meeting_language(&snapshot.segments);
     let mut earlier = Vec::new();
-    let spellings = map_spellings(&snapshot);
+    let spellings = map_spellings(&snapshot, &c.settings.read().languages);
     let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier, &spellings, &[]);
     let started = Instant::now();
     let run = system_map::run(w, &input)?;
@@ -741,11 +737,24 @@ fn live_map_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<Meeti
 /// people the overview screens and the whole talk show, applied to the map as it is by then.
 fn live_closing_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<Meeting>>, cursor: &MapCursor) -> anyhow::Result<()> {
     let c = app.state::<Core>();
+    // The people on the call's video tiles first, so the last look can tie flows to them.
+    let (people, added) = {
+        let mut m = meeting.lock();
+        let people = names::on_screen(&m.screen_names, &m.segments);
+        let now = m.duration_ms;
+        let added = !system_map::add_people(&mut m.system_map, &people, now).is_empty();
+        if added {
+            save(&c.dir, &m);
+        }
+        (people, added)
+    };
     let snapshot = meeting.lock().clone();
+    if added {
+        emit_map(app, &snapshot.id);
+    }
     let language = pipeline::meeting_language(&snapshot.segments);
-    let spellings = map_spellings(&snapshot);
+    let spellings = map_spellings(&snapshot, &c.settings.read().languages);
     let mut earlier = Vec::new();
-    let people = names::on_screen(&snapshot.screen_names);
     let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier, &spellings, &people);
     let started = Instant::now();
     let Some(run) = system_map::closing(w, &input)? else { return Ok(()) };
@@ -1543,16 +1552,24 @@ fn notes_glossary(vocabulary: &[terms::Term], lines: &[String]) -> Vec<String> {
 fn meeting_vocabulary(entries: &[String], dictionary: &[crate::store::DictEntry], settings: &Settings, m: &Meeting) -> Vec<terms::Term> {
     let replacements: Vec<String> =
         if settings.dictionary_enabled { dictionary.iter().map(|e| e.replacement.clone()).collect() } else { Vec::new() };
+    seen_vocabulary(entries, &replacements, &settings.languages, m)
+}
+
+/// `terms::vocabulary_seen` of `entries`, `replacements` and what `m` typed, showed (each screen
+/// counted by how long it stayed, `visuals::showings`) and said.
+fn seen_vocabulary(entries: &[String], replacements: &[String], languages: &[String], m: &Meeting) -> Vec<terms::Term> {
     let mut typed: Vec<&str> = vec![&m.notes, &m.goal];
     if m.title_from_user {
         typed.push(&m.title);
     }
     let shown: Vec<&str> = m.visuals.iter().map(|v| v.text.as_str()).collect();
+    let shown_weight: Vec<usize> = m.visuals.iter().map(visuals::showings).collect();
     let said: Vec<&str> = m.segments.iter().map(|s| s.text.as_str()).collect();
-    let is_word = |w: &str| crate::platform::is_word(w, &settings.languages);
+    let is_word = |w: &str| crate::platform::is_word(w, languages);
     // Windows has no spell checker to ask yet: names written like ordinary words are left out there.
     let spell_checker: Option<terms::Dictionary> = cfg!(target_os = "macos").then_some(&is_word);
-    terms::vocabulary_seen(entries, &replacements, &terms::Seen { typed: &typed, shown: &shown, said: &said }, spell_checker)
+    let seen = terms::Seen { typed: &typed, shown: &shown, shown_weight: &shown_weight, said: &said };
+    terms::vocabulary_seen(entries, replacements, &seen, spell_checker)
 }
 
 /// Fixes misheard terms in the finished meeting's transcript before the notes read it (see
@@ -1731,7 +1748,7 @@ impl CliAssist {
         let t = now_ms as f32 / 1000.0;
         let language = pipeline::meeting_language(&meeting.segments);
         let mut earlier = Vec::new();
-        let spellings = map_spellings(meeting);
+        let spellings = map_spellings(meeting, &self.settings.languages);
         let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier, &spellings, &[]);
         let started = Instant::now();
         let run = system_map::run(&mut self.worker, &input)?;
@@ -1754,9 +1771,12 @@ impl CliAssist {
     fn closing_step(&mut self, meeting: &mut Meeting, now_ms: u64) -> anyhow::Result<()> {
         let t = now_ms as f32 / 1000.0;
         let language = pipeline::meeting_language(&meeting.segments);
-        let spellings = map_spellings(meeting);
+        let spellings = map_spellings(meeting, &self.settings.languages);
         let mut earlier = Vec::new();
-        let people = names::on_screen(&meeting.screen_names);
+        let people = names::on_screen(&meeting.screen_names, &meeting.segments);
+        for l in system_map::add_people(&mut meeting.system_map, &people, now_ms) {
+            eprintln!("[{t:>6.1}s] map {l}");
+        }
         let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier, &spellings, &people);
         let started = Instant::now();
         let Some(run) = system_map::closing(&mut self.worker, &input)? else { return Ok(()) };
