@@ -210,7 +210,8 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   text stays.
 - **After:** the last seconds are transcribed, the whole recording is transcribed once more, more carefully (about
   5 minutes for an hour of meeting on an Apple Silicon Mac; the meeting shows *Improving the transcript…* and how
-  far it is), speakers are labelled (click a name to rename someone), misheard terms are fixed (below), and the
+  far it is), speakers are labelled (named after the call's video tiles when the shared screen was read and the person talking
+  is shown, as Meet, Teams and Zoom do; click a name to rename someone), misheard terms are fixed (below), and the
   notes are written: about a minute for an hour of meeting on a recent GPU or Apple Silicon Mac, a few minutes for
   three hours. Notes are in the language the meeting was held in. *Write the notes again* picks up renamed speakers, edited notes and new words to
   recognise.

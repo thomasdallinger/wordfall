@@ -20,8 +20,14 @@ const MODEL_BYTES: u64 = 29_596_978;
 const WINDOW: usize = 200;
 /// Shorter speech gives unreliable embeddings; those segments take a neighbour's speaker.
 const MIN_SAMPLES: usize = 12_800;
-/// Average cosine similarity above which two groups of segments are the same voice.
+/// Live: cosine similarity above which a segment (or a group of segments) is a known voice.
 pub const SAME_VOICE: f32 = 0.55;
+/// Final: cosine similarity of two voices' centroids above which they are one voice. Higher than
+/// `SAME_VOICE`: a centroid averages away what tells one segment from another, but not the colouring
+/// of the channel everyone is heard through (a call's codec, a room's microphone). Two people on one
+/// call came out at 0.59, two in one room at 0.55–0.6, while the first and second half of one
+/// person's talk score about 0.9.
+const SAME_VOICE_CENTROIDS: f32 = 0.64;
 /// A first pass merges near-identical segments so the full clustering stays small.
 const PRE_MERGE: f32 = 0.75;
 /// A voice needs this much speech to stand on its own...
@@ -167,7 +173,7 @@ pub fn cluster(items: &[Item]) -> (Vec<usize>, usize) {
                 }
             }
         }
-        if best.2 < SAME_VOICE {
+        if best.2 < SAME_VOICE_CENTROIDS {
             break;
         }
         merge(&mut clusters, best.0, best.1);
@@ -492,6 +498,23 @@ mod tests {
         forget_voice(&dir).unwrap();
         assert!(print_wants_voice(&dir, &models), "forgotten: learns again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_people_heard_through_one_channel_stay_apart() {
+        // Both voices share the call's colouring (axis 2): their centroids score 0.6, as a
+        // presenter and a visitor on one call did; each person's segments vary a little.
+        let (a, b) = (unit(&[(0, 1.0), (2, 1.2247)]), unit(&[(1, 1.0), (2, 1.2247)]));
+        assert!((cosine_sim(&a, &b) - 0.6).abs() < 0.01);
+        let embs: Vec<Vec<f32>> = (0..24).map(|i| noisy(if i % 3 == 2 { &b } else { &a }, i)).collect();
+        let items: Vec<Item> = embs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| Item { embedding: Some(e), start_ms: i as u64 * 10_000, end_ms: i as u64 * 10_000 + 9_000 })
+            .collect();
+        let (labels, n) = cluster(&items);
+        assert_eq!(n, 2);
+        assert!(labels.iter().enumerate().all(|(i, &l)| l == usize::from(i % 3 == 2)));
     }
 
     #[test]

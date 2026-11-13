@@ -70,10 +70,13 @@ fn read_rows(c: &Core, path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(visuals::rows(&platform::ocr(path, &languages, &ocr_words(c))?))
 }
 
-/// The text rows of a picture of the shared screen (see `visuals::screen_rows`).
-fn read_screen_rows(c: &Core, path: &Path) -> anyhow::Result<Vec<String>> {
+/// The text rows of a picture of the shared screen: what was shown (`visuals::screen_rows`, without
+/// a sidebar or a video tile's label) and all of it (`visuals::rows`; the names on the call's video
+/// tiles are what `names` looks for).
+fn read_frame(c: &Core, path: &Path) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let languages = c.settings.read().languages.clone();
-    Ok(visuals::screen_rows(&platform::ocr(path, &languages, &ocr_words(c))?))
+    let lines = platform::ocr(path, &languages, &ocr_words(c))?;
+    Ok((visuals::screen_rows(&lines), visuals::rows(&lines)))
 }
 
 /// The text rows of an image file, read upright and at a size that keeps small print (for the
@@ -83,9 +86,10 @@ pub fn read_file(path: &Path, languages: &[String], words: &[String]) -> anyhow:
 }
 
 /// The text rows of an image file showing a shared screen, as the app's screen reading reads
-/// them (for the command line's `--screen-frames`).
-pub fn read_screen_file(path: &Path, languages: &[String], words: &[String]) -> anyhow::Result<Vec<String>> {
-    Ok(visuals::screen_rows(&read_boxes(path, languages, words)?))
+/// them (see `read_frame`; for the command line's `--screen-frames`).
+pub fn read_frame_file(path: &Path, languages: &[String], words: &[String]) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let lines = read_boxes(path, languages, words)?;
+    Ok((visuals::screen_rows(&lines), visuals::rows(&lines)))
 }
 
 /// The OCR boxes of an image file, read upright and at a size that keeps small print.
@@ -392,7 +396,7 @@ pub fn screen_loop(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &Atomic
             continue;
         }
         let started = Instant::now();
-        let rows = match read_screen_rows(&c, &frame) {
+        let (rows, all_rows) = match read_frame(&c, &frame) {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("screen reading: {e:#}");
@@ -406,7 +410,7 @@ pub fn screen_loop(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &Atomic
             continue;
         }
         set_status(app, &id, ScreenStatus::Reading);
-        observe(app, meeting, &frame, &window, rows, started);
+        observe(app, meeting, &frame, &window, rows, &all_rows, started);
     }
     let _ = std::fs::remove_file(&frame);
     // A newer meeting's loop may have taken over the state already.
@@ -419,13 +423,16 @@ pub fn screen_loop(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &Atomic
     emit_screen(app, &id);
 }
 
-/// Keeps a frame of the shared screen if it shows something new.
-fn observe(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, frame: &Path, window: &ScreenWindow, rows: Vec<String>, started: Instant) {
+/// Keeps a frame of the shared screen if it shows something new (`rows`, what was shown), and the
+/// names on it (`all_rows`, with the video tiles' labels).
+#[allow(clippy::too_many_arguments)]
+fn observe(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, frame: &Path, window: &ScreenWindow, rows: Vec<String>, all_rows: &[String], started: Instant) {
     let c = app.state::<Core>();
     let (id, now_ms, verdict) = {
         let mut m = meeting.lock();
         let now_ms = m.duration_ms;
         let verdict = visuals::observe(&mut m.visuals, &rows, now_ms);
+        super::names::record(&mut m.screen_names, all_rows, now_ms);
         (m.id.clone(), now_ms, verdict)
     };
     log::info!("screen reading: {} rows in {} ms, {verdict:?}", rows.len(), started.elapsed().as_millis());

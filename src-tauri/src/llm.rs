@@ -333,6 +333,8 @@ pub struct SummaryInput<'a> {
     /// said, in their spelling ("PO = what it stands for" where the user said).
     pub glossary: &'a [String],
     pub speakers: &'a [String],
+    /// Who was on the call by the names on screen ("Name (Me)" for the user), see `meetings::names`.
+    pub participants: &'a [String],
     pub language: Option<&'a str>,
     /// e.g. "Monday 9 November 2026, 14:00"
     pub when: &'a str,
@@ -446,6 +448,9 @@ fn final_prompt(input: &SummaryInput, language: &str, body_label: &str, body: &s
     if !input.speakers.is_empty() {
         p.push_str(&format!("Speakers as labelled below: {}.
 ", input.speakers.join(", ")));
+    }
+    if !input.participants.is_empty() {
+        p.push_str(&format!("People on the call, by the names the screen showed while they talked: {}.\n", input.participants.join(", ")));
     }
     if !input.glossary.is_empty() {
         p.push_str(&format!(
@@ -641,6 +646,30 @@ pub fn title_of(summary: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_notes_prompt_names_the_people_on_screen() {
+        let speakers = ["Me".to_string(), "Konrad Bauer".to_string()];
+        let participants = ["Konrad Bauer".to_string(), "Tobias Dorfer (Me)".to_string()];
+        let mut input = SummaryInput {
+            title: None,
+            goal: None,
+            notes: "",
+            transcript: &[],
+            shown: false,
+            glossary: &[],
+            speakers: &speakers,
+            participants: &participants,
+            language: None,
+            when: "Friday 13 November 2026, 10:00",
+            minutes: 60,
+        };
+        let p = final_prompt(&input, "English", "transcript", "[00:01] Konrad Bauer: Hello.");
+        assert!(p.contains("Speakers as labelled below: Me, Konrad Bauer.\n"));
+        assert!(p.contains("People on the call, by the names the screen showed while they talked: Konrad Bauer, Tobias Dorfer (Me).\n"));
+        input.participants = &[];
+        assert!(!final_prompt(&input, "English", "transcript", "").contains("People on the call"));
+    }
 
     #[test]
     fn cleans_reasoning_and_fences() {

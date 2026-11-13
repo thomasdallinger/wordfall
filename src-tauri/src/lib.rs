@@ -351,6 +351,13 @@ pub fn run() {
         }
         return;
     }
+    if args.iter().any(|a| a == "--relabel") {
+        if let Err(e) = meetings::cli_relabel(&args) {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--transcript") {
         if let Err(e) = meetings::cli_transcript(&args) {
             eprintln!("error: {e:#}");

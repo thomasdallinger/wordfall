@@ -6,6 +6,7 @@
 //! in memory is the truth and every edit goes through it; otherwise edits load and save the file.
 
 mod capture;
+mod names;
 mod pipeline;
 mod questions;
 mod system_map;
@@ -114,6 +115,10 @@ pub struct Meeting {
     pub visuals: Vec<Visual>,
     /// The highest visual id handed out; a deleted visual's id isn't given again (see `new_visual_id`).
     pub last_visual_id: u32,
+    /// Names read on the shared screen, from a frame every 10 s (see `names.rs`): what names the
+    /// speakers at the end.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub screen_names: Vec<names::Sighting>,
     /// Places the term check turned down (see `terms.rs`), not asked about again when the notes
     /// are written again.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1154,12 +1159,17 @@ fn record(
 }
 
 /// Puts the finished meeting's `segments` into the open copy with speaker labels over the whole
-/// meeting (`pipeline::assign_speakers`). The labels start from the speakers as they are now, not
-/// as copied before the final pass: the user may have named one while it ran (it takes minutes).
-/// Only what this changes is written; the live model may have updated the map or questions.
+/// meeting (`pipeline::assign_speakers`), named after the names on screen while they talked
+/// (`names::name_speakers`). The labels start from the speakers as they are now, not as copied
+/// before the final pass: the user may have named one while it ran (it takes minutes). Only what
+/// this changes is written; the live model may have updated the map or questions.
 fn settle_speakers(meeting: &Mutex<Meeting>, mut segments: Vec<Segment>, embeddings: &pipeline::Embeddings, hints: &pipeline::MeHints, diarize: bool) {
     let mut g = meeting.lock();
     pipeline::assign_speakers(&mut segments, embeddings, hints, &mut g.speakers, diarize);
+    if diarize {
+        let g = &mut *g;
+        names::name_speakers(&g.screen_names, &segments, &mut g.speakers);
+    }
     g.language = pipeline::meeting_language(&segments);
     g.segments = segments;
 }
@@ -1452,6 +1462,7 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
         let used: Vec<u32> = snapshot.segments.iter().map(|s| s.speaker).collect();
         let speakers: Vec<String> =
             snapshot.speakers.iter().filter(|s| used.contains(&s.id)).map(|s| s.name.clone()).collect();
+        let participants = names::participants(&snapshot.screen_names, &snapshot.segments);
         let when = chrono::DateTime::parse_from_rfc3339(&snapshot.started_at)
             .map(|t| t.with_timezone(&chrono::Local).format("%A %-d %B %Y, %H:%M").to_string())
             .unwrap_or_default();
@@ -1463,6 +1474,7 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
             shown: visuals::any_shown(&lines),
             glossary: &glossary,
             speakers: &speakers,
+            participants: &participants,
             language: snapshot.language.as_deref(),
             when: &when,
             minutes: snapshot.duration_ms / 60_000,
@@ -1966,7 +1978,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     }
     if let Some(path) = arg("--save-transcript") {
         // What the live model saw, for replaying it with `--transcript` (no speech recognition).
-        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers, "visuals": meeting.visuals }))?)?;
+        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers, "visuals": meeting.visuals, "screenNames": meeting.screen_names }))?)?;
     }
     if let Some(mut a) = asker {
         a.done(&mut meeting, longest as u64 / 16, arg("--map-json").as_deref())?;
@@ -2008,7 +2020,15 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     });
     let hints = pipeline::MeHints { print: print.as_deref(), levels: &levels };
     pipeline::assign_speakers(&mut meeting.segments, &embeddings, &hints, &mut meeting.speakers, embedder.is_some());
+    if embedder.is_some() {
+        names::name_speakers(&meeting.screen_names, &meeting.segments, &mut meeting.speakers);
+    }
     eprintln!("speakers: live up to id {live_ids}, final {}", meeting.speakers.len());
+    for s in &meeting.speakers {
+        let mine = meeting.segments.iter().filter(|g| g.speaker == s.id);
+        let ms: u64 = mine.clone().map(|g| g.end_ms.saturating_sub(g.start_ms)).sum();
+        eprintln!("speaker {} {:?}: {} segments, {:.0}s", s.id, s.name, mine.count(), ms as f32 / 1000.0);
+    }
     meeting.language = pipeline::meeting_language(&meeting.segments);
     meeting.visuals.append(&mut shown);
     let vocabulary = cli_vocabulary(args, &data_dir, &settings, &meeting)?;
@@ -2017,7 +2037,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     }
     if let Some(path) = arg("--save-final") {
         // The final segments and speakers, as the app saves them in meeting.json.
-        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers, "visuals": meeting.visuals }))?)?;
+        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers, "visuals": meeting.visuals, "screenNames": meeting.screen_names }))?)?;
     }
     let lines = pipeline::timeline_lines(&meeting.segments, &meeting.speakers, &meeting.visuals, visuals::NOTES);
     println!("--- transcript ({:.1}s for {:.0}s of audio) ---", transcribed.as_secs_f32(), longest as f32 / 16_000.0);
@@ -2045,8 +2065,9 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let speakers: Vec<String> = meeting.speakers.iter().map(|s| s.name.clone()).collect();
+    let participants = names::participants(&meeting.screen_names, &meeting.segments);
     let glossary = notes_glossary(&vocabulary, &lines);
-    print_notes(&data_dir, &settings, &lines, &speakers, meeting.language.as_deref(), meeting.duration_ms / 60_000, &meeting.notes, &glossary, &extra, args)
+    print_notes(&data_dir, &settings, &lines, &speakers, &participants, meeting.language.as_deref(), meeting.duration_ms / 60_000, &meeting.notes, &glossary, &extra, args)
 }
 
 /// `wordfall --transcript <saved.json> --map [--questions] [--note-at "90:text"] [--llm <id>] [--map-json f]`:
@@ -2141,7 +2162,8 @@ pub fn cli_notes(args: &[String]) -> anyhow::Result<()> {
             lines.iter().filter(|l| visuals::any_shown(std::slice::from_ref(l))).for_each(|l| eprintln!("{l}"));
         }
         let glossary = notes_glossary(&vocabulary, &lines);
-        return print_notes(&data_dir, &settings, &lines, &speakers, language.as_deref(), minutes, &notes, &glossary, &[], args);
+        let participants = names::participants(&m.screen_names, &m.segments);
+        return print_notes(&data_dir, &settings, &lines, &speakers, &participants, language.as_deref(), minutes, &notes, &glossary, &[], args);
     }
     let line = regex::Regex::new(r"^\[[\d:]+\] ([^:]+): ")?;
     let lines: Vec<String> = content.lines().filter(|l| line.is_match(l)).map(str::to_string).collect();
@@ -2161,7 +2183,89 @@ pub fn cli_notes(args: &[String]) -> anyhow::Result<()> {
     let minutes = arg("--minutes").and_then(|m| m.parse().ok()).unwrap_or(1);
     let vocabulary = cli_vocabulary(args, &data_dir, &settings, &Meeting { notes: notes.clone(), visuals: shown, ..Default::default() })?;
     let glossary = notes_glossary(&vocabulary, &lines);
-    print_notes(&data_dir, &settings, &lines, &speakers, arg("--language").as_deref(), minutes, &notes, &glossary, &[], args)
+    print_notes(&data_dir, &settings, &lines, &speakers, &[], arg("--language").as_deref(), minutes, &notes, &glossary, &[], args)
+}
+
+/// `wordfall --relabel <saved.json> [--mic mic.wav] [--system system.wav] [--screen-frames dir] [--voice v.json]
+/// [--embeddings cache.tsv] [--save-final out.json]`: tells the speakers of a transcript `--meeting … --save-final`
+/// saved apart again, and names them from the screen, as at the end of a meeting (`pipeline::assign_speakers`,
+/// `names::name_speakers`), without transcribing it again. The voice of each segment comes from the recordings
+/// (or the `--embeddings` file a run before wrote: one line per segment, "start end channel v1,v2,…").
+/// The screen's names come from `--screen-frames` or the saved file. For working on speakers.
+pub fn cli_relabel(args: &[String]) -> anyhow::Result<()> {
+    let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let path = arg("--relabel").ok_or_else(|| anyhow::anyhow!("missing saved transcript"))?;
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("no data dir"))?.join("com.wordfall.app");
+    let settings = Settings::load(&data_dir);
+    let mut m: Meeting = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)?;
+    let mut sources: Vec<(Channel, Vec<f32>)> = Vec::new();
+    for (flag, channel) in [("--mic", Channel::Mic), ("--system", Channel::System)] {
+        if let Some(f) = arg(flag) {
+            sources.push((channel, crate::audio::read_wav_16k(Path::new(&f))?));
+        }
+    }
+    let audio_of = |s: &Segment| -> Option<Vec<f32>> {
+        let audio = &sources.iter().find(|(c, _)| *c == s.channel)?.1;
+        let (a, b) = ((s.start_ms * 16) as usize, (s.end_ms * 16) as usize);
+        audio.get(a.min(audio.len())..b.min(audio.len())).map(<[f32]>::to_vec)
+    };
+    let cache = arg("--embeddings");
+    let cached = cache.as_deref().and_then(|f| std::fs::read_to_string(f).ok()).map(|text| {
+        text.lines()
+            .map(|l| l.split('\t').nth(3).filter(|v| !v.is_empty()).map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect::<Vec<f32>>()))
+            .collect::<Vec<_>>()
+    });
+    let embeddings: Vec<Option<Vec<f32>>> = match cached.filter(|c| c.len() == m.segments.len()) {
+        Some(c) => c,
+        None => {
+            let model_dirs = settings.model_dirs(&data_dir);
+            let embedder = Embedder::load(&speakers::model_path(&model_dirs.own).ok_or_else(|| anyhow::anyhow!("no speaker model"))?)?;
+            let t = Instant::now();
+            let out: Vec<Option<Vec<f32>>> = m.segments.iter().map(|s| audio_of(s).and_then(|a| embedder.embed(&a).ok().flatten())).collect();
+            eprintln!("(embedded {} segments in {:.1}s)", out.len(), t.elapsed().as_secs_f32());
+            if let Some(f) = &cache {
+                let lines: Vec<String> = m
+                    .segments
+                    .iter()
+                    .zip(&out)
+                    .map(|(s, e)| {
+                        let v = e.as_ref().map(|e| e.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+                        format!("{}\t{}\t{:?}\t{v}", s.start_ms, s.end_ms, s.channel)
+                    })
+                    .collect();
+                std::fs::write(f, lines.join("\n") + "\n")?;
+            }
+            out
+        }
+    };
+    let print = match arg("--voice") {
+        Some(p) => Some(crate::storage::read_json::<speakers::VoicePrint>(Path::new(&p)).ok_or_else(|| anyhow::anyhow!("can't read {p}"))?.embedding),
+        None => voice_print(&data_dir, &settings),
+    };
+    let levels = segment_levels(&m.segments, |ch, start, len| {
+        let audio = &sources.iter().find(|(c, _)| *c == ch)?.1;
+        audio.get(start.min(audio.len())..(start + len).min(audio.len())).map(<[f32]>::to_vec)
+    });
+    let frames = cli_screen_frames(args, &settings)?;
+    if !frames.is_empty() {
+        m.screen_names.clear();
+        for (at_ms, _, all) in &frames {
+            names::record(&mut m.screen_names, all, *at_ms);
+        }
+    }
+    m.speakers = vec![Speaker { id: ME, name: "Me".into(), renamed: false }];
+    let hints = pipeline::MeHints { print: print.as_deref(), levels: &levels };
+    pipeline::assign_speakers(&mut m.segments, &embeddings, &hints, &mut m.speakers, true);
+    names::name_speakers(&m.screen_names, &m.segments, &mut m.speakers);
+    for s in &m.speakers {
+        let mine: Vec<&Segment> = m.segments.iter().filter(|g| g.speaker == s.id).collect();
+        let ms: u64 = mine.iter().map(|g| g.end_ms.saturating_sub(g.start_ms)).sum();
+        eprintln!("speaker {} {:?}: {} segments, {:.0}s", s.id, s.name, mine.len(), ms as f32 / 1000.0);
+    }
+    if let Some(out) = arg("--save-final") {
+        std::fs::write(&out, serde_json::to_string_pretty(&m)?)?;
+    }
+    Ok(())
 }
 
 /// `--screen-text "90:f.txt"` (a screen at 90 s showing the file's lines, the same on any computer)
@@ -2198,22 +2302,27 @@ fn cli_visuals(args: &[String], settings: &Settings) -> anyhow::Result<Vec<Visua
 
 /// `--screen-frames <dir>`: frames of a shared screen as the app reads one every 10 s, for the
 /// meeting commands. Each file is named by its meeting time in seconds ("130.txt", "130.jpg"); a
-/// `.txt` holds the rows the OCR read (one a line, as `--ocr` prints them), an image is read with
-/// the OCR. They go through `visuals::observe` like the app's frames (see `observe_due`).
-fn cli_screen_frames(args: &[String], settings: &Settings) -> anyhow::Result<Vec<(u64, Vec<String>)>> {
+/// `.txt` holds the rows the OCR read (one a line, as `--ocr` prints them; without the boxes'
+/// places, a sidebar can't be told from the page there), an image is read with the OCR as the app
+/// reads a frame. Each frame is its time, the rows of what was shown and all its rows (for the
+/// names on video tiles); they go through `visuals::observe` like the app's frames (`observe_due`).
+fn cli_screen_frames(args: &[String], settings: &Settings) -> anyhow::Result<Vec<(u64, Vec<String>, Vec<String>)>> {
     let Some(dir) = args.iter().position(|a| a == "--screen-frames").and_then(|i| args.get(i + 1)) else { return Ok(Vec::new()) };
     let mut frames = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{dir}: {e}"))? {
         let path = entry?.path();
         let Some(secs) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok()) else { continue };
-        let rows: Vec<String> = match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
-            Some("txt") => std::fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect(),
-            Some("jpg" | "jpeg" | "png") => capture::read_screen_file(&path, &settings.languages, &[])?,
+        let (rows, all): (Vec<String>, Vec<String>) = match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
+            Some("txt") => {
+                let rows: Vec<String> = std::fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect();
+                (rows.clone(), rows)
+            }
+            Some("jpg" | "jpeg" | "png") => capture::read_frame_file(&path, &settings.languages, &[])?,
             _ => continue,
         };
-        frames.push((secs * 1000, rows));
+        frames.push((secs * 1000, rows, all));
     }
-    frames.sort_by_key(|(ms, _)| *ms);
+    frames.sort_by_key(|(ms, ..)| *ms);
     if !frames.is_empty() {
         eprintln!("(screen frames: {} from {dir})", frames.len());
     }
@@ -2222,9 +2331,10 @@ fn cli_screen_frames(args: &[String], settings: &Settings) -> anyhow::Result<Vec
 
 /// Reads the screen frames due by `now_ms` as the app does (`visuals::observe`): a frame showing
 /// something new becomes a screen visual, the same screen lasts longer.
-fn observe_due(meeting: &mut Meeting, frames: &mut Vec<(u64, Vec<String>)>, now_ms: u64) {
-    while frames.first().is_some_and(|(at, _)| *at <= now_ms) {
-        let (at_ms, rows) = frames.remove(0);
+fn observe_due(meeting: &mut Meeting, frames: &mut Vec<(u64, Vec<String>, Vec<String>)>, now_ms: u64) {
+    while frames.first().is_some_and(|(at, ..)| *at <= now_ms) {
+        let (at_ms, rows, all) = frames.remove(0);
+        names::record(&mut meeting.screen_names, &all, at_ms);
         if visuals::observe(&mut meeting.visuals, &rows, at_ms) == visuals::Seen::New {
             let id = meeting.new_visual_id();
             eprintln!("[{:>6.1}s] (screen {id} new) {}", at_ms as f32 / 1000.0, rows.first().map(String::as_str).unwrap_or_default());
@@ -2321,6 +2431,7 @@ fn print_notes(
     settings: &Settings,
     lines: &[String],
     speakers: &[String],
+    participants: &[String],
     language: Option<&str>,
     minutes: u64,
     notes: &str,
@@ -2342,6 +2453,7 @@ fn print_notes(
         shown: visuals::any_shown(lines),
         glossary,
         speakers,
+        participants,
         language,
         when: &chrono::Local::now().format("%A %-d %B %Y, %H:%M").to_string(),
         minutes,

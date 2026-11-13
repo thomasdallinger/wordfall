@@ -110,6 +110,7 @@ interface Meeting {
   status: MeetingStatus; notes: string /* the user's own */; goal: string /* steers the questions */;
   questions: MeetingQuestion[]; systemMap: SystemMap; segments: MeetingSegment[]; speakers: MeetingSpeaker[];
   visuals: MeetingVisual[] /* screens and photos; [] for meetings from before */;
+  screenNames?: { atMs: number; names?: string[] }[] /* name-shaped text on each frame of the shared screen read, for naming speakers; absent when none */;
   summary: string | null /* Markdown: "# Title", summary, ## decisions / action items / notes */;
   summaryModel: string | null; language: string | null; error: string | null;
   systemAudio: boolean; stoppedByLimit: boolean; hasAudio: boolean;
