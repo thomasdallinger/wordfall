@@ -2071,7 +2071,7 @@ fn cli_screen_frames(args: &[String], settings: &Settings) -> anyhow::Result<Vec
         let Some(secs) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok()) else { continue };
         let rows: Vec<String> = match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
             Some("txt") => std::fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect(),
-            Some("jpg" | "jpeg" | "png") => capture::read_file(&path, &settings.languages, &[])?,
+            Some("jpg" | "jpeg" | "png") => capture::read_screen_file(&path, &settings.languages, &[])?,
             _ => continue,
         };
         frames.push((secs * 1000, rows));

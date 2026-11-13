@@ -70,14 +70,31 @@ fn read_rows(c: &Core, path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(visuals::rows(&platform::ocr(path, &languages, &ocr_words(c))?))
 }
 
+/// The text rows of a picture of the shared screen (see `visuals::screen_rows`).
+fn read_screen_rows(c: &Core, path: &Path) -> anyhow::Result<Vec<String>> {
+    let languages = c.settings.read().languages.clone();
+    Ok(visuals::screen_rows(&platform::ocr(path, &languages, &ocr_words(c))?))
+}
+
 /// The text rows of an image file, read upright and at a size that keeps small print (for the
 /// command line; the app goes through `add_image`).
 pub fn read_file(path: &Path, languages: &[String], words: &[String]) -> anyhow::Result<Vec<String>> {
+    Ok(visuals::rows(&read_boxes(path, languages, words)?))
+}
+
+/// The text rows of an image file showing a shared screen, as the app's screen reading reads
+/// them (for the command line's `--screen-frames`).
+pub fn read_screen_file(path: &Path, languages: &[String], words: &[String]) -> anyhow::Result<Vec<String>> {
+    Ok(visuals::screen_rows(&read_boxes(path, languages, words)?))
+}
+
+/// The OCR boxes of an image file, read upright and at a size that keeps small print.
+fn read_boxes(path: &Path, languages: &[String], words: &[String]) -> anyhow::Result<Vec<platform::OcrLine>> {
     let upright = std::env::temp_dir().join(format!("wordfall-read-{}.jpg", new_id()));
     platform::normalize_image(path, &upright, OCR_PX)?;
     let lines = platform::ocr(&upright, languages, words);
     let _ = std::fs::remove_file(&upright);
-    Ok(visuals::rows(&lines?))
+    lines
 }
 
 /// Keeps a picture of `from` for meeting `id`: a JPEG and its thumbnail under `visuals/`.
@@ -375,7 +392,7 @@ pub fn screen_loop(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &Atomic
             continue;
         }
         let started = Instant::now();
-        let rows = match read_rows(&c, &frame) {
+        let rows = match read_screen_rows(&c, &frame) {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("screen reading: {e:#}");

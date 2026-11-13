@@ -9,7 +9,7 @@
 //! their caps. Capturing, OCR and storage live in `capture.rs` and the platform code.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::platform::OcrLine;
 
@@ -67,7 +67,19 @@ impl Visual {
 /// smaller height are one row, read left to right and joined with " | " (Vision returns a box per
 /// table cell, so a table row stays one line instead of a column of loose values).
 pub fn rows(lines: &[OcrLine]) -> Vec<String> {
-    let mut boxes: Vec<&OcrLine> = lines.iter().filter(|l| !l.text.trim().is_empty()).collect();
+    rows_of(lines.iter().filter(|l| !l.text.trim().is_empty()).collect())
+}
+
+/// A shared screen's text rows (see `rows`) without the text at the window's sides that isn't
+/// what was shown: a sidebar of other pages and a lone label such as a video tile's name (see
+/// `side_boxes`). Photos keep everything.
+pub fn screen_rows(lines: &[OcrLine]) -> Vec<String> {
+    let boxes: Vec<&OcrLine> = lines.iter().filter(|l| !l.text.trim().is_empty()).collect();
+    let side = side_boxes(&boxes);
+    rows_of(boxes.into_iter().enumerate().filter(|(i, _)| !side.contains(i)).map(|(_, b)| b).collect())
+}
+
+fn rows_of(mut boxes: Vec<&OcrLine>) -> Vec<String> {
     boxes.sort_by(|a, b| (a.y + a.h / 2.0).total_cmp(&(b.y + b.h / 2.0)));
     // (top, bottom, boxes)
     let mut grouped: Vec<(f32, f32, Vec<&OcrLine>)> = Vec::new();
@@ -99,29 +111,102 @@ fn squash(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-// ---------- chrome ----------
+// ---------- the window's sides ----------
 
-/// A screen visual's rows are only compared once there are this many…
-const CHROME_MIN: usize = 3;
-/// …and a row in at least this share of them (in fifths) is window chrome (toolbar, tabs, the
-/// app's own buttons), not what was shown.
-const CHROME_SHARE: usize = 4;
+/// Text at a side of the window is apart from the rest when no box reaches across a gap of at
+/// least this share of the width…
+const SIDE_GAP: f32 = 0.005;
+/// …and is left out when it is a lone label (at most this many boxes of at most `LABEL_WORDS`
+/// words: the name under a video tile, a page number)…
+const LABEL_BOXES: usize = 2;
+const LABEL_WORDS: usize = 4;
+/// …or a sidebar: a list of at least this many entries…
+const SIDEBAR_MIN: usize = 3;
+/// …at most this share of the width wide, starting at most this far from the window's edge…
+const SIDEBAR_WIDTH: f32 = 0.25;
+const SIDEBAR_EDGE: f32 = 0.05;
+/// …with fewer than this share of its entries level with text beside it (a table's first column
+/// is level with its other cells; a sidebar's entries only meet a line of the page by chance).
+const SIDEBAR_LEVEL: f32 = 2.0 / 3.0;
 
-/// A row as compared for chrome: lower case, digits as '#' (the clock in a toolbar changes).
-fn chrome_key(row: &str) -> String {
-    row.chars().map(|c| if c.is_ascii_digit() { '#' } else { c.to_ascii_lowercase() }).collect::<String>().trim().to_string()
+/// Which of `boxes` sit at the left or right side of the window, apart from what was shown: a
+/// lone label beyond a gap, or a sidebar listing other pages, projects or channels. OCR reads a
+/// row across the whole width, so a sidebar entry would otherwise be glued to a line of the page
+/// ("Projects | Q3 revenue grew"). Only the outermost group on each side is looked at, so a
+/// page's own columns stay.
+fn side_boxes(boxes: &[&OcrLine]) -> HashSet<usize> {
+    let mut spans: Vec<(f32, f32)> = boxes.iter().map(|b| (b.x, b.x + b.w)).collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Gaps no box reaches across, left to right.
+    let mut gaps: Vec<(f32, f32)> = Vec::new();
+    let mut reach = f32::MIN;
+    for (start, end) in spans {
+        if reach > f32::MIN && start - reach >= SIDE_GAP {
+            gaps.push((reach, start));
+        }
+        reach = reach.max(end);
+    }
+    let mut out = HashSet::new();
+    let (Some(first), Some(last)) = (gaps.first(), gaps.last()) else { return out };
+    for left in [true, false] {
+        let group: Vec<usize> = (0..boxes.len())
+            .filter(|&i| if left { boxes[i].x + boxes[i].w <= first.0 } else { boxes[i].x >= last.1 })
+            .collect();
+        let rest: Vec<&OcrLine> = (0..boxes.len()).filter(|i| !group.contains(i)).map(|i| boxes[i]).collect();
+        let side: Vec<&OcrLine> = group.iter().map(|&i| boxes[i]).collect();
+        if rest.len() > side.len() && (is_label(&side) || is_sidebar(&side, &rest, left)) {
+            out.extend(group);
+        }
+    }
+    out
 }
 
-/// Rows that repeat on most screen visuals (in at least four in five of them, from three on):
-/// the window around what was shown. Photos don't count.
+/// A few short boxes on their own.
+fn is_label(side: &[&OcrLine]) -> bool {
+    side.len() <= LABEL_BOXES && side.iter().all(|b| b.text.split_whitespace().count() <= LABEL_WORDS)
+}
+
+/// A narrow list at the window's edge whose entries mostly aren't level with the text beside it.
+fn is_sidebar(side: &[&OcrLine], rest: &[&OcrLine], left: bool) -> bool {
+    let from = side.iter().map(|b| b.x).fold(f32::MAX, f32::min);
+    let to = side.iter().map(|b| b.x + b.w).fold(f32::MIN, f32::max);
+    let at_edge = if left { from <= SIDEBAR_EDGE } else { to >= 1.0 - SIDEBAR_EDGE };
+    let centre = |b: &OcrLine| b.y + b.h / 2.0;
+    let level = side.iter().filter(|b| rest.iter().any(|r| (centre(b) - centre(r)).abs() < 0.25 * b.h.min(r.h))).count();
+    side.len() >= SIDEBAR_MIN && to - from <= SIDEBAR_WIDTH && at_edge && (level as f32) < SIDEBAR_LEVEL * side.len() as f32
+}
+
+// ---------- chrome ----------
+
+/// A screen visual's cells are only compared once there are this many…
+const CHROME_MIN: usize = 3;
+/// …and a cell in at least this share of them (in fifths) is window chrome (toolbar, tabs, the
+/// app's own buttons, the name under a video tile), not what was shown.
+const CHROME_SHARE: usize = 4;
+
+/// The cells of a row: what OCR read as one box each, joined with " | " by `rows`.
+fn cells(row: &str) -> impl Iterator<Item = &str> {
+    row.split(" | ").map(str::trim).filter(|c| !c.is_empty())
+}
+
+/// A cell as compared for chrome and change: lower case, digits as '#' (the clock in a toolbar
+/// changes, and so do the values in a form while it is the same form), spaces collapsed.
+fn cell_key(cell: &str) -> String {
+    let key: String = cell.chars().map(|c| if c.is_ascii_digit() { '#' } else { c.to_ascii_lowercase() }).collect();
+    squash(&key)
+}
+
+/// Cells that repeat on most screen visuals (in at least four in five of them, from three on):
+/// the window around what was shown. Cells, not rows: OCR joins a toolbar button with whatever
+/// stands level with it, so a whole row rarely repeats. Photos don't count.
 pub fn chrome(visuals: &[Visual]) -> HashSet<String> {
     let screens: Vec<&Visual> = visuals.iter().filter(|v| v.source == Source::Screen).collect();
     if screens.len() < CHROME_MIN {
         return HashSet::new();
     }
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for v in &screens {
-        let unique: HashSet<String> = v.text.lines().map(chrome_key).filter(|k| !k.is_empty()).collect();
+        let unique: HashSet<String> = v.text.lines().flat_map(cells).map(cell_key).collect();
         for k in unique {
             *counts.entry(k).or_default() += 1;
         }
@@ -129,9 +214,11 @@ pub fn chrome(visuals: &[Visual]) -> HashSet<String> {
     counts.into_iter().filter(|(_, n)| n * 5 >= screens.len() * CHROME_SHARE).map(|(k, _)| k).collect()
 }
 
-/// The rows of `text` that aren't chrome.
-fn content_rows<'a>(text: &'a str, chrome: &'a HashSet<String>) -> impl Iterator<Item = &'a str> + 'a {
-    text.lines().map(str::trim).filter(move |r| !r.is_empty() && !chrome.contains(&chrome_key(r)))
+/// The rows of `text` without their chrome cells; rows of chrome only are left out.
+fn content_rows<'a>(text: &'a str, chrome: &'a HashSet<String>) -> impl Iterator<Item = String> + 'a {
+    text.lines()
+        .map(|row| cells(row).filter(|c| !chrome.contains(&cell_key(c))).collect::<Vec<_>>().join(" | "))
+        .filter(|row| !row.is_empty())
 }
 
 // ---------- change detection ----------
@@ -139,10 +226,16 @@ fn content_rows<'a>(text: &'a str, chrome: &'a HashSet<String>) -> impl Iterator
 /// A frame needs this many meaningful words to be worth keeping (a blank share or a transition
 /// has fewer).
 const MIN_WORDS: usize = 8;
-/// Frames whose words overlap the current visual this much (Jaccard) show the same thing…
-const SAME: f32 = 0.85;
-/// …as do frames whose words are nearly all in it (a menu or a cursor hides part of it).
-const SAME_CONTAINED: f32 = 0.9;
+/// A frame shows something new when more than this share of its cells are on none of the
+/// screens shown lately…
+const NEW_SHARE: f32 = 0.1;
+/// …and more than this many (but at most a quarter of them, so a short slide after another still
+/// counts). Fewer are OCR misreadings, a tooltip or a changed value; a new slide, page, dialog or
+/// a scrolled-to part of a page brings more.
+const NEW_CELLS: usize = 3;
+/// Screens on screen within this long before a frame count as shown lately: going back to a page
+/// or closing a dialog shows nothing new.
+pub const RECENT_MS: u64 = 5 * 60_000;
 
 /// Words that carry content: lower case; with a letter and at least three characters, or a
 /// number of at least two digits.
@@ -157,10 +250,63 @@ fn words(text: &str) -> HashSet<String> {
         .collect()
 }
 
-/// What a new frame of the shared screen shows, against the latest screen visual.
+/// The keys of the cells of `rows` that say something (a word of three letters or more; not a
+/// lone number, icon or toggle), without `chrome`.
+fn content_cells<'a>(rows: impl Iterator<Item = &'a str>, chrome: &HashSet<String>) -> HashSet<String> {
+    rows.flat_map(cells)
+        .map(cell_key)
+        .filter(|k| !chrome.contains(k) && k.split(|c: char| !c.is_alphabetic()).any(|w| w.chars().count() >= 3))
+        .collect()
+}
+
+/// Whether `a` is `b` with at most `max` letters changed, added or dropped (OCR misreads small
+/// print differently from frame to frame: "Meilenstein", "Mellenstein").
+fn near(a: &[char], b: &[char], max: usize) -> bool {
+    if a.len().abs_diff(b.len()) > max {
+        return false;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + usize::from(ca != cb));
+        }
+        if cur.iter().min().is_some_and(|m| *m > max) {
+            return false;
+        }
+        prev = cur;
+    }
+    prev[b.len()] <= max
+}
+
+/// Cells already shown, by length in characters, to find a cell or a misreading of it.
+struct Shown(HashMap<usize, Vec<Vec<char>>>);
+
+impl Shown {
+    fn new<'a>(keys: impl Iterator<Item = &'a String>) -> Self {
+        let mut by_len: HashMap<usize, Vec<Vec<char>>> = HashMap::new();
+        for k in keys {
+            let chars: Vec<char> = k.chars().collect();
+            by_len.entry(chars.len()).or_default().push(chars);
+        }
+        Shown(by_len)
+    }
+
+    /// Whether `cell` was shown, allowing a misread character in five.
+    fn has(&self, cell: &str) -> bool {
+        let chars: Vec<char> = cell.chars().collect();
+        let max = (chars.len() / 5).max(1);
+        (chars.len().saturating_sub(max)..=chars.len() + max)
+            .filter_map(|n| self.0.get(&n))
+            .flatten()
+            .any(|shown| shown == &chars || near(&chars, shown, max))
+    }
+}
+
+/// What a new frame of the shared screen shows, against the screens shown lately.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Seen {
-    /// The same as the latest visual: it stays on screen longer.
+    /// Nothing new: the screen it shows stays on screen longer.
     Same,
     /// Something new worth keeping.
     New,
@@ -168,23 +314,30 @@ pub enum Seen {
     Nothing,
 }
 
-/// Compares a frame's rows with the `current` visual's text, both without `chrome`.
-pub fn judge(current: Option<&str>, rows: &[String], chrome: &HashSet<String>) -> Seen {
-    let frame = words(&rows.iter().map(String::as_str).filter(|r| !chrome.contains(&chrome_key(r))).collect::<Vec<_>>().join("\n"));
-    if let Some(current) = current {
-        let before = words(&content_rows(current, chrome).collect::<Vec<_>>().join("\n"));
-        if !frame.is_empty() && !before.is_empty() {
-            let shared = frame.intersection(&before).count() as f32;
-            let union = frame.union(&before).count() as f32;
-            if shared / union >= SAME || shared / frame.len() as f32 >= SAME_CONTAINED {
-                return Seen::Same;
-            }
+/// Compares a frame's rows with the texts of the screens `shown` lately, all without `chrome`.
+#[cfg(test)]
+fn judge(shown: &[&str], rows: &[String], chrome: &HashSet<String>) -> Seen {
+    compare(shown, rows, chrome).0
+}
+
+/// `judge`, and for `Same` which of `shown` the frame has most cells in common with.
+fn compare(shown: &[&str], rows: &[String], chrome: &HashSet<String>) -> (Seen, Option<usize>) {
+    let frame = content_cells(rows.iter().map(String::as_str), chrome);
+    let before: Vec<HashSet<String>> = shown.iter().map(|t| content_cells(t.lines(), chrome)).collect();
+    if !frame.is_empty() && !before.is_empty() {
+        let known = Shown::new(before.iter().flatten());
+        let new = frame.iter().filter(|c| !known.has(c)).count();
+        if new <= NEW_CELLS.min(frame.len() / 4) || (new as f32) <= NEW_SHARE * frame.len() as f32 {
+            // The latest screen (first) wins a tie.
+            let closest = (0..before.len()).rev().max_by_key(|&i| before[i].intersection(&frame).count());
+            return (Seen::Same, closest);
         }
     }
-    if frame.len() >= MIN_WORDS {
-        Seen::New
+    let text = rows.iter().flat_map(|r| cells(r)).filter(|c| !chrome.contains(&cell_key(c))).collect::<Vec<_>>().join("\n");
+    if words(&text).len() >= MIN_WORDS {
+        (Seen::New, None)
     } else {
-        Seen::Nothing
+        (Seen::Nothing, None)
     }
 }
 
@@ -192,22 +345,29 @@ pub fn judge(current: Option<&str>, rows: &[String], chrome: &HashSet<String>) -
 pub const MAX_SCREENS: usize = 240;
 
 /// What a frame of the shared screen, read at meeting time `now_ms`, does to `visuals` (see
-/// `judge`, against the latest screen visual and without chrome): `Same` has already made the
-/// latest screen last until `now_ms`; `New` asks the caller to add a screen visual with `rows`
-/// (only while fewer than `MAX_SCREENS` are kept); `Nothing` leaves them as they are. The app's
-/// screen reading and the command line's `--screen-frames` both go through here.
+/// `judge`, against the latest screen visual and those on screen within `RECENT_MS`, without
+/// chrome): `Same` has already made the screen it shows last until `now_ms`; `New` asks the
+/// caller to add a screen visual with `rows` (only while fewer than `MAX_SCREENS` are kept);
+/// `Nothing` leaves them as they are. The app's screen reading and the command line's
+/// `--screen-frames` both go through here.
 pub fn observe(visuals: &mut [Visual], rows: &[String], now_ms: u64) -> Seen {
     let chrome = chrome(visuals);
-    let latest = visuals.iter().rposition(|v| v.source == Source::Screen);
-    match judge(latest.map(|i| visuals[i].text.as_str()), rows, &chrome) {
-        Seen::Same => {
-            if let Some(i) = latest {
-                visuals[i].until_ms = Some(now_ms);
-            }
+    let screens: Vec<usize> = (0..visuals.len()).filter(|&i| visuals[i].source == Source::Screen).collect();
+    // The latest first: the one on screen last (a later one in the list wins a tie).
+    let latest = screens.iter().copied().max_by_key(|&i| (visuals[i].last_ms(), i));
+    let recent: Vec<usize> = latest
+        .into_iter()
+        .chain(screens.iter().copied().rev().filter(|&i| Some(i) != latest && visuals[i].last_ms() + RECENT_MS >= now_ms))
+        .collect();
+    let shown: Vec<&str> = recent.iter().map(|&i| visuals[i].text.as_str()).collect();
+    match compare(&shown, rows, &chrome) {
+        (Seen::Same, Some(k)) => {
+            let v = &mut visuals[recent[k]];
+            v.until_ms = Some(now_ms.max(v.last_ms()));
             Seen::Same
         }
-        Seen::New if visuals.iter().filter(|v| v.source == Source::Screen).count() >= MAX_SCREENS => Seen::Nothing,
-        seen => seen,
+        (Seen::New, _) if screens.len() >= MAX_SCREENS => Seen::Nothing,
+        (seen, _) => seen,
     }
 }
 
@@ -235,7 +395,7 @@ const MIN_PER_VISUAL: usize = 200;
 
 /// The visual's text for a prompt: rows without chrome joined with " / ", cut at `max` characters.
 fn prompt_text(v: &Visual, chrome: &HashSet<String>, max: usize) -> String {
-    let text = content_rows(&v.text, chrome).map(squash).collect::<Vec<_>>().join(" / ");
+    let text = content_rows(&v.text, chrome).map(|r| squash(&r)).collect::<Vec<_>>().join(" / ");
     if text.chars().count() <= max {
         return text;
     }
@@ -366,8 +526,8 @@ mod tests {
         vs.push(visual(3, 30, Source::Screen, "Teams | Chat | 10:45\nRisks\nSupplier delays"));
         vs.push(visual(4, 40, Source::Photo, "Teams | Chat | 10:45\nA photo"));
         let c = chrome(&vs);
-        assert_eq!(c.len(), 1);
-        assert!(c.contains(&chrome_key("Teams | Chat | 11:00")));
+        assert_eq!(c.len(), 3, "{c:?}");
+        assert!(c.contains(&cell_key("Teams")) && c.contains(&cell_key("11:00")));
         let lines = lines(&vs, NOTES, 100_000);
         assert_eq!(lines[0].1, "[00:10] Screen: Quarterly numbers / Revenue up 12 percent");
     }
@@ -377,21 +537,21 @@ mod tests {
         let slide = "Packlisten prüfen\nGewicht je Karton eintragen\nFehlmengen an das Lager melden";
         let rows_of = |t: &str| t.lines().map(str::to_string).collect::<Vec<_>>();
         let none = HashSet::new();
-        assert_eq!(judge(None, &rows_of(slide), &none), Seen::New);
-        assert_eq!(judge(Some(slide), &rows_of(slide), &none), Seen::Same);
+        assert_eq!(judge(&[], &rows_of(slide), &none), Seen::New);
+        assert_eq!(judge(&[slide], &rows_of(slide), &none), Seen::Same);
         // A menu covers the last row: still the same slide.
-        assert_eq!(judge(Some(slide), &rows_of("Packlisten prüfen\nGewicht je Karton eintragen"), &none), Seen::Same);
+        assert_eq!(judge(&[slide], &rows_of("Packlisten prüfen\nGewicht je Karton eintragen"), &none), Seen::Same);
         let next = "Tourenplan für Montag\nFahrer früh einteilen\nRampen im System buchen";
-        assert_eq!(judge(Some(slide), &rows_of(next), &none), Seen::New);
+        assert_eq!(judge(&[slide], &rows_of(next), &none), Seen::New);
         // A blank share or a transition: nothing to keep.
-        assert_eq!(judge(Some(slide), &rows_of("Loading …"), &none), Seen::Nothing);
+        assert_eq!(judge(&[slide], &rows_of("Loading …"), &none), Seen::Nothing);
     }
 
     #[test]
     fn chrome_alone_is_nothing() {
-        let chrome: HashSet<String> = [chrome_key("File Edit View Window Help Share Record Participants Chat Reactions")].into();
+        let chrome: HashSet<String> = [cell_key("File Edit View Window Help Share Record Participants Chat Reactions")].into();
         let rows = vec!["File Edit View Window Help Share Record Participants Chat Reactions".to_string()];
-        assert_eq!(judge(None, &rows, &chrome), Seen::Nothing);
+        assert_eq!(judge(&[], &rows, &chrome), Seen::Nothing);
     }
 
     #[test]
