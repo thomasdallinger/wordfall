@@ -212,13 +212,19 @@ Known limits: Windows doesn't let Wordfall see keys pressed in, or paste into, a
   three hours. Notes are in the language the meeting was held in. *Write the notes again* picks up renamed speakers, edited notes and new words to
   recognise.
 - **Your terms:** speech recognition doesn't know your abbreviations and product names and writes something that
-  sounds alike. Before the notes are written, places that sound like one of your *Dictionary → Words to recognise*,
-  or like an abbreviation or name on a screen or photo of the meeting, go to the notes model one by one: it says what
-  the heard words mean there and whether the term was said (its reason goes to the log). It can only accept what was
-  found, never write words of its own. Corrected words are underlined in the transcript (point at one to see what
-  was heard). An entry like "PO = purchase order" says what an abbreviation stands for, and the notes are told; an
-  abbreviation shown next to the word it stands for counts too. About a minute for an hour of meeting; turn it off
-  in *Settings → Meetings → Fix misheard terms*.
+  sounds alike, the same way each time. Before the notes are written, places that sound like one of your
+  *Dictionary → Words to recognise*, or like a name or abbreviation on the meeting's screens and photos, go to the
+  notes model, all places heard the same way together, with how many screens show the term and whether someone
+  spelled it out: it says what the heard words mean there, then whether the term was said, leaving out places where
+  they clearly mean something else (its reason goes to the log). A word the screens show themselves is never
+  replaced. It can only accept what was found, never write words of its own. Corrected words are underlined in the
+  transcript (point at one to see what was heard). Names from the screens are abbreviations and words the system's
+  spell checker doesn't know (macOS), those the talk has something sounding like first, then the most shown, on at
+  least two screens (three once a meeting has 30); ordinary words in capitals (OF, TRUTH, CABLE), two words written
+  as one (a form's "Anlagenname") and OCR misreadings (a word the screens show more often read right) are left out. An entry like "PO = purchase order" says what an abbreviation stands
+  for, and the notes are told the spelling of every term that was said; an abbreviation shown next to the word it
+  stands for counts too. About a minute for an hour of meeting; turn it off in *Settings → Meetings → Fix misheard
+  terms*.
 - **Other participants** are recorded from what the computer plays: WASAPI loopback on Windows, a Core Audio
   process tap on macOS 14.2+ (macOS asks once for *System Audio Recording*; on macOS 13 only the microphone is
   recorded). Without headphones, your microphone also hears the call; Wordfall drops those echoed lines.

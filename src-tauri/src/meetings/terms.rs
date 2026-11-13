@@ -11,7 +11,7 @@
 //! nothing is invented silently and nothing is asked twice.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 /// A word or name the meeting may use, with what it stands for when the user said.
@@ -79,6 +79,12 @@ pub fn parse_entry(entry: &str) -> Option<Term> {
 fn is_abbreviation(term: &str) -> bool {
     let n = term.chars().count();
     (2..=ABBREVIATION_MAX).contains(&n) && term.chars().all(|c| c.is_uppercase())
+}
+
+/// An abbreviation of four letters or more with a vowel may be said as a word too ("ECAD" as
+/// "E-Kad"): then it is also looked for as a name is.
+fn said_as_word(abbreviation: &str) -> bool {
+    abbreviation.chars().count() >= 4 && abbreviation.chars().any(|c| "AEIOUÄÖÜ".contains(c))
 }
 
 /// Kölner Phonetik: a key that German words sounding alike share ("Drewolin", "Trevolin" → 27356).
@@ -214,8 +220,9 @@ fn same_stem(heard: &[char], term: &[char]) -> bool {
 }
 
 /// How similar a heard form is to a term (see `MIN_SIMILARITY`), if it is similar enough and
-/// sounds alike: phonetic keys equal, or one digit apart when both have at least three. Cheap
-/// checks first: this runs for every term at every word.
+/// sounds alike: phonetic keys equal, or one digit apart when both have at least three. Letters
+/// that sound alike count as equal ("Ekart" for "Ecad"). Cheap checks first: this runs for every
+/// term at every word.
 fn closeness(lower: &[char], key: &[char], term_lower: &[char], term_key: &[char]) -> Option<f32> {
     if lower.len() < 3 || key.is_empty() || term_key.is_empty() {
         return None;
@@ -227,8 +234,25 @@ fn closeness(lower: &[char], key: &[char], term_lower: &[char], term_key: &[char
     if key != term_key && (key.len().min(term_key.len()) < 3 || key.len().abs_diff(term_key.len()) > 1 || edit_distance(key, term_key) > 1) {
         return None;
     }
-    let sim = 1.0 - edit_distance(lower, term_lower) as f32 / longest;
+    let mut distance = edit_distance(lower, term_lower);
+    if distance as f32 > (1.0 - MIN_SIMILARITY) * longest {
+        let sound = |w: &[char]| w.iter().map(|&c| sound_alike(c)).collect::<Vec<char>>();
+        distance = distance.min(edit_distance(&sound(lower), &sound(term_lower)));
+    }
+    let sim = 1.0 - distance as f32 / longest;
     (sim >= MIN_SIMILARITY).then_some(sim)
+}
+
+/// One letter for letters that sound alike in German: hard and soft consonants, c and k.
+fn sound_alike(c: char) -> char {
+    match c {
+        'c' | 'g' | 'q' => 'k',
+        'd' => 't',
+        'b' => 'p',
+        'v' | 'w' => 'f',
+        'y' => 'i',
+        c => c,
+    }
 }
 
 /// A word of a text: letters and digits, with an apostrophe inside ("Teddy's"). Hyphens part words.
@@ -236,6 +260,8 @@ struct Token {
     range: Range<usize>,
     /// Only spaces between this token and the one before (no punctuation, no hyphen).
     spaced: bool,
+    /// Only a hyphen between this token and the one before ("E-Mail").
+    hyphened: bool,
 }
 
 fn tokens(text: &str) -> Vec<Token> {
@@ -252,7 +278,7 @@ fn tokens(text: &str) -> Vec<Token> {
                 start = Some(i);
                 let gap = &text[gap_start..i];
                 let spaced = !out.is_empty() && !gap.is_empty() && gap.chars().all(char::is_whitespace);
-                out.push(Token { range: i..i, spaced });
+                out.push(Token { range: i..i, spaced, hyphened: !out.is_empty() && gap == "-" });
             }
         } else if let Some(s) = start.take() {
             out.last_mut().expect("pushed at its start").range = s..i;
@@ -288,6 +314,7 @@ struct Word<'a> {
     text: &'a str,
     range: Range<usize>,
     spaced: bool,
+    hyphened: bool,
     is_term: bool,
     /// Only spaces and full stops between this word and the next ("A. B.").
     close_to_next: bool,
@@ -311,30 +338,35 @@ struct Run {
 /// The vocabulary, ready to be looked for in many texts (`find` builds one per text).
 pub struct Matcher<'a> {
     terms: &'a [Term],
-    patterns: Vec<Pattern>,
+    /// Each with the index of its term: an abbreviation said as a word has two.
+    patterns: Vec<(usize, Pattern)>,
     lowercase: HashSet<String>,
 }
 
 impl<'a> Matcher<'a> {
     pub fn new(terms: &'a [Term]) -> Self {
-        let patterns = terms
-            .iter()
-            .map(|t| {
-                let text = t.text.as_str();
-                if is_abbreviation(text) {
-                    Pattern::Abbreviation { text: text.to_string(), letters: text.chars().count(), key: phonetic(&spoken(text)) }
-                } else {
-                    let compact: String = text.split_whitespace().collect();
-                    Pattern::Name {
-                        lower: compact.to_lowercase().chars().collect(),
-                        key: phonetic(&compact).chars().collect(),
-                        words: text.split_whitespace().count(),
-                        capital: text.chars().any(char::is_uppercase),
-                        ends_with_s: compact.ends_with('s'),
-                    }
+        let name = |text: &str| {
+            let compact: String = text.split_whitespace().collect();
+            Pattern::Name {
+                lower: compact.to_lowercase().chars().collect(),
+                key: phonetic(&compact).chars().collect(),
+                words: text.split_whitespace().count(),
+                capital: text.chars().any(char::is_uppercase),
+                ends_with_s: compact.ends_with('s'),
+            }
+        };
+        let mut patterns = Vec::new();
+        for (i, t) in terms.iter().enumerate() {
+            let text = t.text.as_str();
+            if is_abbreviation(text) {
+                patterns.push((i, Pattern::Abbreviation { text: text.to_string(), letters: text.chars().count(), key: phonetic(&spoken(text)) }));
+                if said_as_word(text) {
+                    patterns.push((i, name(text)));
                 }
-            })
-            .collect();
+            } else {
+                patterns.push((i, name(text)));
+            }
+        }
         let lowercase = terms.iter().map(|t| t.text.to_lowercase()).collect();
         Matcher { terms, patterns, lowercase }
     }
@@ -356,7 +388,7 @@ impl<'a> Matcher<'a> {
                     .or_else(|| w.strip_suffix("’s"))
                     .and_then(|stem| stem.chars().next().map(|first| (first, phonetic(stem))));
                 let close_to_next = toks.get(i + 1).is_some_and(|next| text[t.range.end..next.range.start].trim_matches([' ', '.']).is_empty());
-                Word { text: w, range: t.range.clone(), spaced: t.spaced, is_term: self.lowercase.contains(&w.to_lowercase()), close_to_next, caps, possessive }
+                Word { text: w, range: t.range.clone(), spaced: t.spaced, hyphened: t.hyphened, is_term: self.lowercase.contains(&w.to_lowercase()), close_to_next, caps, possessive }
             })
             .collect()
     }
@@ -367,12 +399,12 @@ impl<'a> Matcher<'a> {
         let words = self.words(text);
         let mut found: Vec<Candidate> = Vec::new();
         let mut runs: [Vec<Option<Run>>; 3] = Default::default();
-        if self.patterns.iter().any(|p| matches!(p, Pattern::Name { .. })) {
+        if self.patterns.iter().any(|(_, p)| matches!(p, Pattern::Name { .. })) {
             for (len, runs) in (1..=3).zip(runs.iter_mut()) {
                 *runs = (0..words.len().saturating_sub(len - 1)).map(|i| run(&words[i..i + len])).collect();
             }
         }
-        for (ti, pattern) in self.patterns.iter().enumerate() {
+        for &(ti, ref pattern) in &self.patterns {
             match pattern {
                 Pattern::Abbreviation { text: t, letters: n, key } => {
                     if !key.is_empty() {
@@ -414,17 +446,24 @@ impl<'a> Matcher<'a> {
     }
 }
 
-/// `words` read as one name, if they may be: joined only across spaces, and when more than one,
-/// none of them a term already or a single letter.
+/// `words` read as one name, if they may be: joined only across spaces or after a single letter
+/// and a hyphen ("E-Kart"), and when more than one, none of them a term already or a single
+/// letter other than such.
 fn run(words: &[Word]) -> Option<Run> {
-    if words.iter().skip(1).any(|w| !w.spaced) || (words.len() > 1 && words.iter().any(|w| w.is_term || w.text.chars().count() < 2)) {
+    let letter_before = |k: usize| words[k].hyphened && words[k - 1].text.chars().count() == 1;
+    if (1..words.len()).any(|k| !words[k].spaced && !letter_before(k)) {
+        return None;
+    }
+    let lone_letter = |k: usize| words[k].text.chars().count() < 2 && !(k + 1 < words.len() && letter_before(k + 1));
+    if words.len() > 1 && (0..words.len()).any(|k| words[k].is_term || lone_letter(k)) {
         return None;
     }
     let heard: String = words.iter().map(|w| w.text).collect();
     let plural = heard.strip_suffix('s').map(|stem| (stem.to_lowercase().chars().collect(), phonetic(stem).chars().collect()));
     Some(Run {
         range: words[0].range.start..words[words.len() - 1].range.end,
-        capital: words[0].text.starts_with(char::is_uppercase),
+        // "eCard" has a capital as much as "ECard".
+        capital: words[0].text.chars().any(char::is_uppercase),
         lower: heard.to_lowercase().chars().collect(),
         key: phonetic(&heard).chars().collect(),
         plural,
@@ -549,6 +588,7 @@ const SHOWN_MAX: usize = 40;
 /// ("ZB", also in "ZB-2026-0412") and names with a capital inside ("TreVolin"), each once. An
 /// abbreviation takes as its meaning a longer word on the same line that starts with its first
 /// letter and has the others in order ("Zollbeleg ZB-2026-0412" → ZB = Zollbeleg).
+#[allow(dead_code)] // for callers that read one text; a meeting's screens go by `shown_terms`
 pub fn distinctive(text: &str) -> Vec<Term> {
     let mut out: Vec<Term> = Vec::new();
     for line in text.lines() {
@@ -598,9 +638,31 @@ fn term_like(s: &str) -> bool {
 
 /// The meeting's vocabulary: the user's entries ("ZB = Zollbeleg" or a plain term), the words
 /// dictionary replacements write when they read as terms (not phrases), then distinctive words
-/// of what was typed into the meeting or shown in it (`typed_and_shown`, up to `SHOWN_MAX`). Each
-/// term once; a meaning given anywhere stays with it.
+/// of what was typed into the meeting or shown in it (`typed_and_shown`, see `shown_terms`; without
+/// a dictionary, so only abbreviations and names with a capital inside). Each term once; a meaning
+/// given anywhere stays with it.
+#[allow(dead_code)] // for callers without notes, screens and transcript apart (see `vocabulary_seen`)
 pub fn vocabulary(entries: &[String], replacements: &[String], typed_and_shown: &[&str]) -> Vec<Term> {
+    vocabulary_seen(entries, replacements, &Seen { shown: typed_and_shown, ..Default::default() }, None)
+}
+
+/// What a meeting's vocabulary is read from besides the user's own words: what the user typed
+/// (notes, goal, title), the text of each screen and photo, and what was said.
+#[derive(Default)]
+pub struct Seen<'a> {
+    pub typed: &'a [&'a str],
+    /// One text per screen or photo: a word counts once per screen.
+    pub shown: &'a [&'a str],
+    /// The transcript: only to tell ordinary words (written in small letters there).
+    pub said: &'a [&'a str],
+}
+
+/// Whether a word is an ordinary word of the user's languages (the system's spell checker).
+pub type Dictionary<'a> = &'a dyn Fn(&str) -> bool;
+
+/// Like `vocabulary`, with what was typed, shown and said apart and, when there is one, a
+/// `dictionary`, so names written like ordinary words ("Brontix") are found too (`shown_terms`).
+pub fn vocabulary_seen(entries: &[String], replacements: &[String], seen: &Seen, dictionary: Option<Dictionary>) -> Vec<Term> {
     let mut out: Vec<Term> = Vec::new();
     let add = |term: Term, out: &mut Vec<Term>| match out.iter_mut().find(|t| t.text.to_lowercase() == term.text.to_lowercase()) {
         Some(t) if t.meaning.is_none() => t.meaning = term.meaning,
@@ -617,9 +679,252 @@ pub fn vocabulary(entries: &[String], replacements: &[String], typed_and_shown: 
             add(Term { text: r.trim().to_string(), meaning: None }, &mut out);
         }
     }
-    let shown: Vec<Term> = typed_and_shown.iter().flat_map(|t| distinctive(t)).collect();
-    for t in shown.into_iter().take(SHOWN_MAX) {
+    for t in shown_terms(seen, dictionary) {
         add(t, &mut out);
+    }
+    out
+}
+
+/// With this many screens and photos or more, a word must be on two of them to be a term: the
+/// OCR misreads a word differently each time ("IDEntS"), a name on the screen comes back.
+const RECUR_FROM: usize = 4;
+/// With this many screens and photos or more, on three of them: a long meeting shows many forms
+/// and lists, and an OCR fragment of one ("Keln", "iWS") comes back once or twice while it stays
+/// on screen; a name the meeting is about is on more.
+const RECUR_MORE_FROM: usize = 30;
+
+/// Short words that slides and forms write in capitals ("SOURCE OF TRUTH", "IF … THEN") and that
+/// are too short to tell from an abbreviation otherwise ("AB" is a German word as well).
+const COMMON: &[&str] = &[
+    "A", "AN", "AND", "ARE", "AS", "AT", "BE", "BY", "DO", "FOR", "GO", "HE", "IF", "IN", "IS", "IT", "ME", "MY", "NO", "NOT", "OF",
+    "ON", "OR", "SO", "THE", "TO", "UP", "US", "WE", "YES", "YOU", "ALL", "NEW", "OUT", "OFF", "AM", "AUF", "AUS", "BEI", "DAS",
+    "DER", "DIE", "EIN", "IM", "IST", "JA", "MIT", "UND", "VON", "ZU", "ZUM", "ZUR", "FÜR",
+];
+
+/// How a word of a screen looks, if like the name of something.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Shape {
+    /// "ZB", "ECAD": all capitals, 2 to `ABBREVIATION_MAX` letters.
+    Abbreviation,
+    /// "TreVolin", "macOS", "ElementID": a capital inside.
+    Inner,
+    /// "Brontix", "BRONTIX": a capital first, four letters or more; a name only if the dictionary
+    /// doesn't know it.
+    Capitalised,
+}
+
+fn shape(w: &str) -> Option<Shape> {
+    let chars: Vec<char> = w.chars().collect();
+    if chars.len() < 2 || !chars.iter().all(|c| c.is_alphabetic()) {
+        return None;
+    }
+    if is_abbreviation(w) {
+        return Some(Shape::Abbreviation);
+    }
+    let all_caps = chars.iter().all(|c| c.is_uppercase());
+    if chars[0].is_uppercase() && chars.len() >= 4 && (all_caps || chars[1..].iter().all(|c| c.is_lowercase())) {
+        return Some(Shape::Capitalised);
+    }
+    let inner = chars[1..].iter().any(|c| c.is_uppercase()) && chars.iter().any(|c| c.is_lowercase());
+    // A single capital at the end after small letters is the OCR misreading an "s" ("DantS").
+    let stray_end = chars[chars.len() - 1].is_uppercase() && chars[chars.len() - 2].is_lowercase();
+    (inner && !stray_end).then_some(Shape::Inner)
+}
+
+/// Whether the word at `range` of `line` is part of a path, an address or code ("modules/ecad",
+/// "a_b", "x.y"), where it is written in small letters whatever it is.
+fn in_code(line: &str, range: &Range<usize>) -> bool {
+    let before = line[..range.start].chars().next_back();
+    let mut after = line[range.end..].chars();
+    let (next, then) = (after.next(), after.next());
+    matches!(before, Some('/' | '\\' | '_' | '.' | '=' | '@' | '#' | '~'))
+        || matches!(next, Some('/' | '\\' | '_' | '=' | '@'))
+        || (next == Some('.') && then.is_some_and(char::is_alphanumeric))
+}
+
+/// A word of the screens as `shown_terms` collects it.
+#[derive(Default)]
+struct ShownWord {
+    /// Each way it was written and how often, in the order first seen.
+    forms: Vec<(String, usize)>,
+    /// On how many screens and photos.
+    screens: usize,
+    typed: bool,
+    meaning: Option<String>,
+}
+
+/// The words of what was typed into the meeting and shown in it that name things rather than
+/// being ordinary words, the most shown first (at most `SHOWN_MAX`): abbreviations other than
+/// ordinary words in capitals (OF; TRUTH, also written as a plain word somewhere), names with a
+/// capital inside, and, with a `dictionary`, capitalised words it doesn't know and that are not
+/// written in small letters anywhere ("Brontix"). With `RECUR_FROM` screens or more, a word must be
+/// on two of them (what the user typed always counts). Each in one spelling (see `spelling`). An
+/// abbreviation takes as its meaning a longer word on a line with it that spells it (see
+/// `distinctive`).
+pub fn shown_terms(seen: &Seen, dictionary: Option<Dictionary>) -> Vec<Term> {
+    let mut words: Vec<(String, ShownWord)> = Vec::new();
+    // Lowercase forms of the words written as plain words (small letters, or a capital first; not
+    // in a path), and of those all in small letters.
+    let (mut plain, mut small): (HashSet<String>, HashSet<String>) = Default::default();
+    // On how many screens and photos each word is, whatever it looks like (see `misread`).
+    let mut on_screens: HashMap<String, usize> = HashMap::new();
+    let texts = seen.typed.iter().map(|t| (*t, Some(true))).chain(seen.shown.iter().map(|t| (*t, Some(false))));
+    for (text, typed) in texts.chain(seen.said.iter().map(|t| (*t, None))) {
+        let mut here: HashSet<String> = HashSet::new();
+        if typed == Some(false) {
+            let unique: HashSet<String> = text.lines().flat_map(|l| tokens(l).into_iter().map(move |t| l[t.range].to_lowercase())).collect();
+            for w in unique {
+                *on_screens.entry(w).or_default() += 1;
+            }
+        }
+        for line in text.lines() {
+            let toks = tokens(line);
+            let line_words: Vec<&str> = toks.iter().map(|t| &line[t.range.clone()]).collect();
+            for t in &toks {
+                let w = &line[t.range.clone()];
+                let lower = w.to_lowercase();
+                let small_rest = w.chars().skip(1).all(char::is_lowercase);
+                if small_rest && !in_code(line, &t.range) {
+                    if w.chars().all(char::is_lowercase) {
+                        small.insert(lower.clone());
+                    }
+                    plain.insert(lower.clone());
+                }
+                let (Some(typed), Some(sh)) = (typed, shape(w)) else { continue };
+                let i = words.iter().position(|(k, _)| *k == lower).unwrap_or_else(|| {
+                    words.push((lower.clone(), ShownWord::default()));
+                    words.len() - 1
+                });
+                let entry = &mut words[i].1;
+                match entry.forms.iter_mut().find(|(f, _)| f == w) {
+                    Some((_, n)) => *n += 1,
+                    None => entry.forms.push((w.to_string(), 1)),
+                }
+                if sh == Shape::Abbreviation && entry.meaning.is_none() {
+                    entry.meaning = line_words.iter().find(|long| spells(long, w)).map(|m| m.to_string());
+                }
+                if here.insert(lower) {
+                    if typed {
+                        entry.typed = true;
+                    } else {
+                        entry.screens += 1;
+                    }
+                }
+            }
+        }
+    }
+    let must_recur = seen.shown.len() >= RECUR_FROM;
+    let recur_min = if seen.shown.len() >= RECUR_MORE_FROM { 3 } else { 2 };
+    let kept: Vec<(usize, ShownWord, String)> = words
+        .into_iter()
+        .enumerate()
+        .filter_map(|(order, (key, w))| {
+            let form = spelling(&w.forms);
+            let named = match shape(&form)? {
+                // An ordinary word in capitals ("CABLE") is no abbreviation either; up to four
+                // letters, the spell checker knows many real abbreviations ("ECAD").
+                Shape::Abbreviation => {
+                    let title: String = form.chars().take(1).chain(form.chars().skip(1).flat_map(char::to_lowercase)).collect();
+                    !COMMON.contains(&form.as_str())
+                        && !(form.chars().count() >= 3 && plain.contains(&key))
+                        && !(form.chars().count() >= 5 && dictionary.is_some_and(|known| known(&title)))
+                }
+                Shape::Inner => true,
+                Shape::Capitalised => {
+                    let known = dictionary?;
+                    let title: String = form.chars().take(1).chain(form.chars().skip(1).flat_map(char::to_lowercase)).collect();
+                    !small.contains(&key) && !umlauted(&title).iter().any(|v| known(v)) && !compound(&title, known)
+                }
+            };
+            let recurs = w.typed || !must_recur || w.screens >= recur_min;
+            let misread = !w.typed && misread(&key, &on_screens, shape(&form) == Some(Shape::Abbreviation));
+            (named && recurs && !misread).then_some((order, w, form))
+        })
+        .collect();
+    // Names the talk has something sounding like (other than the name itself) are what the
+    // term check can fix: a product name on one slide, said misheard all meeting, matters more
+    // than a code on every form.
+    let heard: HashSet<usize> = {
+        let terms: Vec<Term> = kept.iter().map(|(_, _, form)| Term { text: form.clone(), meaning: None }).collect();
+        let matcher = Matcher::new(&terms);
+        seen.said.iter().flat_map(|t| matcher.find(t)).filter(|c| c.heard.to_lowercase() != terms[c.term].text.to_lowercase()).map(|c| c.term).collect()
+    };
+    let mut kept: Vec<(bool, (usize, ShownWord, String))> = kept.into_iter().enumerate().map(|(i, k)| (heard.contains(&i), k)).collect();
+    // What the user typed first, then names heard, then the most shown; else as first seen.
+    kept.sort_by_key(|(heard, (order, w, _))| (!w.typed, !heard, std::cmp::Reverse(w.screens), *order));
+    let kept: Vec<(usize, ShownWord, String)> = kept.into_iter().map(|(_, k)| k).collect();
+    kept.into_iter().take(SHOWN_MAX).map(|(_, w, form)| Term { text: form, meaning: w.meaning }).collect()
+}
+
+/// Whether `word` (lower case) is the OCR misreading a word that the screens show more often:
+/// one letter in four changed, added or dropped ("detine" for "define", "sunktinnen" for
+/// "funktionen"), or its end cut off by the edge of a box ("österreic" for "österreich"). A
+/// misreading recurs too when the same thing stays on screen, but the word read right is on more
+/// screens (one letter off: more; more letters off: at least twice as many). A real name has no
+/// such twin.
+/// An abbreviation is only looked at for its end cut off ("LIGH" for "LIGHT"): short ones are one
+/// letter apart from many others.
+fn misread(word: &str, on_screens: &HashMap<String, usize>, abbreviation: bool) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    let count = on_screens.get(word).copied().unwrap_or(0);
+    let max = (chars.len() / 4).max(1);
+    chars.len() >= if abbreviation { 3 } else { 4 }
+        && on_screens.iter().any(|(other, &n)| {
+            if n <= count || other == word {
+                return false;
+            }
+            let o: Vec<char> = other.chars().collect();
+            if o.len() > chars.len() && o.len() - chars.len() <= 2 && o.starts_with(&chars) {
+                return true;
+            }
+            if abbreviation || o.len().abs_diff(chars.len()) > max {
+                return false;
+            }
+            match edit_distance(&chars, &o) {
+                1 => true,
+                d => d <= max && n >= 2 * count,
+            }
+        })
+}
+
+/// Whether `word` ("Anlagenname", capital first, the rest small) is two ordinary words written as
+/// one, as German does ("Anlagen" + "name"; also with a linking "s"): a label on a form, not a
+/// name. The spell checker doesn't know most compounds, so it can't tell by itself. Both parts
+/// have four letters or more: short words make up nearly anything ("Tee" + "goo").
+fn compound(word: &str, known: Dictionary) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    let title = |cs: &[char]| -> String { cs.iter().take(1).flat_map(|c| c.to_uppercase()).chain(cs.iter().skip(1).copied()).collect() };
+    (4..chars.len().saturating_sub(3)).any(|i| {
+        let tail = title(&chars[i..]);
+        let head: String = chars[..i].iter().collect();
+        known(&tail) && (known(&head) || (head.ends_with('s') && known(&head[..head.len() - 1])))
+    })
+}
+
+/// The spelling of a word written in several ways: the most frequent, of equals the first seen;
+/// a word in capitals that is too long for an abbreviation only when it is never written otherwise
+/// (a heading writes "BRONTIX" for "Brontix").
+fn spelling(forms: &[(String, usize)]) -> String {
+    let heading = |f: &str| f.chars().count() > ABBREVIATION_MAX && f.chars().all(char::is_uppercase);
+    let best = |headings: bool| forms.iter().filter(|(f, _)| heading(f) == headings).rev().max_by_key(|(_, n)| *n);
+    best(false).or_else(|| best(true)).map(|(f, _)| f.clone()).unwrap_or_default()
+}
+
+/// A word, and the words it could be with one "a", "o" or "u" an umlaut: the OCR drops the dots
+/// ("Uberblick" for "Überblick").
+fn umlauted(word: &str) -> Vec<String> {
+    let mut out = vec![word.to_string()];
+    for (i, c) in word.char_indices() {
+        let u = match c {
+            'a' => 'ä',
+            'o' => 'ö',
+            'u' => 'ü',
+            'A' => 'Ä',
+            'O' => 'Ö',
+            'U' => 'Ü',
+            _ => continue,
+        };
+        out.push(format!("{}{u}{}", &word[..i], &word[i + c.len_utf8()..]));
     }
     out
 }
@@ -679,19 +984,18 @@ pub fn glossary(terms: &[Term], text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Characters of transcript shown on each side of a candidate.
-const CONTEXT: usize = 160;
+/// Characters of transcript shown on each side of a place.
+const CONTEXT: usize = 100;
+/// Places of one group asked about in one question at most; a larger group is asked in parts,
+/// each with all that is known about the term.
+const PLACES_PER_QUESTION: usize = 15;
 
 /// A candidate in its place: the transcript before and after it (a little of the neighbouring
 /// segments too), for the model to judge by.
 pub struct Place<'a> {
     pub candidate: &'a Candidate,
-    pub term: &'a Term,
     pub before: String,
     pub after: String,
-    /// How often the meeting has the heard words, and the term itself.
-    pub heard_count: usize,
-    pub term_count: usize,
 }
 
 /// How often `texts` have `term`.
@@ -707,6 +1011,29 @@ fn heard_uses(texts: &[Vec<(&str, String)>], heard: &str) -> usize {
         .iter()
         .map(|t| t.windows(words.len().max(1)).filter(|w| w.iter().map(|(x, _)| *x).eq(words.iter().copied())).count())
         .sum()
+}
+
+/// How many of `texts` have `term` (in any case: a screen's heading writes it in capitals).
+fn texts_with(texts: &[Vec<(&str, String)>], term: &str) -> usize {
+    let t = TermWords::of(&term.to_lowercase());
+    texts.iter().filter(|words| uses(&words.iter().map(|(_, l)| (l.as_str(), l.clone())).collect::<Vec<_>>(), &t) > 0).count()
+}
+
+/// Where `text` spells `term` out letter by letter ("L-E-E-G-O-O", "T. D."), if it does: the
+/// letters as single-letter words, in any case.
+fn spelled_out(text: &str, term: &str) -> Option<Range<usize>> {
+    let letters: Vec<char> = term.to_lowercase().chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.len() < 2 {
+        return None;
+    }
+    let toks = tokens(text);
+    let single = |t: &Token| text[t.range.clone()].chars().count() == 1;
+    (0..=toks.len().checked_sub(letters.len())?).find_map(|k| {
+        let run = &toks[k..k + letters.len()];
+        let same = run.iter().zip(&letters).all(|(t, l)| single(t) && text[t.range.clone()].to_lowercase().starts_with(*l));
+        let close = run.windows(2).all(|p| text[p[0].range.end..p[1].range.start].chars().all(|c| matches!(c, ' ' | '-' | '.')));
+        (same && close).then(|| run[0].range.start..run[letters.len() - 1].range.end)
+    })
 }
 
 fn tail(text: &str, max: usize) -> String {
@@ -728,14 +1055,8 @@ fn head(text: &str, max: usize) -> String {
     }
 }
 
-/// The candidates of segment `i` of `texts` in their places.
-#[cfg(test)]
-pub fn places<'a>(texts: &[&str], i: usize, found: &'a [Candidate], terms: &'a [Term]) -> Vec<Place<'a>> {
-    let words: Vec<Vec<(&str, String)>> = texts.iter().map(|t| text_words(t)).collect();
-    places_in(texts, &words, i, found, terms)
-}
-
-fn places_in<'a>(texts: &[&str], words: &[Vec<(&str, String)>], i: usize, found: &'a [Candidate], terms: &'a [Term]) -> Vec<Place<'a>> {
+/// The candidates `found` of segment `i` of `texts` in their places.
+pub fn places<'a>(texts: &[&str], i: usize, found: &'a [Candidate]) -> Vec<Place<'a>> {
     let text = texts[i];
     let prev = i.checked_sub(1).map_or("", |p| texts[p]);
     let next = texts.get(i + 1).copied().unwrap_or("");
@@ -743,69 +1064,139 @@ fn places_in<'a>(texts: &[&str], words: &[Vec<(&str, String)>], i: usize, found:
         .iter()
         .map(|c| Place {
             candidate: c,
-            term: &terms[c.term],
             before: tail(format!("{prev} {}", &text[..c.range.start]).trim_start(), CONTEXT),
             after: head(format!("{} {next}", &text[c.range.end..]).trim_end(), CONTEXT),
-            heard_count: heard_uses(words, &c.heard),
-            term_count: term_uses(words, &terms[c.term].text),
         })
         .collect()
 }
 
-const SYSTEM: &str = "You correct a speech-recognition transcript of a meeting. The user listed terms that come up \
-    in their meetings. Speech recognition doesn't know such terms, so where one was said it writes something that sounds \
-    alike instead: other letters for an abbreviation (\"ZB\" as \"ZP\" or \"Seby's\"), an ordinary word or a garbled \
-    spelling for a name; it never writes the term itself there. You get one place where the transcript has words that \
-    sound like a term, marked [[like this]]. Say whether the speaker most likely said the term there. Answer yes when the \
-    term makes sense there and the marked words make little sense (a strange abbreviation, a non-word, a word that \
-    doesn't fit). Answer no when the marked words are an ordinary word, a well-known abbreviation or a name that makes \
-    good sense there.";
+/// What the meeting shows about a term, for deciding whether a word that sounds like it is it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Evidence {
+    /// How many screens and photos show the term, of how many.
+    pub shown_on: usize,
+    pub screens: usize,
+    /// How many show the heard words themselves.
+    pub heard_shown_on: usize,
+    /// How often the transcript has the term itself, and the heard words.
+    pub term_said: usize,
+    pub heard_said: usize,
+    /// A sentence of the transcript spelling the term out letter by letter.
+    pub spelled: Option<String>,
+}
 
-/// The terms of `places`, each once with its meaning: the start of every question, the same for
-/// all of them (the helper keeps it read).
-pub fn terms_list(places: &[&Place]) -> String {
-    let mut p = String::from("Terms:\n");
-    let mut listed: Vec<&str> = Vec::new();
-    for pl in places {
-        if !listed.contains(&pl.term.text.as_str()) {
-            listed.push(&pl.term.text);
-            match &pl.term.meaning {
-                Some(m) => p.push_str(&format!("- {}: {m}\n", pl.term.text)),
-                None => p.push_str(&format!("- {}\n", pl.term.text)),
+/// The places where the transcript has the same words for a term ("Bronze" for "Brontix"),
+/// decided together: speech recognition hears a name the same wrong way each time, so the
+/// question is whether that word is the name, asked once with every place and what the meeting
+/// shows about the term, not place by place.
+pub struct Group<'a> {
+    pub term: &'a Term,
+    /// The heard words, as first heard.
+    pub heard: String,
+    /// Segment index and place, in transcript order.
+    pub places: Vec<(usize, Place<'a>)>,
+    pub evidence: Evidence,
+}
+
+/// Heard words as `groups` compares them: "E-Card", "eCard" and "E Card" are one.
+fn heard_key(heard: &str) -> String {
+    heard.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// The candidates `found` of `texts` (see `candidates`) grouped by term and heard words, with the
+/// evidence from the transcript and from what was shown (`shown`, one text per screen or photo).
+pub fn groups<'a>(texts: &[&str], shown: &[&str], found: &'a [Vec<Candidate>], terms: &'a [Term]) -> Vec<Group<'a>> {
+    let said: Vec<Vec<(&str, String)>> = texts.iter().map(|t| text_words(t)).collect();
+    let screens: Vec<Vec<(&str, String)>> = shown.iter().map(|t| text_words(t)).collect();
+    let mut out: Vec<(usize, String, Group)> = Vec::new();
+    for (i, f) in found.iter().enumerate() {
+        for p in places(texts, i, f) {
+            let c = p.candidate;
+            let key = heard_key(&c.heard);
+            match out.iter_mut().find(|(t, k, _)| *t == c.term && *k == key) {
+                Some((_, _, g)) => g.places.push((i, p)),
+                None => {
+                    let term = &terms[c.term];
+                    let spelled = texts.iter().find_map(|t| {
+                        let at = spelled_out(t, &term.text)?;
+                        Some(format!("{}{}", tail(&t[..at.start], CONTEXT), head(&t[at.start..], CONTEXT)))
+                    });
+                    let evidence = Evidence {
+                        shown_on: texts_with(&screens, &term.text),
+                        screens: shown.len(),
+                        heard_shown_on: screens.iter().filter(|s| heard_uses(std::slice::from_ref(*s), &c.heard) > 0).count(),
+                        term_said: term_uses(&said, &term.text),
+                        heard_said: heard_uses(&said, &c.heard),
+                        spelled,
+                    };
+                    out.push((c.term, key, Group { term, heard: c.heard.clone(), places: vec![(i, p)], evidence }));
+                }
             }
         }
     }
+    out.into_iter().map(|(_, _, g)| g).collect()
+}
+
+const SYSTEM: &str = "You correct a speech-recognition transcript of a meeting. Some names and terms come up in it: \
+    ones the user listed, and names shown on the shared screen or a photo during the meeting (of products, modules, \
+    tools, companies; abbreviations). Speech recognition doesn't know such names, so where one was said it writes the \
+    closest thing it knows instead, the same way each time: an ordinary word that sounds alike (\"Bronze\" for a product \
+    \"Brontix\"), other letters for an abbreviation (\"ZP\" for \"ZB\"), or a garbled spelling. It never writes the term \
+    itself there. You get a term, what the meeting shows about it, and every place where the transcript has one \
+    sound-alike of it, marked [[like this]]. Decide whether the speakers said the term at these places. Signs that they \
+    did: the sound-alike is used as the name of a thing (a tool, module, system, product, file, company) rather than in \
+    its ordinary meaning; its ordinary meaning makes little sense there; the screen shows the term while the transcript \
+    never has the term itself; someone spells the term out. Signs that they did not: the sound-alike in its ordinary \
+    meaning fits the sentences well and is not the thing the term names; it is a well-known word or abbreviation in its \
+    own right that fits there; it is dialect or a garbled ordinary word (a colour, a verb, a filler) that makes sense as \
+    plain speech; said aloud, it doesn't sound like the term (a term that only looks a bit like it was not said). A \
+    wrong correction is worse than a missed one.";
+
+/// The question about `places` of group `g` (all of them, or a part of a large group): the term
+/// and what the meeting shows about it, then each place numbered. The model reasons first and
+/// then answers for all of them, naming the places that are exceptions: asked place by place it
+/// went by the ordinary meaning of the sound-alike, and decided alike places differently.
+pub fn question(g: &Group, places: &[(usize, Place)]) -> String {
+    let times = |n: usize| match n {
+        0 => "never".to_string(),
+        1 => "once".to_string(),
+        n => format!("{n} times"),
+    };
+    let (t, h, e) = (&g.term.text, &g.heard, &g.evidence);
+    let what = match (&g.term.meaning, e.shown_on) {
+        (Some(m), _) => format!("{t} = {m}"),
+        (None, 0) => format!("{t}, a term from the user's vocabulary"),
+        (None, n) => format!("{t}, a name shown on the shared screen or a photo during the meeting ({n} of {} screens and photos show it)", e.screens),
+    };
+    let mut p = format!("Term: {what}.\nThe transcript has \"{h}\" {} and \"{t}\" itself {}.\n", times(e.heard_said), times(e.term_said));
+    if let Some(s) = &e.spelled {
+        p.push_str(&format!("Someone spells {t} out: \"{s}\"\n"));
+    }
+    p.push_str(&format!("\nPlaces where the transcript has \"{h}\":\n"));
+    for (k, (_, pl)) in places.iter().enumerate() {
+        p.push_str(&format!("{}. \"{}[[{}]]{}\"\n", k + 1, pl.before, pl.candidate.heard, pl.after));
+    }
+    p.push_str(&format!(
+        "\nFirst say in two to four sentences what the speakers mean by \"{h}\" at these places and whether that is \
+         {t}. Then answer yes if they said {t} there, or no. If yes but at some places \"{h}\" clearly means something \
+         else, add their numbers: \"yes, not 2, 5\"."
+    ));
     p
 }
 
-/// The question about one place, after `terms` (`terms_list`). The model says first what the
-/// heard words mean there, then whether the term was said: asked straight away, or about many
-/// places in one answer, it leans on how it answered before rather than on the sentence.
-pub fn question(terms: &str, pl: &Place) -> String {
-    let times = |n: usize| if n == 1 { "once".to_string() } else { format!("{n} times") };
-    let (c, t) = (pl.candidate, &pl.term.text);
-    let meaning = pl.term.meaning.as_ref().map(|m| format!(" ({m})")).unwrap_or_default();
-    format!(
-        "{terms}\nTerm: {t}{meaning}. The transcript has \"{}\" {} and \"{t}\" {}.\nTranscript: \"{}[[{}]]{}\"\n\n\
-         First say in one short sentence what [[{}]] means there, if anything. Then answer whether the speaker said {t} \
-         there: yes or no.",
-        c.heard,
-        times(pl.heard_count),
-        times(pl.term_count),
-        pl.before,
-        c.heard,
-        pl.after,
-        c.heard,
-    )
-}
+/// The answer: a reason on one line, then the verdict, with the places that are exceptions.
+const GRAMMAR: &str = "root ::= [^\\n]{10,700} \"\\nAnswer: \" (\"no\" | \"yes\" | \"yes, not \" n (\", \" n)*)\nn ::= [1-9] [0-9]?\n";
 
-/// The answer: a reason on one line, then the verdict.
-const GRAMMAR: &str = "root ::= [^\\n]{5,200} \"\\nAnswer: \" (\"yes\" | \"no\")\n";
-
-/// The verdict in an answer (see `GRAMMAR`), and the reason before it.
-fn verdict(answer: &str) -> (bool, &str) {
+/// The verdict in an answer (see `GRAMMAR`): yes or no, the place numbers it excepts (from 1),
+/// and the reason before it. Anything else is a no.
+fn verdict(answer: &str) -> (bool, Vec<usize>, &str) {
     let (reason, verdict) = answer.rsplit_once("Answer:").unwrap_or((answer, ""));
-    (verdict.trim() == "yes", reason.trim())
+    let verdict = verdict.trim();
+    let except = verdict.strip_prefix("yes, not ").map(|n| n.split(',').filter_map(|k| k.trim().parse().ok()).collect());
+    match except {
+        Some(except) => (true, except, reason.trim()),
+        None => (verdict == "yes", Vec::new(), reason.trim()),
+    }
 }
 
 /// The model's verdict on one candidate of text `segment`, with its reason.
@@ -838,31 +1229,51 @@ pub fn candidates(texts: &[&str], terms: &[Term], skip: impl Fn(usize, &Candidat
     out
 }
 
-/// Finds candidates in `texts` (see `candidates`) and asks the model about each on its own
-/// (`question`). `progress` gets the share done (0..1). The helper's context for these questions
-/// is dropped afterwards, also when one fails.
+/// Decisions for `places` of `g` from the model's `answer` (see `verdict`).
+fn decide(places: &[(usize, Place)], answer: &str) -> Vec<Decision> {
+    let (yes, except, reason) = verdict(answer);
+    places
+        .iter()
+        .enumerate()
+        .map(|(k, (i, p))| {
+            let here = yes && !except.contains(&(k + 1));
+            let reason = if yes && !here { format!("{reason} (not at this place)") } else { reason.to_string() };
+            Decision { segment: *i, candidate: p.candidate.clone(), yes: here, reason }
+        })
+        .collect()
+}
+
+/// Finds candidates in `texts` (see `candidates`), groups them (`groups`; `shown` are the texts of
+/// the meeting's screens and photos) and asks the model about each group (`question`, a large one
+/// in parts). Heard words the screens show themselves are a word of the meeting, not a
+/// mishearing: turned down without asking. `progress` gets the share done (0..1). The helper's
+/// context for these questions is dropped afterwards, also when one fails.
 pub fn check(
     worker: &mut crate::llm::Worker,
     texts: &[&str],
+    shown: &[&str],
     terms: &[Term],
     skip: impl Fn(usize, &Candidate) -> bool,
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<Vec<Decision>> {
     let found = candidates(texts, terms, skip);
-    let words: Vec<Vec<(&str, String)>> = texts.iter().map(|t| text_words(t)).collect();
-    let all: Vec<(usize, Place)> =
-        found.iter().enumerate().flat_map(|(i, f)| places_in(texts, &words, i, f, terms).into_iter().map(move |p| (i, p))).collect();
-    if all.is_empty() {
+    let groups = groups(texts, shown, &found, terms);
+    let total: usize = groups.iter().map(|g| g.places.len()).sum();
+    if total == 0 {
         return Ok(Vec::new());
     }
-    let listed = terms_list(&all.iter().map(|(_, p)| p).collect::<Vec<_>>());
     let mut ask = || -> anyhow::Result<Vec<Decision>> {
-        let mut out = Vec::with_capacity(all.len());
-        for (k, (i, p)) in all.iter().enumerate() {
-            let answer = worker.chat_at(SYSTEM, &question(&listed, p), 90, Some(GRAMMAR), Some(0.0), Some(SLOT), |_| {})?;
-            let (yes, reason) = verdict(&answer);
-            out.push(Decision { segment: *i, candidate: p.candidate.clone(), yes, reason: reason.to_string() });
-            progress((k + 1) as f32 / all.len() as f32);
+        let mut out = Vec::with_capacity(total);
+        for g in &groups {
+            for part in g.places.chunks(PLACES_PER_QUESTION) {
+                if g.evidence.heard_shown_on > 0 {
+                    out.extend(decide(part, &format!("The screens show \"{}\" itself.\nAnswer: no", g.heard)));
+                } else {
+                    let answer = worker.chat_at(SYSTEM, &question(g, part), 400, Some(GRAMMAR), Some(0.0), Some(SLOT), |_| {})?;
+                    out.extend(decide(part, &answer));
+                }
+                progress(out.len() as f32 / total as f32);
+            }
         }
         Ok(out)
     };
@@ -1046,42 +1457,6 @@ mod tests {
         assert_eq!(serde_json::to_string(&fix("ZP", "ZB", 3)).unwrap(), r#"{"heard":"ZP","written":"ZB","at":3}"#);
     }
 
-    #[test]
-    fn the_model_sees_each_place_in_its_sentence() {
-        let t = terms(&["ZB = Zollbeleg", "Trevolin"]);
-        let texts = ["Der Spediteur schickt eine neue.", "Wir haben die ZP geprüft.", "Das passt."];
-        let found = find(texts[1], &t);
-        let pl = places(&texts, 1, &found, &t);
-        let listed = terms_list(&pl.iter().collect::<Vec<_>>());
-        assert_eq!(listed, "Terms:\n- ZB: Zollbeleg\n");
-        assert_eq!(
-            question(&listed, &pl[0]),
-            "Terms:\n- ZB: Zollbeleg\n\nTerm: ZB (Zollbeleg). The transcript has \"ZP\" once and \"ZB\" 0 times.\n\
-             Transcript: \"Der Spediteur schickt eine neue. Wir haben die [[ZP]] geprüft. Das passt.\"\n\n\
-             First say in one short sentence what [[ZP]] means there, if anything. Then answer whether the speaker said ZB \
-             there: yes or no."
-        );
-    }
-
-    #[test]
-    fn the_answer_is_a_reason_then_a_verdict() {
-        assert_eq!(GRAMMAR, "root ::= [^\\n]{5,200} \"\\nAnswer: \" (\"yes\" | \"no\")\n");
-        assert_eq!(verdict("A customs document.\nAnswer: yes"), (true, "A customs document."));
-        assert_eq!(verdict("Means to deliver.\nAnswer: no"), (false, "Means to deliver."));
-        // Anything else keeps the transcript as it is.
-        assert!(!verdict("cut off").0);
-    }
-
-    #[test]
-    fn long_neighbours_are_cut() {
-        let t = terms(&["ZB"]);
-        let long = "wort ".repeat(100);
-        let texts = [long.as_str(), "Die ZP kam.", long.as_str()];
-        let found = find(texts[1], &t);
-        let pl = places(&texts, 1, &found, &t);
-        assert!(pl[0].before.starts_with('…') && pl[0].before.chars().count() <= CONTEXT + 1);
-        assert!(pl[0].after.ends_with('…') && pl[0].after.chars().count() <= CONTEXT + 1);
-    }
 
     #[test]
     fn distinctive_words_of_a_screen() {
@@ -1100,6 +1475,69 @@ mod tests {
         );
         let shown: Vec<(&str, Option<&str>)> = v.iter().map(|t| (t.text.as_str(), t.meaning.as_deref())).collect();
         assert_eq!(shown, [("ZB", Some("Zollbeleg")), ("Trevolin", None), ("Wortfeld", None), ("KW", None), ("QT", Some("Quittung"))]);
+    }
+
+    #[test]
+    fn names_shown_on_several_screens_and_not_ordinary_words() {
+        let screens = [
+            "BRONTIX | Admin / Brontix Modul | SOURCE OF TRUTH | ECAD | CORE",
+            "Brontix Modul | Eigenschaften | modules/ecad | IDEntS | CORE",
+            "Admin | Eigenschaften | ECAD MODULE | the single source of truth",
+            "Brontix | Überblick | Uberblick | DantS",
+            "Kasse KW 47",
+        ];
+        let said = ["Das Bronze-Modul hat ein Eigenschaften-Feld, core."];
+        let known = ["Termin", "Eigenschaften", "Überblick", "Admin", "Modul", "Module", "Kasse", "Source", "Truth"];
+        let dictionary = |w: &str| known.contains(&w);
+        let seen = Seen { typed: &["Termin mit Zollinka"], shown: &screens, said: &said };
+        let names = |v: Vec<Term>| v.into_iter().map(|t| t.text).collect::<Vec<_>>();
+        // What the user typed first, then by how many screens show it, in its usual spelling.
+        // Ordinary words (also in capitals: written in small letters elsewhere, or common), OCR
+        // misreadings and a word on one screen of many are left out; "ecad" in a path is no word.
+        assert_eq!(names(shown_terms(&seen, Some(&dictionary))), ["Zollinka", "Brontix", "ECAD"]);
+        // Without a dictionary, only how a word looks tells a name.
+        assert_eq!(names(shown_terms(&seen, None)), ["ECAD"]);
+        // Few screens: once is enough.
+        assert_eq!(names(shown_terms(&Seen { shown: &screens[3..], ..Default::default() }, Some(&dictionary))), ["Brontix", "KW"]);
+    }
+
+    #[test]
+    fn misreadings_with_a_twin_read_right_are_no_names() {
+        // "Detine" (for Define) and "Österreic" (cut at a box's edge) recur while the same slide
+        // stays, but the word read right is on more screens; "Brontix" has no such twin.
+        let screens = [
+            "Detine the rules | Brontix | Tanzschule Österreic",
+            "Define the rules | Brontix | Tanzschule Österreich",
+            "Define the rules | Brontix | Tanzschule Österreich",
+            "Detine the rules | Brontix | Tanzschule Österreic",
+            "Define the rules | Brontix | Tanzschule Österreich",
+        ];
+        let known = ["Define", "Rules", "Tanzschule", "Österreich"];
+        let dictionary = |w: &str| known.contains(&w);
+        let seen = Seen { shown: &screens, ..Default::default() };
+        let names: Vec<String> = shown_terms(&seen, Some(&dictionary)).into_iter().map(|t| t.text).collect();
+        assert_eq!(names, ["Brontix"]);
+    }
+
+    #[test]
+    fn form_labels_and_cut_abbreviations_are_no_names() {
+        // "Anlagenname" is two ordinary words; "LIGH" is "LIGHT" cut at a box's edge (and "LIGHT"
+        // an ordinary word); "Teegoo" is no compound of two short words.
+        let screens = ["Anlagenname | Brontix | LIGHT | Teegoo", "Anlagenname | Brontix | LIGH | Teegoo", "Anlagenname | Brontix | LIGHT"];
+        let known = ["Anlagen", "Name", "Light", "Tee", "Goo"];
+        let dictionary = |w: &str| known.contains(&w);
+        let seen = Seen { shown: &screens, ..Default::default() };
+        let names: Vec<String> = shown_terms(&seen, Some(&dictionary)).into_iter().map(|t| t.text).collect();
+        assert_eq!(names, ["Brontix", "Teegoo"]);
+    }
+
+    #[test]
+    fn a_word_in_several_spellings_takes_its_usual_one() {
+        let forms = |f: &[(&str, usize)]| f.iter().map(|(s, n)| (s.to_string(), *n)).collect::<Vec<_>>();
+        assert_eq!(spelling(&forms(&[("BRONTIX", 5), ("Brontix", 2)])), "Brontix");
+        assert_eq!(spelling(&forms(&[("ECAD", 5), ("eCAD", 1)])), "ECAD");
+        assert_eq!(spelling(&forms(&[("TreVolin", 1), ("Trevolin", 1)])), "TreVolin");
+        assert_eq!(umlauted("Uber"), ["Uber", "Über"]);
     }
 
     #[test]
@@ -1145,15 +1583,94 @@ mod tests {
     }
 
     #[test]
-    fn places_count_the_heard_words_and_the_term() {
+    fn places_heard_alike_are_one_group_with_the_evidence() {
         let t = terms(&["ZB", "Trevolin"]);
-        let texts = ["Die ZPs und die ZP.", "Der ZB, die ZBs, ab heute.", "Im Dreh Wolin und im Trevolins."];
-        let count = |i: usize| {
-            let found = find(texts[i], &t);
-            places(&texts, i, &found, &t).iter().map(|p| (p.candidate.heard.clone(), p.heard_count, p.term_count)).collect::<Vec<_>>()
-        };
-        assert_eq!(count(0), [("ZPs".to_string(), 1, 2), ("ZP".to_string(), 1, 2)]);
-        assert_eq!(count(2), [("Dreh Wolin".to_string(), 1, 1)]);
+        let texts = ["Die ZPs und die ZP.", "Der ZB, die ZBs, ab heute.", "Im Dreh Wolin und im Trevolins.", "Das Drehwolin, T-R-E-V-O-L-I-N."];
+        let shown = ["Lager: Trevolin", "TREVOLIN Übersicht", "Rechnung"];
+        let found = candidates(&texts, &t, |_, _| false);
+        let g = groups(&texts, &shown, &found, &t);
+        let summary: Vec<(&str, &str, usize)> = g.iter().map(|g| (g.term.text.as_str(), g.heard.as_str(), g.places.len())).collect();
+        // "Dreh Wolin" and "Drehwolin" are heard alike; "ZPs" and "ZP" are not.
+        assert_eq!(summary, [("ZB", "ZPs", 1), ("ZB", "ZP", 1), ("Trevolin", "Dreh Wolin", 2)]);
+        assert_eq!(g[1].evidence, Evidence { shown_on: 0, screens: 3, heard_shown_on: 0, term_said: 2, heard_said: 1, spelled: None });
+        let e = &g[2].evidence;
+        assert_eq!((e.shown_on, e.term_said, e.heard_said), (2, 1, 1));
+        assert_eq!(e.spelled.as_deref(), Some("Das Drehwolin, T-R-E-V-O-L-I-N."));
+    }
+
+    #[test]
+    fn the_model_sees_every_place_of_a_group_and_what_the_screens_show() {
+        let t = terms(&["Trevolin", "ZB = Zollbeleg"]);
+        let texts = ["Das läuft im Drewolin.", "Dann zurück ins Drewolin und fertig."];
+        let shown = ["Trevolin", "Trevolin Lager", "Rechnung", "Kasse"];
+        let found = candidates(&texts, &t, |_, _| false);
+        let g = groups(&texts, &shown, &found, &t);
+        assert_eq!(
+            question(&g[0], &g[0].places),
+            "Term: Trevolin, a name shown on the shared screen or a photo during the meeting (2 of 4 screens and photos show it).\n\
+             The transcript has \"Drewolin\" 2 times and \"Trevolin\" itself never.\n\n\
+             Places where the transcript has \"Drewolin\":\n\
+             1. \"Das läuft im [[Drewolin]]. Dann zurück ins Drewolin und fertig.\"\n\
+             2. \"Das läuft im Drewolin. Dann zurück ins [[Drewolin]] und fertig.\"\n\n\
+             First say in two to four sentences what the speakers mean by \"Drewolin\" at these places and whether that is \
+             Trevolin. Then answer yes if they said Trevolin there, or no. If yes but at some places \"Drewolin\" clearly \
+             means something else, add their numbers: \"yes, not 2, 5\"."
+        );
+        // A meaning the user gave is the term's description.
+        let texts = ["Die ZP kam."];
+        let found = candidates(&texts, &t, |_, _| false);
+        let g = groups(&texts, &[], &found, &t);
+        assert!(question(&g[0], &g[0].places).starts_with("Term: ZB = Zollbeleg.\nThe transcript has \"ZP\" once and \"ZB\" itself never.\n"));
+    }
+
+    #[test]
+    fn the_answer_is_a_reason_then_a_verdict_for_all_places() {
+        assert_eq!(
+            GRAMMAR,
+            "root ::= [^\\n]{10,700} \"\\nAnswer: \" (\"no\" | \"yes\" | \"yes, not \" n (\", \" n)*)\nn ::= [1-9] [0-9]?\n"
+        );
+        assert_eq!(verdict("A customs document.\nAnswer: yes"), (true, vec![], "A customs document."));
+        assert_eq!(verdict("Means to deliver.\nAnswer: no"), (false, vec![], "Means to deliver."));
+        assert_eq!(verdict("The tool, but 3 is the toy.\nAnswer: yes, not 3, 12"), (true, vec![3, 12], "The tool, but 3 is the toy."));
+        // Anything else keeps the transcript as it is.
+        assert!(!verdict("cut off").0);
+        // The exceptions stay as they were.
+        let t = terms(&["Trevolin"]);
+        let texts = ["Im Drewolin.", "Das Drewolin.", "Ein Drewolin."];
+        let found = candidates(&texts, &t, |_, _| false);
+        let g = groups(&texts, &[], &found, &t);
+        let d = decide(&g[0].places, "Mostly the system.\nAnswer: yes, not 2");
+        assert_eq!(d.iter().map(|d| (d.segment, d.yes)).collect::<Vec<_>>(), [(0, true), (1, false), (2, true)]);
+        assert_eq!(d[1].reason, "Mostly the system. (not at this place)");
+    }
+
+    #[test]
+    fn long_neighbours_are_cut() {
+        let t = terms(&["ZB"]);
+        let long = "wort ".repeat(100);
+        let texts = [long.as_str(), "Die ZP kam.", long.as_str()];
+        let found = find(texts[1], &t);
+        let pl = places(&texts, 1, &found);
+        assert!(pl[0].before.starts_with('…') && pl[0].before.chars().count() <= CONTEXT + 1);
+        assert!(pl[0].after.ends_with('…') && pl[0].after.chars().count() <= CONTEXT + 1);
+    }
+
+    #[test]
+    fn spelled_out_terms_are_found() {
+        assert_eq!(spelled_out("Die heißt B-R-O-N-T-I-X Bronze.", "Brontix"), Some(11..24));
+        assert_eq!(spelled_out("Das ist das Z. B. hier", "ZB"), Some(12..16));
+        assert_eq!(spelled_out("B R O N T I", "Brontix"), None);
+        assert_eq!(spelled_out("B-R-O-N-T-I-K", "Brontix"), None);
+    }
+
+    #[test]
+    fn abbreviations_said_as_a_word() {
+        // "ECAD" said as a word, heard with a hyphen or a capital inside; "E-Mail" is too far off.
+        let t = ["ECAD"];
+        assert_eq!(corrected("Das E-Card-Modul und das eCard, im E-Kart.", &t), "Das ECAD-Modul und das ECAD, im ECAD.");
+        assert!(find("Schick eine E-Mail an die Edda.", &terms(&t)).is_empty());
+        // Short ones and ones without a vowel are only spelled.
+        assert!(!said_as_word("ZB") && !said_as_word("SWS") && said_as_word("ECAD"));
     }
 
     #[test]
@@ -1220,3 +1737,4 @@ mod tests {
         eprintln!("500 terms over 10 000 words: {took:?}, {} candidates kept, {} terms said", found.iter().flatten().count(), glossary.len());
     }
 }
+

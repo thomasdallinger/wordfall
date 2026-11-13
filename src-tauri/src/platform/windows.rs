@@ -54,6 +54,12 @@ pub fn normalize_image(_from: &Path, _to: &Path, _max_px: u32) -> anyhow::Result
     anyhow::bail!(NO_VISUALS)
 }
 
+/// Whether `word` is an ordinary word of `languages`: no spell checker is asked on Windows yet, so
+/// no word is known to be one (the meeting vocabulary then goes by how words look and recur).
+pub fn is_word(_word: &str, _languages: &[String]) -> bool {
+    false
+}
+
 pub fn screen_permission() -> bool {
     false
 }

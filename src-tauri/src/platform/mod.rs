@@ -14,6 +14,8 @@ mod macos_ocr;
 #[cfg(target_os = "macos")]
 mod macos_screen;
 #[cfg(target_os = "macos")]
+mod macos_spelling;
+#[cfg(target_os = "macos")]
 mod macos_tap;
 #[cfg(target_os = "macos")]
 pub use {
@@ -21,6 +23,7 @@ pub use {
     macos_keys::run_key_listener,
     macos_ocr::{normalize_image, ocr},
     macos_screen::{capture_window, request_screen_permission, screen_permission, screen_windows},
+    macos_spelling::is_word,
     macos_tap::SystemTap,
 };
 

@@ -329,7 +329,8 @@ pub struct SummaryInput<'a> {
     pub transcript: &'a [String],
     /// Some transcript lines are text read from a screen or a photo.
     pub shown: bool,
-    /// The user's terms the meeting used ("PO = what it stands for" where the user said).
+    /// The terms of the meeting's vocabulary (the user's, and names from its screens) that were
+    /// said, in their spelling ("PO = what it stands for" where the user said).
     pub glossary: &'a [String],
     pub speakers: &'a [String],
     pub language: Option<&'a str>,
@@ -448,7 +449,9 @@ fn final_prompt(input: &SummaryInput, language: &str, body_label: &str, body: &s
     }
     if !input.glossary.is_empty() {
         p.push_str(&format!(
-            "Terms from my vocabulary used in this meeting, each a thing of its own, in their exact spelling: {}.\n",
+            "Names and terms used in this meeting (from my vocabulary and the shared screen), each a thing of its own. \
+             Write them in exactly this spelling, also where the transcript has a word that sounds like one of them and \
+             clearly means it: {}.\n",
             input.glossary.join("; ")
         ));
     }

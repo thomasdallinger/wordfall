@@ -1376,7 +1376,7 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
         }
         let snapshot = meeting.lock().clone();
         let lines = pipeline::timeline_lines(&snapshot.segments, &snapshot.speakers, &snapshot.visuals, visuals::NOTES);
-        let glossary = terms::glossary(&vocabulary, &lines.join("\n"));
+        let glossary = notes_glossary(&vocabulary, &lines);
         let used: Vec<u32> = snapshot.segments.iter().map(|s| s.speaker).collect();
         let speakers: Vec<String> =
             snapshot.speakers.iter().filter(|s| used.contains(&s.id)).map(|s| s.name.clone()).collect();
@@ -1441,9 +1441,18 @@ fn write_summary(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>) {
     }
 }
 
-/// The vocabulary of `m` (see `terms::vocabulary`): `entries` (the user's words to recognise), the
-/// words dictionary replacements write (when the dictionary is on), and what was typed into the
-/// meeting or shown in it.
+/// The glossary for the notes (see `terms::glossary`): the terms of `vocabulary` that were said, in
+/// `lines` without what was shown (a screen's lines spell its words right anyway, and a screen
+/// shows many more than the meeting talks about).
+fn notes_glossary(vocabulary: &[terms::Term], lines: &[String]) -> Vec<String> {
+    let said: Vec<&str> = lines.iter().filter(|l| !visuals::is_shown(l)).map(String::as_str).collect();
+    terms::glossary(vocabulary, &said.join("\n"))
+}
+
+/// The vocabulary of `m` (see `terms::vocabulary_seen`): `entries` (the user's words to
+/// recognise), the words dictionary replacements write (when the dictionary is on), and the names
+/// in what was typed into the meeting or shown in it, told from ordinary words by the system's
+/// spell checker in the user's languages and by what was said.
 fn meeting_vocabulary(entries: &[String], dictionary: &[crate::store::DictEntry], settings: &Settings, m: &Meeting) -> Vec<terms::Term> {
     let replacements: Vec<String> =
         if settings.dictionary_enabled { dictionary.iter().map(|e| e.replacement.clone()).collect() } else { Vec::new() };
@@ -1451,28 +1460,34 @@ fn meeting_vocabulary(entries: &[String], dictionary: &[crate::store::DictEntry]
     if m.title_from_user {
         typed.push(&m.title);
     }
-    typed.extend(m.visuals.iter().map(|v| v.text.as_str()));
-    terms::vocabulary(entries, &replacements, &typed)
+    let shown: Vec<&str> = m.visuals.iter().map(|v| v.text.as_str()).collect();
+    let said: Vec<&str> = m.segments.iter().map(|s| s.text.as_str()).collect();
+    let is_word = |w: &str| crate::platform::is_word(w, &settings.languages);
+    // Windows has no spell checker to ask yet: names written like ordinary words are left out there.
+    let spell_checker: Option<terms::Dictionary> = cfg!(target_os = "macos").then_some(&is_word);
+    terms::vocabulary_seen(entries, &replacements, &terms::Seen { typed: &typed, shown: &shown, said: &said }, spell_checker)
 }
 
 /// Fixes misheard terms in the finished meeting's transcript before the notes read it (see
-/// `terms.rs`): every place that sounds like a term of `vocabulary` goes to the summary model,
-/// which says yes or no; places it turned down before are skipped. A segment changes only if its
+/// `terms.rs`): the places that sound like a term of `vocabulary` go to the summary model, those
+/// heard the same way together with what the screens show about the term, and it says yes or no;
+/// places it turned down before are skipped. A segment changes only if its
 /// text is still what was checked; what it said before stays in its `fixes`. Shown as "Checking
 /// terms…" (with a share) while it runs. The log gets counts only: the transcript stays out of it.
 fn check_terms(app: &AppHandle, meeting: &Mutex<Meeting>, worker: &mut llm::Worker, vocabulary: &[terms::Term]) {
     if vocabulary.is_empty() {
         return;
     }
-    let (id, segments, rejected) = {
+    let (id, segments, rejected, visuals) = {
         let m = meeting.lock();
-        (m.id.clone(), m.segments.clone(), m.term_rejections.clone())
+        (m.id.clone(), m.segments.clone(), m.term_rejections.clone(), m.visuals.clone())
     };
     let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+    let shown: Vec<&str> = visuals.iter().map(|v| v.text.as_str()).collect();
     let started = Instant::now();
     progress(app, &id, "checking", Some(0.0), None);
     let skip = turned_down(&segments, &rejected);
-    let decisions = match terms::check(worker, &texts, vocabulary, skip, |f| progress(app, &id, "checking", Some(f), None)) {
+    let decisions = match terms::check(worker, &texts, &shown, vocabulary, skip, |f| progress(app, &id, "checking", Some(f), None)) {
         Ok(d) => d,
         Err(e) => {
             log::warn!("the term check failed, the transcript stays as it was: {e:#}");
@@ -1909,7 +1924,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let speakers: Vec<String> = meeting.speakers.iter().map(|s| s.name.clone()).collect();
-    let glossary = terms::glossary(&vocabulary, &lines.join("\n"));
+    let glossary = notes_glossary(&vocabulary, &lines);
     print_notes(&data_dir, &settings, &lines, &speakers, meeting.language.as_deref(), meeting.duration_ms / 60_000, &meeting.notes, &glossary, &extra, args)
 }
 
@@ -2003,7 +2018,7 @@ pub fn cli_notes(args: &[String]) -> anyhow::Result<()> {
         if args.iter().any(|a| a == "--print-lines") {
             lines.iter().filter(|l| visuals::any_shown(std::slice::from_ref(l))).for_each(|l| eprintln!("{l}"));
         }
-        let glossary = terms::glossary(&vocabulary, &lines.join("\n"));
+        let glossary = notes_glossary(&vocabulary, &lines);
         return print_notes(&data_dir, &settings, &lines, &speakers, language.as_deref(), minutes, &notes, &glossary, &[], args);
     }
     let line = regex::Regex::new(r"^\[[\d:]+\] ([^:]+): ")?;
@@ -2023,7 +2038,7 @@ pub fn cli_notes(args: &[String]) -> anyhow::Result<()> {
     );
     let minutes = arg("--minutes").and_then(|m| m.parse().ok()).unwrap_or(1);
     let vocabulary = cli_vocabulary(args, &data_dir, &settings, &Meeting { notes: notes.clone(), visuals: shown, ..Default::default() })?;
-    let glossary = terms::glossary(&vocabulary, &lines.join("\n"));
+    let glossary = notes_glossary(&vocabulary, &lines);
     print_notes(&data_dir, &settings, &lines, &speakers, arg("--language").as_deref(), minutes, &notes, &glossary, &[], args)
 }
 
@@ -2144,7 +2159,9 @@ fn cli_vocabulary(args: &[String], data_dir: &Path, settings: &Settings, m: &Mee
         Some(f) => std::fs::read_to_string(&f).map_err(|e| anyhow::anyhow!("{f}: {e}"))?.lines().map(str::to_string).collect(),
         None => store.vocabulary,
     };
-    Ok(meeting_vocabulary(&entries, &store.dictionary, settings, m))
+    let vocabulary = meeting_vocabulary(&entries, &store.dictionary, settings, m);
+    eprintln!("(vocabulary: {})", vocabulary.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(", "));
+    Ok(vocabulary)
 }
 
 /// `--check-terms`: the term check of `check_terms` on `m`, printing every candidate's verdict.
@@ -2152,11 +2169,11 @@ fn cli_check_terms(data_dir: &Path, settings: &Settings, m: &mut Meeting, vocabu
     let entry = llm::entry(&settings.summary_model).ok_or_else(|| anyhow::anyhow!("unknown summary model"))?;
     let path = llm::locate(&settings.model_dirs(data_dir).own, entry).ok_or_else(|| anyhow::anyhow!("{} is not downloaded", entry.id))?;
     let mut worker = llm::Worker::spawn(&path, &data_dir.join("llm.log"), llm::NOTES_CTX)?;
-    eprintln!("(term check vocabulary: {})", vocabulary.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(", "));
     let segments = m.segments.clone();
     let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+    let shown: Vec<&str> = m.visuals.iter().map(|v| v.text.as_str()).collect();
     let t = Instant::now();
-    let decisions = terms::check(&mut worker, &texts, vocabulary, turned_down(&segments, &m.term_rejections), |_| {})?;
+    let decisions = terms::check(&mut worker, &texts, &shown, vocabulary, turned_down(&segments, &m.term_rejections), |_| {})?;
     let ms = t.elapsed().as_millis();
     for d in &decisions {
         let s = &m.segments[d.segment];
