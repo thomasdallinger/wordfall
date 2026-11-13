@@ -261,10 +261,78 @@ fn near(a: &str, b: &str) -> bool {
     la.min(lb) >= 5 && edit_distance(&a, &b) as f32 <= 0.2 * la.max(lb) as f32
 }
 
+/// Words for a part of a system rather than which system it is: two names that differ only by them
+/// are one box ("Navision" ~ "Navision-Modul" ~ "Navision Core"). The longer ones also as the last
+/// part of a German compound ("Navisionmodul").
+const PART_WORDS: &[&str] = &[
+    "modul", "module", "core", "engine", "system", "tool", "software", "app", "plattform", "platform", "komponente", "component",
+];
+
+/// A name without its part words, letters and digits only ("Navi-Sion Modul" → "navision"); the
+/// whole name when it is nothing but part words ("Core System").
+fn head(name: &str) -> String {
+    let kept: Vec<String> = words(name)
+        .into_iter()
+        .filter(|w| !PART_WORDS.contains(&w.as_str()))
+        .map(|w| {
+            let stem = PART_WORDS.iter().filter(|p| p.len() >= 5).find_map(|p| w.strip_suffix(p).filter(|rest| rest.chars().count() >= 3));
+            stem.map(str::to_string).unwrap_or(w)
+        })
+        .collect();
+    if kept.is_empty() { compact(name) } else { kept.concat() }
+}
+
+fn digits(s: &str) -> String {
+    s.chars().filter(char::is_ascii_digit).collect()
+}
+
+/// Two names of one thing that speech recognition heard (or a screen showed) in different ways: the
+/// same but for part words, or (four letters on) sounding alike with at most a third of the letters
+/// different and the same digits ("Navision" ~ "Navisjon Modul"; not "Windows 10" ~ "Windows 11").
+fn variant(a: &str, b: &str) -> bool {
+    let (x, y) = (head(a), head(b));
+    let (lx, ly) = (x.chars().count(), y.chars().count());
+    lx.min(ly) >= 3
+        && !different_people(a, b)
+        && (x == y
+            || (lx.min(ly) >= 4
+                && digits(&x) == digits(&y)
+                && super::terms::phonetic(&x) == super::terms::phonetic(&y)
+                && edit_distance(&x, &y) * 3 <= lx.max(ly)))
+}
+
+/// Whether `heard` is the name `shown` (on a screen, in the notes) as speech recognition heard it:
+/// a variant (see `variant`), or from four letters on one letter off with the same first letter
+/// ("SKU" is too short; "EDIX" ~ "Edix", "ECAD" ~ "eCard").
+fn heard_as(shown: &str, heard: &str) -> bool {
+    if variant(shown, heard) {
+        return true;
+    }
+    let (x, y) = (head(shown), head(heard));
+    x.chars().count().min(y.chars().count()) >= 4 && x.chars().next() == y.chars().next() && digits(&x) == digits(&y) && edit_distance(&x, &y) <= 1
+}
+
+/// The spelling a screen or the notes showed for `name` when it was heard otherwise: that spelling
+/// with the part words `name` has ("Ecard Modul" → "ECAD Modul" when "ECAD" was shown), if exactly
+/// one shown spelling fits. `None` when `name` is spelled as shown already.
+fn shown_spelling(name: &str, spellings: &[String]) -> Option<String> {
+    if spellings.iter().any(|s| head(s) == head(name)) {
+        return None;
+    }
+    let fits: Vec<&String> = spellings.iter().filter(|s| heard_as(s, name)).collect();
+    let [shown] = fits.as_slice() else { return None };
+    if head(shown) != compact(shown) {
+        return Some(shown.to_string());
+    }
+    let parts = name.split(|c: char| c.is_whitespace() || c == '-').filter(|w| PART_WORDS.contains(&w.to_lowercase().as_str()));
+    Some(std::iter::once(shown.as_str()).chain(parts).collect::<Vec<_>>().join(" "))
+}
+
 /// The node called `name` among `nodes`. A small model doesn't always repeat a name exactly, so
 /// failing that: the same letters ("BusinessCentral"), the one node whose name holds it or is held
-/// by it ("Business Central" for "Microsoft Dynamics Business Central"), or the one node whose name
-/// is the same but for an ending or a misheard letter ("Lieferanten", "Varnog" for "Varnor").
+/// by it ("Business Central" for "Microsoft Dynamics Business Central"), the one node whose name
+/// is the same but for an ending or a misheard letter ("Lieferanten", "Varnog" for "Varnor"), or
+/// the one that is the same heard another way (see `variant`: "Navisjon Modul" for "Navision").
 fn find_in(nodes: &[Node], name: &str) -> Option<u32> {
     let n = norm(name);
     if let Some(x) = nodes.iter().find(|x| names(x).any(|a| norm(a) == n)) {
@@ -289,7 +357,9 @@ fn find_in(nodes: &[Node], name: &str) -> Option<u32> {
         }))
         .map(|x| x.id)
         .collect();
-    unique(holding).or_else(|| unique(nodes.iter().filter(|x| names(x).any(|a| near(a, name))).map(|x| x.id).collect()))
+    unique(holding)
+        .or_else(|| unique(nodes.iter().filter(|x| names(x).any(|a| near(a, name))).map(|x| x.id).collect()))
+        .or_else(|| unique(nodes.iter().filter(|x| names(x).any(|a| variant(a, name))).map(|x| x.id).collect()))
 }
 
 impl SystemMap {
@@ -495,13 +565,57 @@ pub struct Evidence<'a> {
     /// Names the user gave speakers.
     pub people: &'a [String],
     pub language: &'a str,
+    /// Everything said in the meeting so far (a name said anywhere is backed by speech).
+    pub spoken: &'a str,
+    /// The text of every screen and photo so far.
+    pub screens: &'a [String],
+    /// Names as screens or the notes spelled them (see `shown_spelling`).
+    pub spellings: &'a [String],
+    /// New boxes one answer may draw.
+    pub max_new: usize,
+    /// The lines were picked from all over the meeting (see `closing`): the one next to a line may
+    /// be from an hour later, so a flow's ends must both be in its own line.
+    pub picked: bool,
 }
 
 impl<'a> Evidence<'a> {
-    /// All lines new, nobody named, English.
+    /// All lines new, nobody named, English, nothing else said or shown.
     #[cfg(test)]
     pub fn of(lines: &'a [String], notes: &'a str) -> Self {
-        Evidence { lines, notes, new_from: 1, people: &[], language: "English" }
+        Evidence {
+            lines,
+            notes,
+            new_from: 1,
+            people: &[],
+            language: "English",
+            spoken: "",
+            screens: &[],
+            spellings: &[],
+            max_new: MAX_NEW,
+            picked: false,
+        }
+    }
+
+    /// A name said in the meeting (in these lines or before), also as heard another way (see
+    /// `heard_as`): not only read off a screen.
+    fn said_anywhere(&self, name: &str) -> bool {
+        let spoken_lines = self.lines.iter().filter(|l| !super::visuals::is_shown(l)).map(|l| line_text(l));
+        if spoken_lines.chain(std::iter::once(self.spoken)).any(|t| name_in(name, t)) {
+            return true;
+        }
+        let telling: Vec<String> = words(name).into_iter().filter(|w| w.chars().count() >= 4 && !PART_WORDS.contains(&w.as_str())).collect();
+        let heard: std::collections::HashSet<String> = words(self.spoken).into_iter().filter(|w| w.chars().count() >= 3).collect();
+        !telling.is_empty() && telling.iter().all(|t| heard.contains(t) || heard.iter().any(|h| heard_as(t, h)))
+    }
+
+    /// On how many screens (or photos) a name was shown.
+    fn screens_with(&self, name: &str) -> usize {
+        self.screens.iter().filter(|s| name_in(name, s)).count()
+    }
+
+    /// Whether line `l` is a shared screen's (not speech, nor a photo the user chose to add).
+    fn is_screen(&self, l: usize) -> bool {
+        l >= 1 && l <= self.lines.len() && self.lines[l - 1].split_once("] ").is_some_and(|(_, rest)| rest.starts_with("Screen: "))
     }
 
     /// The cited text, with `around` lines on either side.
@@ -677,6 +791,13 @@ const FIRST_NAMES: &[&str] = &[
     "rebecca", "ryan", "sean", "tina", "tony", "victor", "jeff", "jenny", "joe", "ken", "lucas", "mark", "matt", "phil",
     "rob", "sophia", "ted", "will", "anita", "elif", "mehmet", "ahmet", "fatma", "ivan", "milan", "jakub", "tomas",
 ];
+
+/// Two names with different common first names ("Anna" and "Anne", "Jonas" and "Jana"): two people,
+/// however alike they sound.
+fn different_people(a: &str, b: &str) -> bool {
+    let first = |n: &str| words(n).into_iter().find(|w| FIRST_NAMES.contains(&w.as_str()));
+    first(a).zip(first(b)).is_some_and(|(x, y)| x != y)
+}
 
 fn role_word(w: &str) -> bool {
     ROLES.iter().any(|r| w == *r || (r.chars().count() >= 5 && w.ends_with(r)))
@@ -933,12 +1054,23 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                 if name.is_empty() || map.is_dropped(&name) || not_a_node(&name) {
                     continue;
                 }
+                if garbled(&name) {
+                    out.lines.push(format!("(skipped node {name}: no name)"));
+                    continue;
+                }
                 let line = ev.around(cite, 2);
                 if !name_in(&name, &line) {
                     out.lines.push(format!("(skipped node {name}: not in its line)"));
                     continue;
                 }
                 let aka = aka.map(|a| cut(&a, NAME_MAX)).filter(|a| !a.is_empty() && name_in(a, &ev.around(cite, 2)));
+                // Heard otherwise than a screen or the notes spell it: the shown spelling, the heard
+                // one as another name.
+                let heard = name.clone();
+                let (name, aka) = match shown_spelling(&name, ev.spellings) {
+                    Some(shown) if kind != Kind::Person => (shown, aka.or(Some(name))),
+                    _ => (name, aka),
+                };
                 // The same node by another name, or the one generic box ("the web shop", "the warehouse
                 // system") named in this line or the one before it: "which system is that?" "Shopware".
                 let generic_here = || {
@@ -960,8 +1092,8 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                 };
                 // A name that is a candidate already is that candidate (the model may even give its
                 // number), not the generic box said nearby: "Halvorsen" next to "ERP" doesn't make the ERP Halvorsen.
-                let own = map.find(&name);
-                let cand = if own.is_none() { map.candidate(&name) } else { None };
+                let own = map.find(&name).or_else(|| map.find(&heard));
+                let cand = if own.is_none() { map.candidate(&name).or_else(|| map.candidate(&heard)) } else { None };
                 let by_aka = || aka.as_deref().and_then(|a| map.find(a)).filter(|&id| may_take(map, id, &name, kind));
                 let known = own.or_else(by_aka).or_else(|| if cand.is_none() { generic_here() } else { None });
                 if let Some(id) = known {
@@ -1005,7 +1137,11 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                     out.lines.push(format!("(skipped person {name}: no name, title or role)"));
                     continue;
                 }
+                // Read off one screen and never said: OCR garbage, a menu, a field, an example
+                // record. Such a name needs a second screen (or to be said) to be a box.
+                let shown_once = matches!(cite, Cite::Line(l) if ev.is_screen(l)) && !ev.said_anywhere(&name) && ev.screens_with(&name) < 2;
                 let strong = !was_set_aside
+                    && !shown_once
                     && (cite == Cite::Notes
                         || said_in(&name, ev.notes)
                         || (kind == Kind::Person && person_named(&name, &here, ev))
@@ -1021,7 +1157,7 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                     // same answer).
                     let candidate = map.candidates.iter().find(|c| c.id == id).expect("found above");
                     let named_anew = (ev.new_from..=ev.lines.len()).any(|l| mentioned(candidate, ev.line(l)));
-                    let again = (ev.is_new(cite) || named_anew) && !made.contains(&id) && map.nodes.len() < SOFT_CAP;
+                    let again = (ev.is_new(cite) || named_anew) && !made.contains(&id) && map.nodes.len() < SOFT_CAP && !shown_once;
                     if (again || strong) && map.promote(id) {
                         let node = map.nodes.last_mut().expect("just promoted");
                         if node.kind != kind && (node.kind == Kind::Person) == (kind == Kind::Person) {
@@ -1032,8 +1168,8 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                     continue;
                 }
                 // At most `MAX_NEW` new boxes drawn per run; hidden candidates only take node lines.
-                if strong && shown >= MAX_NEW {
-                    out.lines.push(format!("(skipped node {name}: {MAX_NEW} new ones in this run)"));
+                if strong && shown >= ev.max_new {
+                    out.lines.push(format!("(skipped node {name}: {} new ones in this run)", ev.max_new));
                     continue;
                 }
                 let id = map.next_id();
@@ -1084,6 +1220,10 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                     out.lines.push(format!("(skipped fact on {}: not in its line) {fact}", map.name_of(id)));
                     continue;
                 }
+                if !in_language(&fact, ev.language) {
+                    out.lines.push(format!("(skipped fact on {}: not in {}) {fact}", map.name_of(id), ev.language));
+                    continue;
+                }
                 if add_known(map, id, fact.clone()) && map.node(id).is_some() {
                     out.lines.push(format!("{}: {fact}", map.name_of(id)));
                 }
@@ -1103,9 +1243,19 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                 // A flow that brings a candidate onto the map needs something said to move, in the cited
                 // line itself (a line is a whole turn: one line away can be another topic).
                 let still = (map.node(a).is_none() || map.node(b).is_none()) && !moves(&ev.around(cite, 0));
-                if what.is_empty() || says_unknown(&what) || !ends || echo || still || support(&what, &ev.around(cite, 1)).is_some_and(|s| s == 0.0) {
+                // A candidate read off one screen only comes in with a flow when it is backed too.
+                let unbacked = [na, nb].iter().any(|n| map.node(n.id).is_none() && !ev.said_anywhere(&n.name) && ev.screens_with(&n.name) < 2);
+                let denied = withheld(&what, &ev.spoken_around(cite, 0));
+                let foreign = !in_language(&what, ev.language);
+                if what.is_empty() || says_unknown(&what) || !ends || echo || still || unbacked || denied || foreign || support(&what, &ev.around(cite, 1)).is_some_and(|s| s == 0.0) {
                     let why = if echo {
                         "what flows is an end's name"
+                    } else if denied {
+                        "said not to flow"
+                    } else if foreign {
+                        "not in the meeting's language"
+                    } else if unbacked {
+                        "an end only shown once"
                     } else if still && ends {
                         "nothing moves there"
                     } else {
@@ -1150,6 +1300,10 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                 if text.is_empty() || repeat || map.open.len() >= MAX_OPEN {
                     continue;
                 }
+                if !in_language(&text, ev.language) {
+                    out.lines.push(format!("(skipped open point on {}: not in {}) {text}", map.name_of(id), ev.language));
+                    continue;
+                }
                 map.opened += 1;
                 let number = map.opened;
                 out.lines.push(format!("O{number} {}: {text}", map.name_of(id)));
@@ -1162,7 +1316,7 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
                 let answers = shares_word(&map.open[i].text, &fact);
                 // "I'd have to look up whether the API is on" answers nothing.
                 let unsure = matches!(cite, Cite::Line(_)) && uncertain(&ev.spoken_around(cite, 0));
-                if says_unknown(&fact) || !answers || unsure || support(&fact, &ev.around(cite, 1)).is_none_or(|s| s < 0.5) {
+                if says_unknown(&fact) || !answers || unsure || !in_language(&fact, ev.language) || support(&fact, &ev.around(cite, 1)).is_none_or(|s| s < 0.5) {
                     out.lines.push(format!("(O{number} not solved: no answer in its line) {fact}"));
                     continue;
                 }
@@ -1172,7 +1326,105 @@ pub fn apply(map: &mut SystemMap, ops: Vec<Op>, ev: &Evidence, now_ms: u64) -> A
             }
         }
     }
+    out.lines.extend(merge_variants(map, ev.spellings));
     out
+}
+
+/// Boxes that are one thing heard or shown in different ways become one ("Navision", "Navisjon
+/// Modul", "Navision Core"; see `variant`), and a box heard otherwise than a screen or the notes
+/// spell it takes that spelling (see `shown_spelling`), the heard name kept as another name. The
+/// older box stays; a person and a system, two people with different first names, or two boxes
+/// the user named are never joined. Boxes the user named keep their names.
+fn merge_variants(map: &mut SystemMap, spellings: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for i in 0..map.nodes.len() {
+        let node = &map.nodes[i];
+        let Some(shown) = shown_spelling(&node.name, spellings).filter(|_| !node.named && node.kind != Kind::Person) else { continue };
+        // Another box with that name: one box, joined below.
+        if map.nodes.iter().any(|x| x.id != node.id && names(x).any(|a| norm(a) == norm(&shown))) {
+            continue;
+        }
+        let node = &mut map.nodes[i];
+        let old = std::mem::replace(&mut node.name, shown.clone());
+        out.push(format!("{old} is {shown} (as shown)"));
+        node.aka.retain(|a| norm(a) != norm(&shown));
+        node.aka.push(old);
+    }
+    let canon = |x: &str| shown_spelling(x, spellings).unwrap_or_else(|| x.to_string());
+    let mut refused: Vec<(u32, u32)> = Vec::new();
+    loop {
+        let pair = map.nodes.iter().enumerate().find_map(|(i, a)| {
+            map.nodes[i + 1..]
+                .iter()
+                .find(|b| {
+                    (a.kind == Kind::Person) == (b.kind == Kind::Person)
+                        && !(a.named && b.named)
+                        && !refused.contains(&(a.id, b.id))
+                        && names(a).any(|x| names(b).any(|y| variant(&canon(x), &canon(y))))
+                })
+                .map(|b| (a.id, b.id, b.named && !a.named))
+        });
+        let Some((older, newer, keep_newer)) = pair else { break };
+        let (from, into) = if keep_newer { (older, newer) } else { (newer, older) };
+        let (from_name, into_name) = (map.name_of(from).to_string(), map.name_of(into).to_string());
+        if !map.merge(from, into) {
+            refused.push((older, newer));
+            continue;
+        }
+        // The name a screen or the notes showed wins over a heard one.
+        let node = map.nodes.iter_mut().find(|n| n.id == into).expect("merged into it");
+        let is_shown = |a: &str| spellings.iter().any(|s| head(s) == head(a));
+        let shown = node.aka.iter().position(|a| is_shown(a));
+        if let (Some(k), false) = (shown, node.named || is_shown(&node.name)) {
+            let name = node.aka.remove(k);
+            let old = std::mem::replace(&mut node.name, name);
+            node.aka.push(old);
+        }
+        out.push(format!("{from_name} is {into_name} (heard alike)"));
+    }
+    out
+}
+
+/// A name OCR or speech recognition made up rather than one somebody uses: an underscore (a file or
+/// field name, "IGE_X_Diag"), or a lone lower-case letter between words ("Diag r am").
+fn garbled(name: &str) -> bool {
+    name.contains('_') || name.split_whitespace().any(|w| w.chars().count() == 1 && w.chars().all(char::is_lowercase))
+}
+
+/// Whether a text is written in `language` as far as its little words tell (German and English; in
+/// another language, or with too few little words, it passes). The model sometimes answers in the
+/// language of an English screen or of the worked example.
+fn in_language(text: &str, language: &str) -> bool {
+    const DE: &[&str] = &[
+        "der", "die", "das", "und", "ist", "nicht", "mit", "von", "für", "wird", "werden", "ein", "eine", "einen", "im", "auf",
+        "zu", "den", "dem", "sind", "wie", "wer", "welche", "welcher", "welches", "wo", "aus", "bei", "nach", "auch", "kann",
+        "hat", "es", "vom", "zum", "zur", "oder", "wenn", "noch",
+    ];
+    const EN: &[&str] = &[
+        "the", "is", "are", "and", "of", "to", "for", "with", "from", "by", "on", "it", "this", "that", "which", "what", "how",
+        "who", "can", "be", "has", "have", "does", "into", "used", "when", "where", "a", "or", "its", "their",
+    ];
+    let w = words(text);
+    let de = w.iter().filter(|x| DE.contains(&x.as_str())).count();
+    let en = w.iter().filter(|x| EN.contains(&x.as_str())).count();
+    match language {
+        "German" => !(en >= 2 && en > de),
+        "English" => !(de >= 2 && de > en),
+        _ => true,
+    }
+}
+
+/// Whether the line says that what would flow is left out ("die Preise vorher löschen", "ohne
+/// Preise", "without prices"): one of its words within four words of a word for without or removing.
+fn withheld(what: &str, line: &str) -> bool {
+    const WITHOUT: &[&str] = &["ohne", "kein", "keine", "keinen", "keiner", "without", "no", "none"];
+    const REMOVE: &[&str] = &["lösch", "entfern", "streich", "gestrich", "weglass", "weggelass", "remov", "strip", "delet", "exclud"];
+    let line = words(line);
+    let content: Vec<String> = words(what).into_iter().filter(|w| w.chars().count() >= 4 && !STOP.contains(&w.as_str())).collect();
+    line.iter().enumerate().any(|(i, w)| {
+        content.iter().any(|c| same_word(c, w))
+            && line[i.saturating_sub(4)..(i + 5).min(line.len())].iter().any(|x| WITHOUT.contains(&x.as_str()) || REMOVE.iter().any(|r| x.contains(r)))
+    })
 }
 
 /// Words that say something moves (German and English): sending, going, importing, reading, typing
@@ -1209,6 +1461,10 @@ fn moves(text: &str) -> bool {
 /// and the other is the clear subject: the only box (or candidate) named in the nearest line before
 /// it that names one.
 fn flow_ends(map: &SystemMap, a: &Node, b: &Node, ev: &Evidence, cite: Cite) -> bool {
+    if ev.picked {
+        let here = ev.around(cite, 0);
+        return mentioned(a, &here) && mentioned(b, &here);
+    }
     let near = ev.around(cite, 1);
     if mentioned(a, &near) && mentioned(b, &near) {
         return true;
@@ -1334,26 +1590,31 @@ fn kinds(room: Room) -> String {
     alternatives(Kind::ALL.iter().map(|k| k.word(room).to_string()).chain(NOT_BOX_WORDS.iter().map(|w| w.to_string())))
 }
 
-/// The answer's form: up to `NODE_LINES` "node" lines first, then up to `MAX_LINES` other lines,
-/// each ending in the line it comes from ("[L4]", "[notes]"). Node numbers, line numbers, open point
+/// Node lines and other lines a run's answer may have.
+const ANSWER_SIZE: (usize, usize) = (NODE_LINES, MAX_LINES);
+
+/// The answer's form: up to `size.0` "node" lines first, then up to `size.1` other lines, each
+/// ending in the line it comes from ("[L4]", "[notes]"); with `CLOSING_SIZE`, the other lines are
+/// flows only. Node numbers, line numbers, open point
 /// numbers, kinds and the kinds of "how" are fixed lists, so the model can only point at what
 /// exists; a kind may be "topic", "data or document" or "feature or process", for a name that is no
 /// box. Each text has a word limit and words at most 20 letters (left free, a small model goes on
 /// inside a field until it runs out of tokens, or runs words together at the limit), and no CJK
 /// or full-width characters (it drifts into them). The answer may end right after its last line:
 /// made to write a line break first, it pads the line with spaces instead.
-fn grammar(existing: &[u32], new: &[u32], lines: usize, open: &[u32], language: &str, room: Room) -> String {
+fn grammar(existing: &[u32], new: &[u32], lines: usize, open: &[u32], language: &str, room: Room, size: (usize, usize)) -> String {
     let ids = alternatives(existing.iter().chain(new).map(|n| format!("N{n}")));
     let new_ids = alternatives(new.iter().map(|n| format!("N{n}")));
     let cites = alternatives((1..=lines).map(|l| format!("L{l}")).chain(["notes".to_string()]));
     let opens = alternatives(open.iter().map(|o| format!("O{o}")));
     let solved = if open.is_empty() { "" } else { " | solved" };
+    let items = if size == CLOSING_SIZE { "flow".to_string() } else { format!("alias | known | flow | open{solved}") };
     let how = alternatives(hows(language).iter().map(|h| h.to_string()));
     format!(
-        "root ::= (node \"\\n\"){{0,{NODE_LINES}}} (item (\"\\n\" item){{0,{more}}} \"\\n\"?)?\n\
+        "root ::= (node \"\\n\"){{0,{nodes}}} (item (\"\\n\" item){{0,{more}}} \"\\n\"?)?\n\
          node ::= \"node \" {new_ids} \": \" name \" (\" kind \")\" (\" also called \" name)? cite\n\
          kind ::= {kinds}\n\
-         item ::= alias | known | flow | open{solved}\n\
+         item ::= {items}\n\
          alias ::= \"alias \" id \": \" name cite\n\
          known ::= \"known \" id \": \" text cite\n\
          flow ::= \"flow \" id \" -> \" id \": \" text \" | how: \" how cite\n\
@@ -1368,7 +1629,8 @@ fn grammar(existing: &[u32], new: &[u32], lines: usize, open: &[u32], language: 
          word ::= [^\\[\\]|\\n<> \\u3000-\\u9fff\\uff00-\\uffef]{{1,20}}\n\
          qtext ::= qword (\" \" qword){{0,15}}\n\
          qword ::= [^\\[\\]|\\n<>? \\u3000-\\u9fff\\uff00-\\uffef]{{1,20}}\n",
-        more = MAX_LINES - 1,
+        nodes = size.0,
+        more = size.1 - 1,
         kinds = kinds(room),
     )
 }
@@ -1380,8 +1642,15 @@ pub struct Input<'a> {
     pub language: Option<&'a str>,
     /// Talk since the last run.
     pub new: &'a [Segment],
-    /// Screens and photos since the last run: "[mm:ss] Screen: …" lines among the new ones.
+    /// Talk the runs before read (the spoken backing of a name, see `Evidence::said_anywhere`).
+    pub said_before: &'a [Segment],
+    /// Screens and photos since the last run: "[mm:ss] Screen: …" lines among the new ones, with
+    /// only the rows not shown before (see `fresh_rows`).
     pub visuals: &'a [super::Visual],
+    /// Screens and photos the runs before read.
+    pub shown_before: &'a [super::Visual],
+    /// Names as the screens and the notes spell them (the meeting's vocabulary).
+    pub spellings: &'a [String],
     /// The last lines before it (already read), for context.
     pub earlier: &'a [String],
     pub speakers: &'a [Speaker],
@@ -1390,6 +1659,60 @@ pub struct Input<'a> {
     pub notes_changed: bool,
     /// On a call (the others on system audio) or all in one room on the microphone.
     pub room: Room,
+}
+
+/// What one run reads of a screen: at most this many characters of the rows it hasn't shown yet,
+/// all screens of the run together at most `SCREEN_CHARS` (and half the talk's length).
+const SCREEN_CAPS: super::visuals::Caps = super::visuals::Caps { per_visual: 700, total: SCREEN_CHARS, ..super::visuals::MAP };
+const SCREEN_CHARS: usize = 1_000;
+/// Rows this alike (bigrams of their letters, Dice) are one row read twice: OCR reads a slide a
+/// little differently each time ("Roadmap und Meilenst", "Roadmap und Mellenst").
+const SAME_ROW: f32 = 0.7;
+
+/// The letter pairs of a row, lower case, letters and digits only.
+fn bigrams(row: &str) -> std::collections::HashSet<(char, char)> {
+    let c: Vec<char> = compact(row).chars().collect();
+    c.windows(2).map(|p| (p[0], p[1])).collect()
+}
+
+/// The visuals of this run with only the rows no visual before showed (nor one earlier in this
+/// run): a slide read again with OCR jitter, the same sidebar, a form with one field changed add
+/// only what changed. Visuals with nothing new are left out; photos are kept whole (the user chose
+/// them).
+fn fresh_rows(visuals: &[super::Visual], before: &[super::Visual]) -> Vec<super::Visual> {
+    let mut seen: Vec<std::collections::HashSet<(char, char)>> = Vec::new();
+    let mut exact: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let remember = |row: &str, seen: &mut Vec<_>, exact: &mut std::collections::HashSet<String>| {
+        if exact.insert(compact(row)) {
+            seen.push(bigrams(row));
+        }
+    };
+    for v in before {
+        for row in v.text.lines() {
+            remember(row, &mut seen, &mut exact);
+        }
+    }
+    let mut out = Vec::new();
+    for v in visuals {
+        if v.source == super::visuals::Source::Photo {
+            out.push(v.clone());
+            continue;
+        }
+        let mut fresh: Vec<&str> = Vec::new();
+        for row in v.text.lines().map(str::trim).filter(|r| compact(r).chars().count() >= 3) {
+            let b = bigrams(row);
+            let known = exact.contains(&compact(row))
+                || seen.iter().any(|s| 2.0 * s.intersection(&b).count() as f32 >= SAME_ROW * (s.len() + b.len()) as f32);
+            if !known {
+                fresh.push(row);
+            }
+            remember(row, &mut seen, &mut exact);
+        }
+        if !fresh.is_empty() {
+            out.push(super::Visual { text: fresh.join("\n"), ..v.clone() });
+        }
+    }
+    out
 }
 
 /// In a room, the microphone's first voice isn't the user: no line says "Me".
@@ -1403,21 +1726,12 @@ pub fn unlabel_me(line: String, room: Room) -> String {
     }
 }
 
-/// The map as the model reads it, small however big the map grows: first every box (number, name,
-/// kind, other names; in the order they came, so a new box only adds to the end and the helper keeps
-/// the rest), then facts, flows and open points only of the boxes `talk` (the new lines and the
-/// notes) names, and the open points it touches; last the candidates `all_talk` (all the lines the
-/// run shows, and the notes) names.
-fn map_text(map: &SystemMap, talk: &str, all_talk: &str, room: Room) -> String {
-    let maybe = named_candidates(map, all_talk);
-    let maybe_text = if maybe.is_empty() {
-        String::new()
-    } else {
-        let list: Vec<String> = maybe.iter().map(|n| format!("N{} {} ({})", n.id, n.name, n.kind.word(room))).collect();
-        format!("Said before, not on the map (no box unless the new lines show it is a system, service or person): {}\n", list.join(", "))
-    };
+/// The map's boxes as the model reads them: every box (number, name, kind, other names) in the order
+/// they came, so a new box only adds to the end and the helper keeps what came before (it comes first
+/// in the prompt; see `user_prompt`).
+fn boxes_text(map: &SystemMap, room: Room) -> String {
     if map.nodes.is_empty() {
-        return format!("(empty)\n{maybe_text}");
+        return "(empty)\n".to_string();
     }
     let mut s = String::new();
     for n in &map.nodes {
@@ -1427,6 +1741,21 @@ fn map_text(map: &SystemMap, talk: &str, all_talk: &str, room: Room) -> String {
         }
         s.push('\n');
     }
+    s
+}
+
+/// What the map has on what a run reads, small however big the map grows: facts, flows and open
+/// points only of the boxes `talk` (the new lines and the notes) names, and the open points it
+/// touches; last the candidates `all_talk` (all the lines the run shows, and the notes) names.
+fn news_text(map: &SystemMap, talk: &str, all_talk: &str, room: Room) -> String {
+    let maybe = named_candidates(map, all_talk);
+    let maybe_text = if maybe.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = maybe.iter().map(|n| format!("N{} {} ({})", n.id, n.name, n.kind.word(room))).collect();
+        format!("Said before, not on the map (no box unless the new lines show it is a system, service or person): {}\n", list.join(", "))
+    };
+    let mut s = String::new();
     let here: Vec<&Node> = map.nodes.iter().filter(|n| mentioned(n, talk)).collect();
     let open: Vec<&OpenPoint> = map.open.iter().filter(|o| here.iter().any(|n| n.id == o.node) || shares_word(&o.text, talk)).collect();
     let mut details = String::new();
@@ -1499,7 +1828,9 @@ Not a box (if you started a node line for one, give it this kind and it is set a
 - \"topic\": subjects, problems, qualities, events, absences, plans (Krankenstand, Urlaub, Weihnachten, \
 Bestellqualität, Rückstand, sick leave, Christmas, delays, feedback);
 - \"data or document\": fields, numbers, dates, business objects, documents (Liefertermin, Bestellnummer, \
-Angebot, Auftragsbestätigung, Rechnung, Vertrag, order number, delivery date, invoice, contract); they are what flows;
+Angebot, Auftragsbestätigung, Rechnung, Vertrag, order number, delivery date, invoice, contract); they are what flows; \
+also the things the systems describe: machines, plants, vehicles, buildings and their parts, product types, and \
+the example records a demo shows (Maschine, Anlage, Fahrzeug, Bauteil, a machine, a plant, a part, one customer's order);
 - \"feature or process\": a function, screen, step or rule inside a system (Freigabe, Erinnerung, Texteditor, \
 Import, approval, reminder, search, the check).
 A file format (CSV, PDF, XML), a channel (mail, API), a shared folder or a file is never a node: it is how something \
@@ -1520,7 +1851,8 @@ isn't sure, or my notes want it found out; give each thing my notes want found o
 solved O3: the fact that answers it [L8]   when a new line answers an open point.
 Nodes first, then the other lines. Use the node numbers, never names, after \"node\". Never invent: if it isn't \
 in the line you cite, leave it out. Most lines add nothing to the map; then write nothing. Write facts, flows and \
-open points in {language}; keep names as they were said.
+open points in {language}, also when a line or a screen is in another language; keep names as they were said, or \
+as a screen spells them. A box a new line names by another spelling (heard wrong) is that box: use its number.
 
 Example.
 Map so far:
@@ -1541,18 +1873,29 @@ flow N1 -> N2: orders, every hour | how: file [L2]
 known N3: works on the invoices in Navision [L4]
 open N2: Who looks at failed imports? [L3]
 (Petra works in Navision, but nothing was said to flow between them: no flow line. Christmas and sick leave are \
-topics, and L6 adds nothing: no lines for them.)"
+topics, and L6 adds nothing: no lines for them.)
+
+{shown}",
+        shown = llm::SHOWN.trim_start(),
     )
 }
 
-fn user_prompt(input: &Input, earlier: &[String], new: &[String], notes: &str, new_ids: &[u32]) -> String {
+/// The run's question. What changes least comes first, so the helper keeps it from the run before
+/// and reads only the rest: the boxes (new ones only add to the end), what I removed, my notes;
+/// then what the map has on the boxes the new talk names, the talk, the new numbers and the
+/// language to write in.
+fn user_prompt(input: &Input, earlier: &[String], new: &[String], notes: &str, new_ids: &[u32], language: &str) -> String {
     let talk = talk_of(new, notes);
-    let mut p = format!("Map so far:\n{}", map_text(input.map, &talk, &talk, input.room));
+    let mut p = format!("Map so far:\n{}", boxes_text(input.map, input.room));
     if !input.map.dropped.is_empty() {
         p.push_str(&format!("Removed by me, never add again: {}\n", input.map.dropped.join(", ")));
     }
     if !notes.is_empty() {
         p.push_str(&format!("\nMy notes (what to focus on and what the map must find out):\n{notes}\n"));
+    }
+    let news = news_text(input.map, &talk, &talk, input.room);
+    if !news.is_empty() {
+        p.push_str(&format!("\n{news}"));
     }
     let numbered = |from: usize, lines: &[String]| -> String {
         lines.iter().enumerate().map(|(i, l)| format!("L{} {l}\n", from + i)).collect()
@@ -1564,7 +1907,7 @@ fn user_prompt(input: &Input, earlier: &[String], new: &[String], notes: &str, n
         (e, _) => format!("\nTalk (L1 to L{e} were read before, L{} on are new):\n{}{}", e + 1, numbered(1, earlier), numbered(e + 1, new)),
     });
     let ids: Vec<String> = new_ids.iter().map(|n| format!("N{n}")).collect();
-    p.push_str(&format!("New node numbers: {}.\nAnswer:", ids.join(", ")));
+    p.push_str(&format!("New node numbers: {}. Write in {language}.\nAnswer:", ids.join(", ")));
     p
 }
 
@@ -1579,6 +1922,13 @@ pub struct Run {
     /// Names the user gave speakers.
     pub people: Vec<String>,
     pub language: &'static str,
+    /// Everything said so far, the text of every screen so far, and the shown spellings, to back
+    /// names with (see `Evidence`).
+    pub spoken: String,
+    pub screens: Vec<String>,
+    pub spellings: Vec<String>,
+    /// The last look at the whole meeting (see `closing`), not a run on new talk.
+    pub closing: bool,
     /// The answer as written.
     pub answer: String,
     /// What the model call cost.
@@ -1587,14 +1937,67 @@ pub struct Run {
 
 impl Run {
     pub fn evidence(&self) -> Evidence<'_> {
-        Evidence { lines: &self.lines, notes: &self.notes, new_from: self.new_from, people: &self.people, language: self.language }
+        Evidence {
+            lines: &self.lines,
+            notes: &self.notes,
+            new_from: self.new_from,
+            people: &self.people,
+            language: self.language,
+            spoken: &self.spoken,
+            screens: &self.screens,
+            spellings: &self.spellings,
+            max_new: if self.closing { CLOSING_SIZE.0 } else { MAX_NEW },
+            picked: self.closing,
+        }
     }
+}
+
+/// The earlier lines a run shows at most (they are context: a speaker's turn may run to 1,200
+/// characters, and four of them were a quarter of a prompt).
+const EARLIER_CHARS: usize = 900;
+
+/// The last `max` characters of `lines`: the latest lines whole, the one before cut at its start
+/// ("[12:00] Speaker 1: …the end of what they said"), older ones left out.
+fn latest_words(lines: Vec<String>, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut left = max;
+    for line in lines.into_iter().rev() {
+        if left == 0 {
+            break;
+        }
+        let n = line.chars().count();
+        if n <= left {
+            left -= n;
+            out.push(line);
+            continue;
+        }
+        let (head, text) = line.split_once(": ").unwrap_or(("", &line));
+        let keep = left.saturating_sub(head.chars().count() + 3);
+        if keep >= 60 {
+            let skip = text.chars().count() - keep;
+            let mut tail: String = text.chars().skip(skip).collect();
+            // Start at a word.
+            if let Some(space) = tail.find(' ').filter(|i| *i < tail.len() / 2) {
+                tail = tail[space + 1..].to_string();
+            }
+            out.push(format!("{head}: …{tail}"));
+        }
+        break;
+    }
+    out.reverse();
+    out
+}
+
+/// Everything said in `segments`, one segment a line.
+fn spoken_text(segments: &[&[Segment]]) -> String {
+    segments.iter().flat_map(|s| s.iter()).map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n")
 }
 
 /// One run: asks the model how the new talk (and changed notes) change the map. `None` when
 /// there's nothing new to read.
 pub fn run(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Run>> {
-    let mut new: Vec<String> = super::pipeline::timeline_lines(input.new, input.speakers, input.visuals, super::visuals::MAP)
+    let fresh = fresh_rows(input.visuals, input.shown_before);
+    let mut new: Vec<String> = super::pipeline::timeline_lines(input.new, input.speakers, &fresh, SCREEN_CAPS)
         .into_iter()
         .map(|l| unlabel_me(l, input.room))
         .collect();
@@ -1611,17 +2014,13 @@ pub fn run(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Run
     let new_ids: Vec<u32> = (first_new..first_new + NODE_LINES as u32).collect();
     let existing: Vec<u32> = input.map.nodes.iter().map(|n| n.id).collect();
     let open: Vec<u32> = input.map.open.iter().map(|o| o.number).collect();
-    let earlier: Vec<String> = input.earlier.iter().map(|l| unlabel_me(l.clone(), input.room)).collect();
+    let earlier = latest_words(input.earlier.iter().map(|l| unlabel_me(l.clone(), input.room)).collect(), EARLIER_CHARS);
     // Node lines may also use the number of a candidate the new lines name (see `named_candidates`).
     let node_ids: Vec<u32> = named_candidates(input.map, &talk_of(&new, &notes)).iter().map(|n| n.id).chain(new_ids.iter().copied()).collect();
     let lines: Vec<String> = earlier.iter().chain(&new).cloned().collect();
-    let grammar = grammar(&existing, &node_ids, lines.len(), &open, language, input.room);
-    let prompt = user_prompt(input, &earlier, &new, &notes, &new_ids);
-    let mut system = system_prompt(language, input.room);
-    if super::visuals::any_shown(&lines) {
-        system.push_str("\n\n");
-        system.push_str(llm::SHOWN.trim_start());
-    }
+    let grammar = grammar(&existing, &node_ids, lines.len(), &open, language, input.room, ANSWER_SIZE);
+    let prompt = user_prompt(input, &earlier, &new, &notes, &new_ids, language);
+    let system = system_prompt(language, input.room);
     let mut answer = worker.chat_at(&system, &prompt, ANSWER_TOKENS, Some(&grammar), Some(TEMPERATURE), Some("map"), |_| {})?;
     let cost = worker.last.unwrap_or_default();
     // Cut off by the token limit: the last line is unfinished.
@@ -1629,7 +2028,200 @@ pub fn run(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Run
         answer.truncate(answer.trim_end().rfind('\n').unwrap_or(0));
     }
     let people = input.speakers.iter().filter(|s| s.renamed).map(|s| s.name.clone()).collect();
-    Ok(Some(Run { ops: parse(&answer), lines, new_from: earlier.len() + 1, notes, people, language, answer, cost }))
+    Ok(Some(Run {
+        ops: parse(&answer),
+        lines,
+        new_from: earlier.len() + 1,
+        notes,
+        people,
+        language,
+        spoken: spoken_text(&[input.said_before, input.new]),
+        screens: input.shown_before.iter().chain(input.visuals).map(|v| v.text.clone()).collect(),
+        spellings: input.spellings.to_vec(),
+        closing: false,
+        answer,
+        cost,
+    }))
+}
+
+// ---------- the last look ----------
+
+/// Node lines and flow lines the last look may write.
+const CLOSING_SIZE: (usize, usize) = (5, 10);
+const CLOSING_TOKENS: u32 = 520;
+/// What the last look reads at most: spoken lines, and each overview screen.
+const CLOSING_TALK: usize = 4_000;
+const CLOSING_SCREEN: usize = 2_400;
+/// Overview screens it reads at most, and the boxes a screen must name to be one.
+const CLOSING_SCREENS: usize = 2;
+const OVERVIEW_BOXES: usize = 3;
+
+/// A row as `visuals::chrome` compares it: lower case, digits as '#'.
+fn chrome_key(row: &str) -> String {
+    row.chars().map(|c| if c.is_ascii_digit() { '#' } else { c.to_ascii_lowercase() }).collect::<String>().trim().to_string()
+}
+
+/// How alike two texts are (letter pairs, Dice).
+fn alike(a: &str, b: &str) -> f32 {
+    let (a, b) = (bigrams(a), bigrams(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    2.0 * a.intersection(&b).count() as f32 / (a.len() + b.len()) as f32
+}
+
+/// People whose name ("Klara Huber": a common first name and a capitalised word) is on at least
+/// half the screens (three or more): the call's video tiles, so most likely the people in the call.
+fn people_on_screen(screens: &[&super::Visual]) -> Vec<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for v in screens {
+        let mut here: Vec<String> = Vec::new();
+        for row in v.text.lines() {
+            let tokens: Vec<&str> = row.split(|c: char| !c.is_alphabetic() && c != '-').filter(|t| !t.is_empty()).collect();
+            for p in tokens.windows(2) {
+                let capital = |w: &str| w.chars().next().is_some_and(char::is_uppercase) && w.chars().skip(1).all(char::is_lowercase) && w.chars().count() >= 2;
+                if capital(p[0]) && capital(p[1]) && FIRST_NAMES.contains(&p[0].to_lowercase().as_str()) {
+                    let name = format!("{} {}", p[0], p[1]);
+                    if !here.contains(&name) {
+                        here.push(name);
+                    }
+                }
+            }
+        }
+        for name in here {
+            match counts.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, c)) => *c += 1,
+                None => counts.push((name, 1)),
+            }
+        }
+    }
+    counts.into_iter().filter(|(_, c)| *c >= 3 && 2 * c >= screens.len()).map(|(n, _)| n).collect()
+}
+
+/// The sentences of a spoken line that name a box, or the whole line when none does on its own.
+fn naming_sentences(text: &str, known: &[&Node]) -> String {
+    let sentences: Vec<&str> = text.split_inclusive(['.', '?', '!']).map(str::trim).filter(|s| !s.is_empty()).collect();
+    let naming: Vec<&str> = sentences.iter().copied().filter(|s| known.iter().any(|n| mentioned(n, s))).collect();
+    if naming.is_empty() { text.to_string() } else { naming.join(" ") }
+}
+
+/// What the last look reads: the screens that showed the most boxes at once (an overview or an
+/// architecture slide; at most `CLOSING_SCREENS` that differ, without the window around them), the
+/// people on most screens, and the spoken turns of the whole meeting that name two boxes (or
+/// candidates) and say something moves, cut to the sentences that name one, the ones naming most
+/// first within `CLOSING_TALK`, in the order they were said.
+fn closing_lines(input: &Input) -> Vec<String> {
+    let map = input.map;
+    let known: Vec<&Node> = map.nodes.iter().chain(&map.candidates).collect();
+    let named = |text: &str| known.iter().filter(|n| mentioned(n, text)).count();
+    let all: Vec<super::Visual> = input.shown_before.iter().chain(input.visuals).cloned().collect();
+    let chrome = super::visuals::chrome(&all);
+    let screens: Vec<&super::Visual> = all.iter().filter(|v| v.source == super::visuals::Source::Screen).collect();
+    let content = |v: &super::Visual| {
+        v.text.lines().map(str::trim).filter(|r| !r.is_empty() && !chrome.contains(&chrome_key(r))).collect::<Vec<_>>().join(" / ")
+    };
+    let mut overviews: Vec<(usize, u64, String)> =
+        screens.iter().map(|v| (v.at_ms, content(v))).map(|(at, t)| (named(&t), at, t)).filter(|(n, ..)| *n >= OVERVIEW_BOXES).collect();
+    overviews.sort_by_key(|(n, at, t)| (std::cmp::Reverse(*n), std::cmp::Reverse(t.len()), *at));
+    let mut shown: Vec<(u64, String)> = Vec::new();
+    for (_, at, text) in overviews {
+        if shown.len() < CLOSING_SCREENS && !shown.iter().any(|(_, t)| alike(t, &text) >= SAME_ROW) {
+            shown.push((at, text));
+        }
+    }
+    let mut lines: Vec<(u64, String)> =
+        shown.into_iter().map(|(at, t)| (at, format!("[{}] Screen: {}", super::pipeline::clock(at), cut(&t, CLOSING_SCREEN)))).collect();
+    let people = people_on_screen(&screens);
+    if let (false, Some(first)) = (people.is_empty(), screens.first()) {
+        lines.push((first.at_ms, format!("[{}] Screen: {} (a name on most screens)", super::pipeline::clock(first.at_ms), people.join(", "))));
+    }
+    let segments: Vec<Segment> = input.said_before.iter().chain(input.new).cloned().collect();
+    let mut talk: Vec<(usize, u64, String)> = super::pipeline::transcript_lines(&segments, input.speakers)
+        .into_iter()
+        .map(|l| unlabel_me(l, input.room))
+        .filter(|l| named(line_text(l)) >= 2 && moves(line_text(l)))
+        .map(|l| {
+            let (head, text) = l.split_once(": ").unwrap_or(("", &l));
+            let line = format!("{head}: {}", naming_sentences(text, &known));
+            (named(&line), super::visuals::line_ms(&line).unwrap_or(0), line)
+        })
+        .collect();
+    talk.sort_by_key(|(n, at, _)| (std::cmp::Reverse(*n), *at));
+    let mut budget = CLOSING_TALK;
+    for (_, at, line) in talk {
+        if line.len() <= budget {
+            budget -= line.len();
+            lines.push((at, line));
+        }
+    }
+    lines.sort_by_key(|(at, _)| *at);
+    lines.into_iter().map(|(_, l)| l).collect()
+}
+
+/// The last look at the whole meeting, once it is over: the boxes and flows the map has, and
+/// `closing_lines` (the overview screens, the people on screen, the spoken lines naming two
+/// boxes). The answer may add flows the map lacks and the people, teams or roles shown working with
+/// a system (no facts, no open points), checked like a run's (a flow's two ends in its own line).
+/// A live run sees a few lines at a time; an overview slide shown at the start and the end, and a
+/// flow told in pieces, only show from here. `None` when nothing names two boxes.
+pub fn closing(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Run>> {
+    let lines = closing_lines(input);
+    if lines.is_empty() || input.map.nodes.len() < 2 {
+        return Ok(None);
+    }
+    let notes: String = input.notes.trim().chars().take(NOTES_CHARS).collect();
+    let language = llm::language_name(input.language);
+    let first_new = input.map.next_id();
+    let new_ids: Vec<u32> = (first_new..first_new + CLOSING_SIZE.0 as u32).collect();
+    let existing: Vec<u32> = input.map.nodes.iter().map(|n| n.id).collect();
+    let talk = talk_of(&lines, &notes);
+    let node_ids: Vec<u32> = named_candidates(input.map, &talk).iter().map(|n| n.id).chain(new_ids.iter().copied()).collect();
+    let grammar = grammar(&existing, &node_ids, lines.len(), &[], language, input.room, CLOSING_SIZE);
+    let mut p = format!("Map so far:\n{}", boxes_text(input.map, input.room));
+    let flows: Vec<String> = input.map.edges.iter().map(|e| format!("flow N{} -> N{}: {} | how: {}\n", e.from, e.to, e.what, e.how)).collect();
+    if !flows.is_empty() {
+        p.push_str(&format!("Flows on the map:\n{}", flows.concat()));
+    }
+    if !notes.is_empty() {
+        p.push_str(&format!("\nMy notes (what to focus on and what the map must find out):\n{notes}\n"));
+    }
+    let maybe = news_text(&SystemMap { edges: Vec::new(), open: Vec::new(), ..input.map.clone() }, "", &talk, input.room);
+    if !maybe.is_empty() {
+        p.push_str(&format!("\n{maybe}"));
+    }
+    let numbered: String = lines.iter().enumerate().map(|(i, l)| format!("L{} {l}\n", i + 1)).collect();
+    let ids: Vec<String> = new_ids.iter().map(|n| format!("N{n}")).collect();
+    p.push_str(&format!(
+        "\nThe meeting is over. Last, look at it as a whole: the screens that showed several boxes at once, and the \
+spoken lines from the whole meeting that name two boxes. Add only what the map lacks: a flow between two boxes when a \
+line shows something moving from one to the other (on a screen, columns and arrows can show it: \"A → B\", \"team | \
+does this in B\"), and a person, team or role a line shows working with a system (with a flow to it). No facts, no \
+open points; a flow the map has already is no new line.\n\
+Talk (all lines are new):\n{numbered}New node numbers: {}. Write in {language}.\nAnswer:",
+        ids.join(", ")
+    ));
+    let system = system_prompt(language, input.room);
+    let mut answer = worker.chat_at(&system, &p, CLOSING_TOKENS, Some(&grammar), Some(TEMPERATURE), Some("map"), |_| {})?;
+    let cost = worker.last.unwrap_or_default();
+    if cost.tokens >= CLOSING_TOKENS as u64 {
+        answer.truncate(answer.trim_end().rfind('\n').unwrap_or(0));
+    }
+    let ops = parse(&answer).into_iter().filter(|o| matches!(o, Op::Node { .. } | Op::NotBox { .. } | Op::Flow { .. })).collect();
+    let people = input.speakers.iter().filter(|s| s.renamed).map(|s| s.name.clone()).collect();
+    Ok(Some(Run {
+        ops,
+        lines,
+        new_from: 1,
+        notes,
+        people,
+        language,
+        spoken: spoken_text(&[input.said_before, input.new]),
+        screens: input.shown_before.iter().chain(input.visuals).map(|v| v.text.clone()).collect(),
+        spellings: input.spellings.to_vec(),
+        closing: true,
+        answer,
+        cost,
+    }))
 }
 
 // ---------- tidy-up ----------
@@ -1714,7 +2306,9 @@ A box is a software system, tool, app or online service with a name or a clear r
 a service, or a real person, team or role who does something with the systems.
 Not a box: topics, problems, events, absences, plans (Krankenstand, Urlaub, Weihnachten, sick leave, delays); data \
 fields, numbers and documents (Liefertermin, Bestellnummer, Angebot, Auftragsbestätigung, order number, invoice); \
-features, functions and steps of a system (Freigabe, Erinnerung, approval, reminder, import).
+the things the systems describe (machines, plants, vehicles, their parts, product types, a demo's example records: \
+\"data or document\"); features, functions, screens and steps of a system (Freigabe, Erinnerung, approval, reminder, \
+import, a settings page).
 
 First, for each pair of boxes whose names look alike, say whether they are the same box (\"N3 = N9: same\") or \
 two different things (\"N3 = N9: different\"). Speech recognition often hears one name in several ways \
@@ -1961,14 +2555,14 @@ mod tests {
 
     #[test]
     fn grammar_offers_only_what_exists() {
-        let g = grammar(&[1, 2], &[3, 4, 5], 6, &[2], "English", Room::Call);
+        let g = grammar(&[1, 2], &[3, 4, 5], 6, &[2], "English", Room::Call, ANSWER_SIZE);
         assert!(g.contains("id ::= (\"N1\" | \"N2\" | \"N3\" | \"N4\" | \"N5\")"), "{g}");
         assert!(g.contains("\"node \" (\"N3\" | \"N4\" | \"N5\")"));
         assert!(g.contains("\"L6\" | \"notes\""));
         assert!(g.contains("solved ::= \"solved \" (\"O2\")") && g.contains("| open | solved\n"));
         assert!(g.contains("\"Me's system\"") && g.contains("\"topic\" | \"data or document\" | \"feature or process\""));
-        assert!(!grammar(&[], &[1, 2, 3], 2, &[], "German", Room::Call).contains("| solved\n"));
-        let room = grammar(&[], &[1, 2, 3], 2, &[], "German", Room::OneMic);
+        assert!(!grammar(&[], &[1, 2, 3], 2, &[], "German", Room::Call, ANSWER_SIZE).contains("| solved\n"));
+        let room = grammar(&[], &[1, 2, 3], 2, &[], "German", Room::OneMic, ANSWER_SIZE);
         assert!(room.contains("\"von Hand\"") && room.contains("\"my company's system\"") && !room.contains("Me's system"));
     }
 
@@ -2081,7 +2675,14 @@ mod tests {
             "[03:20] Screen: Lieferschein / Halvorsen AG | Tour 12 / Rampe | 3 / Fragen?",
             "[03:25] Speaker 2: Genau, so sieht die aus.",
         ]);
-        let ev = Evidence { language: "German", ..Evidence::of(&talk, "") };
+        // Read off one screen and never said: a candidate, not a box.
+        let one = ["Lieferschein / Halvorsen AG | Tour 12 / Rampe | 3 / Fragen?".to_string()];
+        let mut map = SystemMap::default();
+        apply(&mut map, vec![node(1, "Halvorsen", Kind::Outside, 2)], &Evidence { language: "German", screens: &one, ..Evidence::of(&talk, "") }, 0);
+        assert_eq!((visible(&map), hidden(&map)), (vec![], vec!["Halvorsen"]));
+        // On a second screen it is one.
+        let two = [one[0].clone(), "Halvorsen AG / Tour 13".to_string()];
+        let ev = Evidence { language: "German", screens: &two, ..Evidence::of(&talk, "") };
         let mut map = SystemMap::default();
         let a = apply(
             &mut map,
@@ -2516,13 +3117,128 @@ mod tests {
         map.nodes[1].known.push("the tax advisor's".into());
         let earlier = vec!["[00:58] Me: And then?".to_string()];
         let new = vec!["[01:01] Speaker 1: LagerPro exports a CSV.".to_string()];
-        let input = Input { notes: "", language: Some("en"), new: &[], visuals: &[], earlier: &earlier, speakers: &[], map: &map, notes_changed: false, room: Room::Call };
-        let p = user_prompt(&input, &earlier, &new, "focus on the ERP export", &[3, 4, 5]);
+        let input = Input {
+            notes: "",
+            language: Some("en"),
+            new: &[],
+            said_before: &[],
+            visuals: &[],
+            shown_before: &[],
+            spellings: &[],
+            earlier: &earlier,
+            speakers: &[],
+            map: &map,
+            notes_changed: false,
+            room: Room::Call,
+        };
+        let p = user_prompt(&input, &earlier, &new, "focus on the ERP export", &[3, 4, 5], "English");
         assert!(p.contains("N1 LagerPro (customer system)\nN2 DATEV (outside service)\n"), "{p}");
         assert!(p.contains("N1 known: the warehouse system") && !p.contains("tax advisor's"), "facts only of boxes the new talk names: {p}");
         assert!(p.contains("L1 [00:58] Me: And then?\nL2 [01:01] Speaker 1: LagerPro exports a CSV.\n"));
-        assert!(p.contains("L1 to L1 were read before, L2 on are new") && p.contains("New node numbers: N3, N4, N5."));
-        assert!(p.contains("focus on the ERP export"));
+        assert!(p.contains("L1 to L1 were read before, L2 on are new") && p.contains("New node numbers: N3, N4, N5. Write in English."));
+        // What changes least comes first: the boxes, then the notes, then what changes every run.
+        let (boxes, notes, facts) = (p.find("N2 DATEV").unwrap(), p.find("focus on the ERP export").unwrap(), p.find("N1 known").unwrap());
+        assert!(boxes < notes && notes < facts && facts < p.find("L1 [00:58]").unwrap(), "{p}");
+    }
+
+    #[test]
+    fn names_heard_in_different_ways_are_one() {
+        assert!(variant("Navision", "Navision-Modul") && variant("Navision Core", "navision"));
+        assert!(variant("Shopware", "Shopwear") && variant("Teamviewer", "Teamviewer Engine"));
+        assert!(variant("Lagerprofi", "Lagerprofie") && variant("Smartfoo", "Smartfo"));
+        assert!(!variant("Windows 10", "Windows 11") && !variant("Anna", "Anne") && !variant("SAP", "SAPS"));
+        assert!(!variant("Navision", "Navision Builder") && !variant("Outlook", "Lookout"));
+        // One letter off a shown spelling, from four letters on.
+        assert!(heard_as("ECAD", "eCard") && heard_as("ECAD", "E-Card Modul") && !heard_as("ECAD", "IKAD") && !heard_as("SKU", "SKI"));
+        let shown = vec!["ECAD".to_string(), "Navision".to_string()];
+        assert_eq!(shown_spelling("E-Card Modul", &shown).as_deref(), Some("ECAD Modul"));
+        assert_eq!(shown_spelling("Navisjon", &shown).as_deref(), Some("Navision"));
+        assert_eq!(shown_spelling("ECAD", &shown), None, "spelled as shown already");
+        assert_eq!(shown_spelling("Outlook", &shown), None);
+    }
+
+    #[test]
+    fn boxes_heard_alike_merge_under_the_shown_spelling() {
+        let talk = lines(&[
+            "[10:00] Speaker 1: Das Navision Modul holt die Aufträge.",
+            "[10:20] Speaker 1: Und das eCard exportiert dann pro Station ein XML.",
+        ]);
+        let mut map = SystemMap::default();
+        put(&mut map, 1, "Navision", Kind::Customer);
+        put(&mut map, 2, "Navisjon Core", Kind::Customer);
+        put(&mut map, 3, "eCard", Kind::Ours);
+        put(&mut map, 4, "Anna", Kind::Person);
+        put(&mut map, 5, "Anne", Kind::Person);
+        map.edges.push(Edge { from: 2, to: 3, what: "Aufträge".into(), how: "unbekannt".into() });
+        let shown = vec!["ECAD".to_string()];
+        let ev = Evidence { language: "German", spellings: &shown, ..Evidence::of(&talk, "") };
+        let a = apply(&mut map, vec![node(6, "E-Card", Kind::Ours, 2)], &ev, 0);
+        assert_eq!(visible(&map), ["Navision", "ECAD", "Anna", "Anne"], "{:?}", a.lines);
+        assert!(map.nodes[0].aka.contains(&"Navisjon Core".to_string()) && map.nodes[1].aka.contains(&"eCard".to_string()));
+        assert_eq!((map.edges[0].from, map.edges[0].to), (1, 3), "the flow moves with the box");
+        assert!(map.candidates.is_empty(), "the heard spelling of a box is that box: {:?}", a.lines);
+    }
+
+    #[test]
+    fn garbled_names_foreign_facts_and_withheld_flows_are_left_out() {
+        assert!(garbled("IGE-XAO_SeeAutoDiag") && garbled("Diag r amGeneration") && !garbled("Plan B") && !garbled("eCard"));
+        assert!(in_language("wird im Admin-Bereich gepflegt", "German") && !in_language("is used for the export of the data", "German"));
+        assert!(in_language("Preisdaten", "German") && in_language("exports it to the ERP", "English") && !in_language("wird von der IT gepflegt", "English"));
+        assert!(withheld("Preise", "Nur dann die Preise vorher auslöschen, bevor sie es einspielen."));
+        assert!(withheld("prices", "They import it without the prices.") && !withheld("Preise", "Da stehen die Preise drinnen, die gehen ins ERP."));
+        let talk = lines(&["[50:17] Speaker 1: Nur dann die Preise vorher auslöschen, bevor sie es in Navision einspielen, im Shopware stehen sie."]);
+        let mut map = SystemMap::default();
+        put(&mut map, 1, "Shopware", Kind::Customer);
+        put(&mut map, 2, "Navision", Kind::Customer);
+        map.nodes[0].known.push("x".into());
+        let ev = Evidence { language: "German", ..Evidence::of(&talk, "") };
+        let a = apply(
+            &mut map,
+            vec![
+                Op::Flow { from: 1, to: 2, what: "Preise".into(), how: "Datei".into(), cite: Cite::Line(1) },
+                Op::Known { n: 1, fact: "the prices are in the Shopware".into(), cite: Cite::Line(1) },
+            ],
+            &ev,
+            0,
+        );
+        assert!(map.edges.is_empty() && map.nodes[0].known == ["x"], "{:?}", a.lines);
+    }
+
+    #[test]
+    fn earlier_lines_keep_their_latest_words() {
+        let long = format!("[01:00] Speaker 1: {}", "und dann geht das weiter ".repeat(20));
+        let lines = vec!["[00:50] Me: Old.".to_string(), long, "[01:40] Me: And then?".to_string()];
+        let kept = latest_words(lines.clone(), 140);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept[0].starts_with("[01:00] Speaker 1: …") && kept[0].ends_with("weiter ") && kept[0].chars().count() <= 140, "{kept:?}");
+        assert_eq!(kept[1], "[01:40] Me: And then?");
+        assert_eq!(latest_words(lines.clone(), 10_000), lines);
+    }
+
+    #[test]
+    fn the_instructions_stay_the_same_with_or_without_screens() {
+        // The helper keeps the instructions between runs only when they don't change.
+        let p = system_prompt("German", Room::Call);
+        assert!(p.contains("Screen:") && p.ends_with(llm::SHOWN.trim()), "{p}");
+    }
+
+    #[test]
+    fn a_screen_shows_only_its_new_rows() {
+        use super::super::visuals::{Source, Visual};
+        let screen = |id: u32, text: &str| Visual { id, at_ms: id as u64 * 10_000, until_ms: None, source: Source::Screen, label: String::new(), text: text.into(), image: None };
+        let before = [screen(1, "Roadmap und Meilenst | Weekly Update\nOne plant configuration as the single source of truth")];
+        let now = [
+            // The same slide read again with OCR jitter, and one new row.
+            screen(2, "Roadmap und Mellenst | Weekly Update\nOne plant configuraton as the single source of truth\nXML export per station"),
+            // Nothing new at all: left out.
+            screen(3, "Roadmap und Meilenst | Weekly Update"),
+        ];
+        let fresh = fresh_rows(&now, &before);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].text, "XML export per station");
+        // A photo stays whole.
+        let photo = Visual { source: Source::Photo, ..screen(4, "Roadmap und Meilenst | Weekly Update") };
+        assert_eq!(fresh_rows(&[photo], &before).len(), 1);
     }
 
     #[test]
@@ -2531,7 +3247,7 @@ mod tests {
         put(&mut map, 1, "Business Central", Kind::Customer);
         map.candidates.push(Node { id: 7, name: "tax advisor".into(), kind: Kind::Outside, known: Vec::new(), aka: Vec::new(), at_ms: 0, named: false, said: "We send it to our tax advisor.".into() });
         map.candidates.push(Node { id: 8, name: "Pömmel".into(), kind: Kind::Customer, known: Vec::new(), aka: Vec::new(), at_ms: 0, named: false, said: String::new() });
-        let text = map_text(&map, "", "So the tax advisor imports that into DATEV?", Room::Call);
+        let text = news_text(&map, "", "So the tax advisor imports that into DATEV?", Room::Call);
         assert!(text.contains("not on the map (no box unless the new lines show it is a system, service or person): N7 tax advisor (outside service)\n") && !text.contains("Pömmel"), "{text}");
         // A flow to it (with something moving) brings it in.
         let talk = lines(&["[02:00] Speaker 1: Tom sends the invoices to the tax advisor by email."]);

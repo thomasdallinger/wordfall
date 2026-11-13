@@ -632,8 +632,16 @@ impl MapCursor {
     /// The visuals added since the last run: from the first one it didn't read on (they are kept
     /// in the order added).
     fn unseen<'a>(&self, m: &'a Meeting) -> &'a [Visual] {
-        let from = m.visuals.iter().position(|v| v.id > self.visuals_seen).unwrap_or(m.visuals.len());
-        &m.visuals[from..]
+        &m.visuals[self.first_unseen(m)..]
+    }
+
+    /// The visuals the runs before read.
+    fn seen<'a>(&self, m: &'a Meeting) -> &'a [Visual] {
+        &m.visuals[..self.first_unseen(m)]
+    }
+
+    fn first_unseen(&self, m: &Meeting) -> usize {
+        m.visuals.iter().position(|v| v.id > self.visuals_seen).unwrap_or(m.visuals.len())
     }
 
     /// Something was shown since the last run (a screen changed, a photo was added).
@@ -652,8 +660,26 @@ fn room_of(m: &Meeting) -> system_map::Room {
     if m.segments.iter().any(|s| s.channel == Channel::System) { system_map::Room::Call } else { system_map::Room::OneMic }
 }
 
-/// The map's input for the talk since `cursor`. `earlier` holds the last lines before it.
-fn map_input<'a>(m: &'a Meeting, cursor: &MapCursor, language: Option<&'a str>, earlier: &'a mut Vec<String>) -> system_map::Input<'a> {
+/// Names as the meeting's screens, photos, notes and goal spell them (the meeting's vocabulary, see
+/// `terms::vocabulary`): the map takes these spellings for names heard otherwise.
+fn map_spellings(m: &Meeting) -> Vec<String> {
+    let mut typed: Vec<&str> = vec![&m.notes, &m.goal];
+    if m.title_from_user {
+        typed.push(&m.title);
+    }
+    typed.extend(m.visuals.iter().map(|v| v.text.as_str()));
+    terms::vocabulary(&[], &[], &typed).into_iter().map(|t| t.text).collect()
+}
+
+/// The map's input for the talk since `cursor`. `earlier` holds the last lines before it,
+/// `spellings` the names as shown (see `map_spellings`).
+fn map_input<'a>(
+    m: &'a Meeting,
+    cursor: &MapCursor,
+    language: Option<&'a str>,
+    earlier: &'a mut Vec<String>,
+    spellings: &'a [String],
+) -> system_map::Input<'a> {
     let seen = cursor.seen.min(m.segments.len());
     let mut before = pipeline::transcript_lines(&m.segments[..seen], &m.speakers);
     *earlier = before.split_off(before.len().saturating_sub(system_map::EARLIER_LINES));
@@ -661,7 +687,10 @@ fn map_input<'a>(m: &'a Meeting, cursor: &MapCursor, language: Option<&'a str>, 
         notes: &m.notes,
         language,
         new: &m.segments[seen..],
+        said_before: &m.segments[..seen],
         visuals: cursor.unseen(m),
+        shown_before: cursor.seen(m),
+        spellings,
         earlier,
         speakers: &m.speakers,
         map: &m.system_map,
@@ -677,7 +706,8 @@ fn live_map_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<Meeti
     let snapshot = meeting.lock().clone();
     let language = pipeline::meeting_language(&snapshot.segments);
     let mut earlier = Vec::new();
-    let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier);
+    let spellings = map_spellings(&snapshot);
+    let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier, &spellings);
     let started = Instant::now();
     let run = system_map::run(w, &input)?;
     cursor.read(&snapshot);
@@ -692,6 +722,35 @@ fn live_map_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<Meeti
     emit_map(app, &snapshot.id);
     log::info!(
         "system map: read the new talk in {:.1}s ({}), {}",
+        started.elapsed().as_secs_f32(),
+        stats_line(Some(run.cost)),
+        // How many changes, not what they were: the log outlives the meeting.
+        if applied.lines.is_empty() { "no change".to_string() } else { format!("{} changes", applied.lines.len()) }
+    );
+    Ok(())
+}
+
+/// The map's last look at the whole meeting once it stopped (see `system_map::closing`): flows and
+/// people the overview screens and the whole talk show, applied to the map as it is by then.
+fn live_closing_step(app: &AppHandle, w: &mut llm::Worker, meeting: &Arc<Mutex<Meeting>>, cursor: &MapCursor) -> anyhow::Result<()> {
+    let c = app.state::<Core>();
+    let snapshot = meeting.lock().clone();
+    let language = pipeline::meeting_language(&snapshot.segments);
+    let spellings = map_spellings(&snapshot);
+    let mut earlier = Vec::new();
+    let input = map_input(&snapshot, cursor, language.as_deref(), &mut earlier, &spellings);
+    let started = Instant::now();
+    let Some(run) = system_map::closing(w, &input)? else { return Ok(()) };
+    let applied = {
+        let mut m = meeting.lock();
+        let now = m.duration_ms;
+        let applied = system_map::apply(&mut m.system_map, run.ops.clone(), &run.evidence(), now);
+        save(&c.dir, &m);
+        applied
+    };
+    emit_map(app, &snapshot.id);
+    log::info!(
+        "system map: last look in {:.1}s ({}), {}",
         started.elapsed().as_secs_f32(),
         stats_line(Some(run.cost)),
         // How many changes, not what they were: the log outlives the meeting.
@@ -857,6 +916,9 @@ fn assist(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBool, tal
         }
         if let Err(e) = live_map_step(app, w, meeting, &mut cursor) {
             log::warn!("the system map's last run failed: {e:#}");
+        }
+        if let Err(e) = live_closing_step(app, w, meeting, &cursor) {
+            log::warn!("the system map's last look failed: {e:#}");
         }
     }
     drop(worker);
@@ -1568,6 +1630,7 @@ struct CliAssist {
     /// (meeting ms, prompt tokens, written, ms) per map run, tidy-up and questions run.
     map_runs: Vec<llm::ChatStats>,
     tidy_runs: Vec<llm::ChatStats>,
+    closing_runs: Vec<llm::ChatStats>,
     question_runs: Vec<llm::ChatStats>,
     /// The map after each run that changed it, for looking at how it grew.
     snapshots: Vec<serde_json::Value>,
@@ -1653,7 +1716,8 @@ impl CliAssist {
         let t = now_ms as f32 / 1000.0;
         let language = pipeline::meeting_language(&meeting.segments);
         let mut earlier = Vec::new();
-        let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier);
+        let spellings = map_spellings(meeting);
+        let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier, &spellings);
         let started = Instant::now();
         let run = system_map::run(&mut self.worker, &input)?;
         self.cursor.read(meeting);
@@ -1665,6 +1729,27 @@ impl CliAssist {
         }
         let applied = system_map::apply(&mut meeting.system_map, run.ops.clone(), &run.evidence(), now_ms);
         for l in &applied.lines {
+            eprintln!("[{t:>6.1}s] map {l}");
+        }
+        self.snapshots.push(json!({ "atMs": now_ms, "notes": meeting.notes, "map": meeting.system_map }));
+        Ok(())
+    }
+
+    /// The map's last look at the whole meeting (see `system_map::closing`), printing what it changed.
+    fn closing_step(&mut self, meeting: &mut Meeting, now_ms: u64) -> anyhow::Result<()> {
+        let t = now_ms as f32 / 1000.0;
+        let language = pipeline::meeting_language(&meeting.segments);
+        let spellings = map_spellings(meeting);
+        let mut earlier = Vec::new();
+        let input = map_input(meeting, &self.cursor, language.as_deref(), &mut earlier, &spellings);
+        let started = Instant::now();
+        let Some(run) = system_map::closing(&mut self.worker, &input)? else { return Ok(()) };
+        self.closing_runs.push(run.cost);
+        eprintln!("[{t:>6.1}s] (map closing pass in {:.1}s: {})", started.elapsed().as_secs_f32(), stats_line(Some(run.cost)));
+        if std::env::var_os("WORDFALL_MAP_RAW").is_some() {
+            eprintln!("[{t:>6.1}s] closing pass read:\n{}\n[{t:>6.1}s] closing pass answer:\n{}", run.lines.join("\n"), run.answer.trim_end());
+        }
+        for l in system_map::apply(&mut meeting.system_map, run.ops.clone(), &run.evidence(), now_ms).lines {
             eprintln!("[{t:>6.1}s] map {l}");
         }
         self.snapshots.push(json!({ "atMs": now_ms, "notes": meeting.notes, "map": meeting.system_map }));
@@ -1723,6 +1808,7 @@ impl CliAssist {
             notes_at,
             map_runs: Vec::new(),
             tidy_runs: Vec::new(),
+            closing_runs: Vec::new(),
             question_runs: Vec::new(),
             snapshots: Vec::new(),
             words,
@@ -1739,6 +1825,9 @@ impl CliAssist {
         }
         if self.map && (self.cursor.seen < meeting.segments.len() || self.cursor.shown_since(meeting)) {
             self.map_step(meeting, now_ms)?;
+        }
+        if self.map {
+            self.closing_step(meeting, now_ms)?;
         }
         eprintln!("--- live model cost ---\n{}", self.report());
         if let Some(path) = map_json {
@@ -1762,7 +1851,8 @@ impl CliAssist {
                 p / n, w / n, ms as f32 / n as f32 / 1000.0, max_ms as f32 / 1000.0, ms as f32 / 1000.0
             )
         };
-        format!("{}\n{}\n{}", line("map", &self.map_runs), line("tidy-up", &self.tidy_runs), line("questions", &self.question_runs))
+        let closing = line("closing pass", &self.closing_runs);
+        format!("{}\n{}\n{closing}\n{}", line("map", &self.map_runs), line("tidy-up", &self.tidy_runs), line("questions", &self.question_runs))
     }
 }
 
