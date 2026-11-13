@@ -585,7 +585,7 @@ fn spells(long: &str, abbreviation: &str) -> bool {
 }
 
 /// Whether a dictionary replacement reads as a term ("Claude Code", "macOS") rather than a
-/// phrase or a snippet ("Mit freundlichen Grüßen", "Best regards, Thomas"): at most three words,
+/// phrase or a snippet ("Mit freundlichen Grüßen", "Best regards, Tobias"): at most three words,
 /// no punctuation between them, each word of several with a capital or a digit.
 fn term_like(s: &str) -> bool {
     let words: Vec<&str> = s.split_whitespace().collect();
@@ -1105,7 +1105,7 @@ mod tests {
     #[test]
     fn phrases_a_replacement_writes_are_no_terms() {
         let replacements: Vec<String> =
-            ["Mit freundlichen Grüßen", "Best regards, Thomas", "Danke.", "Claude Code", "macOS", "Next.js", "Wortfeld 2"].map(String::from).to_vec();
+            ["Mit freundlichen Grüßen", "Best regards, Tobias", "Danke.", "Claude Code", "macOS", "Next.js", "Wortfeld 2"].map(String::from).to_vec();
         let v = vocabulary(&[], &replacements, &[]);
         assert_eq!(v.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(), ["Claude Code", "macOS", "Next.js", "Wortfeld 2"]);
         // The user's own words to recognise stay, whatever they look like.

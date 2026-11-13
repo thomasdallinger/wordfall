@@ -188,6 +188,29 @@ pub fn judge(current: Option<&str>, rows: &[String], chrome: &HashSet<String>) -
     }
 }
 
+/// At most this many distinct screens are kept per meeting (four hours of a slide a minute).
+pub const MAX_SCREENS: usize = 240;
+
+/// What a frame of the shared screen, read at meeting time `now_ms`, does to `visuals` (see
+/// `judge`, against the latest screen visual and without chrome): `Same` has already made the
+/// latest screen last until `now_ms`; `New` asks the caller to add a screen visual with `rows`
+/// (only while fewer than `MAX_SCREENS` are kept); `Nothing` leaves them as they are. The app's
+/// screen reading and the command line's `--screen-frames` both go through here.
+pub fn observe(visuals: &mut [Visual], rows: &[String], now_ms: u64) -> Seen {
+    let chrome = chrome(visuals);
+    let latest = visuals.iter().rposition(|v| v.source == Source::Screen);
+    match judge(latest.map(|i| visuals[i].text.as_str()), rows, &chrome) {
+        Seen::Same => {
+            if let Some(i) = latest {
+                visuals[i].until_ms = Some(now_ms);
+            }
+            Seen::Same
+        }
+        Seen::New if visuals.iter().filter(|v| v.source == Source::Screen).count() >= MAX_SCREENS => Seen::Nothing,
+        seen => seen,
+    }
+}
+
 // ---------- prompt lines ----------
 
 /// How much visual text a prompt takes.
@@ -437,6 +460,20 @@ mod tests {
         assert_eq!(next_id(&vs, 0), 4);
         // The newest was deleted: its id isn't handed out again.
         assert_eq!(next_id(&vs[..2], 3), 4);
+    }
+
+    #[test]
+    fn frames_extend_the_screen_or_add_one() {
+        let slide: Vec<String> = vec!["Brontix Overview single source of truth for plant configuration".into()];
+        let mut vs = vec![visual(1, 0, Source::Screen, &slide[0]), visual(2, 5_000, Source::Photo, "a printout")];
+        assert_eq!(observe(&mut vs, &slide, 10_000), Seen::Same);
+        assert_eq!(vs[0].until_ms, Some(10_000));
+        let other: Vec<String> = vec!["Admin area schemas templates prefills rules macros sheets folders".into()];
+        assert_eq!(observe(&mut vs, &other, 20_000), Seen::New);
+        assert_eq!(observe(&mut vs, &["ok".to_string()], 30_000), Seen::Nothing);
+        // Once MAX_SCREENS are kept, a new screen is not added.
+        let mut full: Vec<Visual> = (0..MAX_SCREENS as u32).map(|i| visual(i + 1, i as u64, Source::Screen, &slide[0])).collect();
+        assert_eq!(observe(&mut full, &other, 1_000_000), Seen::Nothing);
     }
 
     #[test]

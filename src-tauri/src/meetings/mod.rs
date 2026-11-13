@@ -1726,7 +1726,8 @@ impl CliAssist {
 /// and prints the transcript and notes; with `--questions`, also the live questions as they come.
 /// The final pass runs at the end as in the app (`--no-final` keeps the live transcript);
 /// `--voice <voice.json>` uses another voice print than the user's; `--save-final <file>` keeps
-/// the final segments and speakers.
+/// the final segments, speakers and visuals; `--screen-frames <dir>` reads a shared screen's
+/// frames as the app does (see `cli_screen_frames`).
 pub fn cli(args: &[String]) -> anyhow::Result<()> {
     use crate::{store::Store, transcribe::{catalog_entry, Engine}};
     let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
@@ -1781,6 +1782,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     meeting.goal = arg("--goal").unwrap_or_default();
     meeting.notes = arg("--notes").unwrap_or_default();
     let mut shown = cli_visuals(args, &settings)?;
+    let mut frames = cli_screen_frames(args, &settings)?;
     let mut asker = CliAssist::from_args(args, &settings, &data_dir)?;
     let mut pos = 0;
     while pos < longest {
@@ -1821,6 +1823,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
             }
         }
         show_due(&mut meeting, &mut shown, end as u64 / 16);
+        observe_due(&mut meeting, &mut frames, end as u64 / 16);
         if let Some(a) = asker.as_mut() {
             a.step(&mut meeting, end as u64 / 16)?;
         }
@@ -1828,7 +1831,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     }
     if let Some(path) = arg("--save-transcript") {
         // What the live model saw, for replaying it with `--transcript` (no speech recognition).
-        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers }))?)?;
+        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers, "visuals": meeting.visuals }))?)?;
     }
     if let Some(mut a) = asker {
         a.done(&mut meeting, longest as u64 / 16, arg("--map-json").as_deref())?;
@@ -1879,7 +1882,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     }
     if let Some(path) = arg("--save-final") {
         // The final segments and speakers, as the app saves them in meeting.json.
-        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers }))?)?;
+        std::fs::write(&path, serde_json::to_string_pretty(&json!({ "segments": meeting.segments, "speakers": meeting.speakers, "visuals": meeting.visuals }))?)?;
     }
     let lines = pipeline::timeline_lines(&meeting.segments, &meeting.speakers, &meeting.visuals, visuals::NOTES);
     println!("--- transcript ({:.1}s for {:.0}s of audio) ---", transcribed.as_secs_f32(), longest as f32 / 16_000.0);
@@ -1913,7 +1916,8 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
 /// `wordfall --transcript <saved.json> --map [--questions] [--note-at "90:text"] [--llm <id>] [--map-json f]`:
 /// the live model on a transcript `--meeting … --save-transcript` saved, with the segments arriving
 /// at the pace they were said (no speech recognition, so runs are quick and comparable). Prints
-/// what changes, the cost of each run and the map's section.
+/// what changes, the cost of each run and the map's section. Screens come from `--screen-frames`,
+/// `--screen-text`/`--image`, or else the visuals saved with the transcript.
 pub fn cli_transcript(args: &[String]) -> anyhow::Result<()> {
     let arg = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let path = arg("--transcript").ok_or_else(|| anyhow::anyhow!("missing transcript file"))?;
@@ -1929,6 +1933,12 @@ pub fn cli_transcript(args: &[String]) -> anyhow::Result<()> {
     meeting.goal = arg("--goal").unwrap_or_default();
     meeting.notes = arg("--notes").unwrap_or_default();
     let mut shown = cli_visuals(args, &settings)?;
+    let mut frames = cli_screen_frames(args, &settings)?;
+    // The screens saved with the transcript come back at their time, unless others are given.
+    if shown.is_empty() && frames.is_empty() {
+        shown = serde_json::from_value(saved["visuals"].clone()).unwrap_or_default();
+        shown.sort_by_key(|v: &Visual| v.at_ms);
+    }
     let mut asker = CliAssist::from_args(args, &settings, &data_dir)?.ok_or_else(|| anyhow::anyhow!("add --map and/or --questions"))?;
     let end_ms = segments.iter().map(|s| s.end_ms).max().unwrap_or(0) + 8_000;
     // As in `cli`: every 8 s of meeting time, what has been transcribed by then (about 3 s after it was said).
@@ -1939,6 +1949,7 @@ pub fn cli_transcript(args: &[String]) -> anyhow::Result<()> {
             next += 1;
         }
         show_due(&mut meeting, &mut shown, t);
+        observe_due(&mut meeting, &mut frames, t);
         asker.step(&mut meeting, t)?;
         t += 8_000;
     }
@@ -2046,6 +2057,51 @@ fn cli_visuals(args: &[String], settings: &Settings) -> anyhow::Result<Vec<Visua
     }
     out.sort_by_key(|v| v.at_ms);
     Ok(out)
+}
+
+/// `--screen-frames <dir>`: frames of a shared screen as the app reads one every 10 s, for the
+/// meeting commands. Each file is named by its meeting time in seconds ("130.txt", "130.jpg"); a
+/// `.txt` holds the rows the OCR read (one a line, as `--ocr` prints them), an image is read with
+/// the OCR. They go through `visuals::observe` like the app's frames (see `observe_due`).
+fn cli_screen_frames(args: &[String], settings: &Settings) -> anyhow::Result<Vec<(u64, Vec<String>)>> {
+    let Some(dir) = args.iter().position(|a| a == "--screen-frames").and_then(|i| args.get(i + 1)) else { return Ok(Vec::new()) };
+    let mut frames = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{dir}: {e}"))? {
+        let path = entry?.path();
+        let Some(secs) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok()) else { continue };
+        let rows: Vec<String> = match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
+            Some("txt") => std::fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect(),
+            Some("jpg" | "jpeg" | "png") => capture::read_file(&path, &settings.languages, &[])?,
+            _ => continue,
+        };
+        frames.push((secs * 1000, rows));
+    }
+    frames.sort_by_key(|(ms, _)| *ms);
+    if !frames.is_empty() {
+        eprintln!("(screen frames: {} from {dir})", frames.len());
+    }
+    Ok(frames)
+}
+
+/// Reads the screen frames due by `now_ms` as the app does (`visuals::observe`): a frame showing
+/// something new becomes a screen visual, the same screen lasts longer.
+fn observe_due(meeting: &mut Meeting, frames: &mut Vec<(u64, Vec<String>)>, now_ms: u64) {
+    while frames.first().is_some_and(|(at, _)| *at <= now_ms) {
+        let (at_ms, rows) = frames.remove(0);
+        if visuals::observe(&mut meeting.visuals, &rows, at_ms) == visuals::Seen::New {
+            let id = meeting.new_visual_id();
+            eprintln!("[{:>6.1}s] (screen {id} new) {}", at_ms as f32 / 1000.0, rows.first().map(String::as_str).unwrap_or_default());
+            meeting.visuals.push(Visual {
+                id,
+                at_ms,
+                until_ms: Some(at_ms),
+                source: visuals::Source::Screen,
+                label: "Screen".into(),
+                text: rows.join("\n"),
+                image: None,
+            });
+        }
+    }
 }
 
 /// Moves the visuals due by `now_ms` into the meeting, as if shown then.

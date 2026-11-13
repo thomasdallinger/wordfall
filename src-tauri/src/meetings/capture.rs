@@ -36,8 +36,6 @@ const OCR_PX: u32 = 3200;
 const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// The shared screen is read this often…
 const SCREEN_EVERY: Duration = Duration::from_secs(10);
-/// …and at most this many distinct screens are kept per meeting (four hours of a slide a minute).
-const MAX_SCREENS: usize = 240;
 /// Images arriving in Downloads are offered while recording and this long after.
 const PHOTO_WATCH_AFTER: Duration = Duration::from_secs(30 * 60);
 const PHOTO_POLL: Duration = Duration::from_secs(3);
@@ -407,23 +405,15 @@ pub fn screen_loop(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &Atomic
 /// Keeps a frame of the shared screen if it shows something new.
 fn observe(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, frame: &Path, window: &ScreenWindow, rows: Vec<String>, started: Instant) {
     let c = app.state::<Core>();
-    let (id, now_ms, verdict, latest, screens) = {
-        let m = meeting.lock();
-        let latest = m.visuals.iter().rev().find(|v| v.source == visuals::Source::Screen);
-        let chrome = visuals::chrome(&m.visuals);
-        let verdict = visuals::judge(latest.map(|v| v.text.as_str()), &rows, &chrome);
-        let screens = m.visuals.iter().filter(|v| v.source == visuals::Source::Screen).count();
-        (m.id.clone(), m.duration_ms, verdict, latest.map(|v| v.id), screens)
+    let (id, now_ms, verdict) = {
+        let mut m = meeting.lock();
+        let now_ms = m.duration_ms;
+        let verdict = visuals::observe(&mut m.visuals, &rows, now_ms);
+        (m.id.clone(), now_ms, verdict)
     };
     log::info!("screen reading: {} rows in {} ms, {verdict:?}", rows.len(), started.elapsed().as_millis());
     match verdict {
-        visuals::Seen::Same => {
-            let mut m = meeting.lock();
-            if let Some(v) = m.visuals.iter_mut().find(|v| Some(v.id) == latest) {
-                v.until_ms = Some(now_ms);
-            }
-        }
-        visuals::Seen::New if screens < MAX_SCREENS => {
+        visuals::Seen::New => {
             let image = match keep_picture(&c.dir, &id, frame) {
                 Ok(i) => Some(i),
                 Err(e) => {
