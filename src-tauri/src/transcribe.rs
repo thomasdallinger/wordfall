@@ -322,6 +322,11 @@ const DETECT_AUDIO_CTX: i32 = 256;
 /// of distribution for whisper and leans English on German full of English loanwords; a wrong
 /// guess is costly, because whisper then translates instead of transcribing.
 const DETECT_CONFIDENT: f32 = 0.9;
+/// A switch away from the previous language, and the first language, get the full window below
+/// this probability. On 175 switches of German and English clips (German full of English terms,
+/// German-accented English) the quick check was wrong at up to 0.89 and the full window overruled
+/// it at up to 0.97; from 0.98 on it agreed every time. The full window costs about 1 s.
+const SWITCH_CONFIDENT: f32 = 0.99;
 
 impl Loaded {
     /// Gets `state` ready for a decode at `audio_ctx`: a new one when the encoder size changes or
@@ -635,18 +640,14 @@ fn choose_language(
             // Like whisper's own "auto", but only the user's languages compete, and a quick check
             // on a short window settles clear cases.
             let threads = thread_count(opts) as usize;
-            let (mut probs, mut window) = if previous.is_none() && audio_ctx == 0 {
-                (loaded.full_window_language_probs(audio, threads)?, "full")
-            } else {
-                (loaded.language_probs(audio, threads)?, "short")
-            };
+            let (mut probs, mut window) = (loaded.language_probs(audio, threads)?, "short");
             let lookup = |probs: &[f32], code: &str| {
                 whisper_rs::get_lang_id(code).and_then(|id| probs.get(id as usize).copied()).unwrap_or(0.0)
             };
             let shares = |probs: &[f32]| several.iter().map(|l| format!("{l} {:.2}", lookup(probs, l))).collect::<Vec<_>>().join(", ");
             let mut quick = String::new();
             // The full-window check needs the main state on the full window (the default).
-            if window == "short" && needs_full_window(several, previous, |l| lookup(&probs, l)) && audio_ctx == 0 {
+            if needs_full_window(several, previous, |l| lookup(&probs, l)) && audio_ctx == 0 {
                 // Only a second opinion: if it fails, the quick guess still beats no dictation.
                 match loaded.full_window_language_probs(audio, threads) {
                     Ok(full) => {
@@ -805,11 +806,13 @@ fn thread_count(opts: &DecodeOptions) -> i32 {
 }
 
 /// Whether the quick short-window guess needs the full window's second opinion: when it is unsure,
-/// and when it would switch away from the previous language, where it is most often confidently
-/// wrong (German full of English terms heard as English).
+/// and when it is the first language or would switch away from the previous one, where it is most
+/// often confidently wrong (German full of English terms heard as English), unless it is sure
+/// beyond `SWITCH_CONFIDENT`.
 pub fn needs_full_window(allowed: &[String], previous: Option<&str>, prob: impl Fn(&str) -> f32) -> bool {
-    allowed.iter().map(|l| prob(l)).fold(0.0, f32::max) < DETECT_CONFIDENT
-        || previous.is_some_and(|p| pick_language(allowed, previous, &prob) != p)
+    let best = allowed.iter().map(|l| prob(l)).fold(0.0, f32::max);
+    let switching = previous.is_none_or(|p| pick_language(allowed, previous, &prob) != p);
+    best < DETECT_CONFIDENT || (switching && best < SWITCH_CONFIDENT)
 }
 
 /// The most likely of `allowed`, except that an ambiguous clip (e.g. a one-word "OK")
@@ -900,9 +903,9 @@ mod tests {
         // The German dictation of 2026-11-05 that came out translated into English.
         assert!(needs_full_window(&allowed, None, probs(&[("en", 0.66), ("de", 0.14)])));
         assert!(needs_full_window(&allowed, None, probs(&[("en", 0.4), ("de", 0.47)])));
-        // Clear cases keep the fast path.
+        // Clear cases keep the fast path; the first language only when it is very clear.
         assert!(!needs_full_window(&allowed, None, probs(&[("en", 0.01), ("de", 0.99)])));
-        assert!(!needs_full_window(&allowed, None, probs(&[("en", 0.96), ("de", 0.0)])));
+        assert!(needs_full_window(&allowed, None, probs(&[("en", 0.96), ("de", 0.0)])));
     }
 
     #[test]
@@ -913,6 +916,9 @@ mod tests {
         // Staying in the same language keeps the fast path, in either direction.
         assert!(!needs_full_window(&allowed, Some("en"), probs(&[("en", 0.95), ("de", 0.01)])));
         assert!(!needs_full_window(&allowed, Some("de"), probs(&[("en", 0.01), ("de", 0.99)])));
+        // A switch the quick check is sure of keeps it too: it was never overruled from 0.98 on.
+        assert!(!needs_full_window(&allowed, Some("de"), probs(&[("en", 0.995), ("de", 0.0)])));
+        assert!(needs_full_window(&allowed, Some("de"), probs(&[("en", 0.97), ("de", 0.01)])));
     }
 
     #[test]
