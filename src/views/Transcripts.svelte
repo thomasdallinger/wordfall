@@ -48,17 +48,18 @@
   const searching = $derived(query.trim() !== '');
   const cap = $derived(pttCap(app.settings?.pttKey));
 
-  const statsLine = $derived.by(() => {
+  /** Everything dictated so far, from the running totals (not just the transcripts loaded). */
+  const stats = $derived.by(() => {
     const s = app.snapshot?.stats;
-    if (!s || s.totalWords === 0) return '';
-    const since = s.firstUsed
-      ? new Date(s.firstUsed).toLocaleString('en-GB', {
+    if (!s || s.totalWords === 0) return null;
+    const first = s.firstUsed ? new Date(s.firstUsed) : null;
+    const since = first
+      ? first.toLocaleString('en-GB', {
           month: 'long',
-          year: new Date(s.firstUsed).getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+          year: first.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
         })
       : null;
-    const pace = s.wpm > 0 ? `, at about ${Math.round(s.wpm)} a minute` : '';
-    return `${formatNumber(s.totalWords)} words${since ? ` since ${since}` : ''}${pace}.`;
+    return { words: formatNumber(s.totalWords), since, wpm: s.wpm > 0 ? formatNumber(Math.round(s.wpm)) : null };
   });
 
   async function load(reset: boolean) {
@@ -169,7 +170,7 @@
   }}
 />
 
-<Page title="Transcripts">
+<Page title="Dictation">
   {#snippet actions()}
     <div class="search">
       <SearchIcon size={14} strokeWidth={1.5} class="search-icon" aria-hidden="true" />
@@ -233,6 +234,21 @@
 
   <AttentionLine />
 
+  {#if stats}
+    <dl class="stats">
+      <div class="stat">
+        <dt>Words dictated</dt>
+        <dd><span class="figure">{stats.words}</span>{#if stats.since}<span class="unit">since {stats.since}</span>{/if}</dd>
+      </div>
+      <div class="stat">
+        <dt>Average pace</dt>
+        <dd>
+          {#if stats.wpm}<span class="figure">{stats.wpm}</span><span class="unit">words a minute</span>{:else}<span class="figure">–</span>{/if}
+        </dd>
+      </div>
+    </dl>
+  {/if}
+
   {#if filter !== 'all'}
     <p class="filter-note">
       Showing only {filter === 'audio' ? 'transcripts with a recording' : 'verified transcripts'}.
@@ -282,14 +298,12 @@
 
   <div class="sentinel" {@attach watchEnd}></div>
 
-  {#if loaded && visible.length > 0}
+  {#if loaded && visible.length > 0 && (hasMore || searching)}
     <p class="foot">
       {#if hasMore}
         Loading earlier transcripts…
       {:else if searching}
         {plural(visible.length, 'transcript')} mention “{query.trim()}”.
-      {:else if filter === 'all'}
-        {statsLine}
       {/if}
     </p>
   {/if}
@@ -323,6 +337,32 @@
   .filtered {
     color: var(--ink);
     background: var(--press);
+  }
+  .stats {
+    display: flex;
+    gap: 48px;
+    margin: 8px 0 24px;
+  }
+  .stat dt {
+    font-size: 12px;
+    line-height: 16px;
+    color: var(--ink-2);
+  }
+  .stat dd {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  .figure {
+    font-size: 24px;
+    line-height: 30px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .unit {
+    font-size: 13px;
+    color: var(--ink-2);
   }
   .filter-note {
     margin-bottom: 16px;

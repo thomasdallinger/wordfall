@@ -7,7 +7,7 @@
   import Logo from './Logo.svelte';
 
   const items: { id: View; label: string; key: string }[] = [
-    { id: 'transcripts', label: 'Transcripts', key: '1' },
+    { id: 'transcripts', label: 'Dictation', key: '1' },
     { id: 'meetings', label: 'Meetings', key: '2' },
     { id: 'dictionary', label: 'Dictionary', key: '3' },
     { id: 'settings', label: 'Settings', key: '4' },
@@ -42,10 +42,17 @@
 </script>
 
 <nav class="sidebar" aria-label="Main">
-  <!-- macOS draws the window buttons in this bar, so the brand starts after them there. -->
-  <div class="titlebar" class:mac={!IS_WINDOWS} data-tauri-drag-region>
-    <span class="brand"><Logo size={20} accent="var(--signal)" /> {PRODUCT}</span>
-  </div>
+  <!-- macOS draws the window buttons in this bar, so there the brand sits on its own row below them. -->
+  {#if IS_WINDOWS}
+    <div class="titlebar" data-tauri-drag-region>
+      <span class="brand"><Logo size={20} accent="var(--signal)" /> {PRODUCT}</span>
+    </div>
+  {:else}
+    <div class="titlebar" data-tauri-drag-region></div>
+    <div class="brand-row" data-tauri-drag-region>
+      <span class="brand"><Logo size={20} accent="var(--signal)" /> {PRODUCT}</span>
+    </div>
+  {/if}
 
   <ul class="nav">
     {#each items as item (item.id)}
@@ -117,8 +124,11 @@
     flex-shrink: 0;
     padding: 0 20px;
   }
-  .titlebar.mac {
-    padding-left: 84px;
+  .brand-row {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    padding: 0 20px 14px;
   }
   .brand {
     display: inline-flex;
