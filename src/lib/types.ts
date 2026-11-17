@@ -23,6 +23,7 @@ export interface Settings {
   soundsEnabled: boolean;
   muteSystemAudio: boolean;
   copyOnly: boolean;
+  trailingSpace: boolean;
   launchAtLogin: boolean;
   widgetVisibility: WidgetVisibility;
   pillStyle: PillStyle;

@@ -254,7 +254,7 @@ fn process(app: &AppHandle, active: Active) -> anyhow::Result<()> {
 
     let paste_started = std::time::Instant::now();
     let mut output = cleaned.text.clone();
-    if !output.ends_with(char::is_whitespace) {
+    if settings.trailing_space && !output.ends_with(char::is_whitespace) {
         output.push(' ');
     }
     if settings.copy_only {

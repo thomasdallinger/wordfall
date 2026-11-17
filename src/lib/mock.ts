@@ -72,6 +72,7 @@ const settings: Settings = {
   soundsEnabled: true,
   muteSystemAudio: false,
   copyOnly: false,
+  trailingSpace: true,
   launchAtLogin: true,
   widgetVisibility: 'always',
   pillStyle: 'logo-and-text',

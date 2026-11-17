@@ -7,7 +7,7 @@
   import { app } from '../../lib/state.svelte';
   import type { Settings } from '../../lib/types';
 
-  type BoolKey = 'launchAtLogin' | 'removeFillers' | 'formatLists' | 'soundsEnabled' | 'muteSystemAudio';
+  type BoolKey = 'launchAtLogin' | 'removeFillers' | 'formatLists' | 'soundsEnabled' | 'muteSystemAudio' | 'trailingSpace';
 
   const s = $derived(app.settings);
   const switches: { key: BoolKey; label: string; help: string }[] = [
@@ -21,6 +21,11 @@
       key: 'formatLists',
       label: 'Make lists',
       help: 'Say “first, … second, …” or “bullet point …” (“erstens …”, “Stichpunkt …”) to get a numbered or bulleted list.',
+    },
+    {
+      key: 'trailingSpace',
+      label: 'Space after the text',
+      help: 'Ends pasted text with a space, so the next dictation doesn’t run into it.',
     },
     { key: 'soundsEnabled', label: 'Sounds', help: 'A soft tone when recording starts and when it stops.' },
     { key: 'muteSystemAudio', label: 'Mute other audio', help: 'Silences music and videos while you talk, then turns them back on.' },

@@ -44,6 +44,8 @@ pub struct Settings {
     pub sounds_enabled: bool,
     pub mute_system_audio: bool,
     pub copy_only: bool,
+    /// End pasted text with a space so the next dictation doesn't run into it.
+    pub trailing_space: bool,
     pub launch_at_login: bool,
     pub widget_visibility: WidgetVisibility,
     pub pill_style: String,
@@ -118,6 +120,7 @@ impl Default for Settings {
             sounds_enabled: true,
             mute_system_audio: false,
             copy_only: false,
+            trailing_space: true,
             launch_at_login: true,
             widget_visibility: WidgetVisibility::Always,
             pill_style: "logo-and-text".into(),
