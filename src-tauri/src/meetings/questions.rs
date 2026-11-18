@@ -44,6 +44,9 @@ const NAMES_MAX: usize = 30;
 /// in the last minutes, at most this many (older repeats are caught by `similar`).
 const EARLIER_MS: u64 = 20 * 60_000;
 const EARLIER_MAX: usize = 12;
+/// No questions before the meeting has gone on this long: until the topic is clear, they are off
+/// topic and only distract.
+const FIRST_AFTER_MS: u64 = 3 * 60_000;
 /// A question about the goal and the big picture is asked for once the meeting has gone on this
 /// long, and again when the last one is this old.
 const BIG_PICTURE_FROM_MS: u64 = 5 * 60_000;
@@ -693,6 +696,9 @@ fn respell(text: &str, input: &Input, shown: &[Term]) -> String {
 
 /// One run: asks the model about the recent transcript. `None` when there's nothing to read.
 pub fn run(worker: &mut llm::Worker, input: &Input) -> anyhow::Result<Option<Outcome>> {
+    if input.now_ms < FIRST_AFTER_MS {
+        return Ok(None);
+    }
     let (from, transcript) = talk_lines(input);
     if transcript.trim().is_empty() {
         return Ok(None);
