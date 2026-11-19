@@ -836,6 +836,13 @@ fn assist(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBool, tal
         if expired {
             emit_questions(app, &id);
         }
+        // Neither starts in the first minutes (see each `FIRST_AFTER_MS`); until one is due, the
+        // model isn't loaded. The talk so far still counts, so the first run comes right after.
+        let map_now = settings.live_map() && now_ms >= system_map::FIRST_AFTER_MS;
+        let ask_now = settings.live_questions() && now_ms >= questions::FIRST_AFTER_MS;
+        if !map_now && !ask_now {
+            continue;
+        }
         let due = (words.saturating_sub(words_then) >= QUESTION_WORDS || (notes_changed && words > 0) || shown)
             && last_run.is_none_or(|t| now_ms.saturating_sub(t) >= QUESTION_GAP_MS);
         if !due || c.sessions.dictation_busy() || stop.load(Ordering::SeqCst) {
@@ -857,13 +864,13 @@ fn assist(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, stop: &AtomicBool, tal
         words_then = words;
         last_run = Some(now_ms);
         let result = (|| -> anyhow::Result<()> {
-            if settings.live_map() {
+            if map_now {
                 live_map_step(app, w, meeting, &mut cursor)?;
                 if cursor.tidy_due(now_ms) {
                     live_tidy_step(app, w, meeting, &mut cursor)?;
                 }
             }
-            if settings.live_questions() {
+            if ask_now {
                 let snapshot = meeting.lock().clone();
                 let language = pipeline::meeting_language(&snapshot.segments);
                 let unknowns = snapshot.system_map.unknowns();
@@ -1689,19 +1696,22 @@ impl CliAssist {
         let words = word_count(&meeting.segments);
         let notes_changed = self.map && meeting.notes.trim() != self.cursor.notes.trim();
         let shown = self.map && self.cursor.shown_since(meeting);
-        let due = (words.saturating_sub(self.words_then) >= QUESTION_WORDS || (notes_changed && words > 0) || shown)
+        let map_now = self.map && now_ms >= system_map::FIRST_AFTER_MS;
+        let ask_now = self.ask && now_ms >= questions::FIRST_AFTER_MS;
+        let due = (map_now || ask_now)
+            && (words.saturating_sub(self.words_then) >= QUESTION_WORDS || (notes_changed && words > 0) || shown)
             && self.last_run.is_none_or(|t| now_ms.saturating_sub(t) >= QUESTION_GAP_MS);
         if due {
             self.words_then = words;
             self.last_run = Some(now_ms);
             let language = pipeline::meeting_language(&meeting.segments);
-            if self.map {
+            if map_now {
                 self.map_step(meeting, now_ms)?;
                 if self.cursor.tidy_due(now_ms) {
                     self.tidy_step(meeting, now_ms)?;
                 }
             }
-            if self.ask {
+            if ask_now {
                 let unknowns = meeting.system_map.unknowns();
                 let vocabulary = meeting_vocabulary(&self.words, &self.dictionary, &self.settings, meeting);
                 let input = questions::Input {
@@ -1856,13 +1866,15 @@ impl CliAssist {
     /// At the end: the map is tidied up and reads what was said since its last run, as in a live
     /// meeting; then the cost report, and the map's snapshots to `map_json`.
     fn done(&mut self, meeting: &mut Meeting, now_ms: u64, map_json: Option<&str>) -> anyhow::Result<()> {
-        if self.map {
+        // As live: a meeting that ended before the model's first run gets no map.
+        let map = self.map && self.last_run.is_some();
+        if map {
             self.tidy_step(meeting, now_ms)?;
         }
-        if self.map && (self.cursor.seen < meeting.segments.len() || self.cursor.shown_since(meeting)) {
+        if map && (self.cursor.seen < meeting.segments.len() || self.cursor.shown_since(meeting)) {
             self.map_step(meeting, now_ms)?;
         }
-        if self.map {
+        if map {
             self.closing_step(meeting, now_ms)?;
         }
         eprintln!("--- live model cost ---\n{}", self.report());

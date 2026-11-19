@@ -24,6 +24,8 @@
   let meeting = $state<Meeting | null>(null);
   let tab = $state<Tab>('notes');
   let now = $state(Date.now());
+  /** The live map starts this far into the meeting (`system_map::FIRST_AFTER_MS`). */
+  const MAP_FROM_MS = 2 * 60_000;
   let notesDraft = $state('');
   let notesDirty = false;
   let titleDraft = $state('');
@@ -458,6 +460,7 @@
               map={liveMap?.map ?? meeting.systemMap}
               status={liveMap?.status ?? 'listening'}
               alsoMentioned={liveMap?.alsoMentioned ?? []}
+              early={now - Date.parse(meeting.startedAt) < MAP_FROM_MS}
               editable
             />
           </section>

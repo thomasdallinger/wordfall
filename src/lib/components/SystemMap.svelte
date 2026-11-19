@@ -16,6 +16,7 @@
     status = 'off',
     editable = false,
     alsoMentioned = [],
+    early = false,
   }: {
     meetingId: string;
     map: SystemMap;
@@ -24,6 +25,8 @@
     editable?: boolean;
     /** Names said but not on the map, the latest first. */
     alsoMentioned?: string[];
+    /** The meeting is in its first two minutes, before the live map starts. */
+    early?: boolean;
   } = $props();
 
   const uid = $props.id();
@@ -184,6 +187,7 @@
       case 'off':
         return editable ? 'No map is built for this meeting.' : 'No systems or people came up.';
       default:
+        if (early) return 'The map starts after the first two minutes, once the topic is clear.';
         return 'Systems, people and how they connect appear here as they come up. Say in My notes what to focus on, for example “focus on the ERP export”.';
     }
   });

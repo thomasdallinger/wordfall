@@ -83,6 +83,9 @@ const MAX_SHOWN_CANDIDATES: usize = 6;
 /// Names said but not on the map that the live view lists under it, at most.
 const ALSO_MENTIONED: usize = 12;
 /// Meeting time between two tidy-up runs.
+/// The live map starts once the meeting has gone on this long: the first minutes are mostly
+/// greetings and small talk, and the first run then reads them together with what came after.
+pub const FIRST_AFTER_MS: u64 = 2 * 60_000;
 pub const TIDY_EVERY_MS: u64 = 10 * 60_000;
 /// A tidy-up is worth it from this many boxes on.
 const TIDY_FROM: usize = 4;

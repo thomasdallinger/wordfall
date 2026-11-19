@@ -18,6 +18,8 @@
 
   /** How long a question the talk answered stays, saying so, before it leaves. */
   const ANSWERED_FOR_MS = 4000;
+  /** Questions start this far into the meeting (`questions::FIRST_AFTER_MS`). */
+  const QUESTIONS_FROM_MS = 3 * 60_000;
 
   const KIND: Record<QuestionKind, string> = {
     understand: 'Understand',
@@ -50,6 +52,7 @@
       case 'off':
         return 'No questions are proposed for this meeting.';
       default:
+        if (meetingMs < QUESTIONS_FROM_MS) return 'Questions start after the first three minutes, once the topic is clear.';
         return 'Questions to ask appear here as the talk goes on.';
     }
   });

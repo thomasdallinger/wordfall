@@ -46,7 +46,7 @@ const EARLIER_MS: u64 = 20 * 60_000;
 const EARLIER_MAX: usize = 12;
 /// No questions before the meeting has gone on this long: until the topic is clear, they are off
 /// topic and only distract.
-const FIRST_AFTER_MS: u64 = 3 * 60_000;
+pub const FIRST_AFTER_MS: u64 = 3 * 60_000;
 /// A question about the goal and the big picture is asked for once the meeting has gone on this
 /// long, and again when the last one is this old.
 const BIG_PICTURE_FROM_MS: u64 = 5 * 60_000;
