@@ -1378,16 +1378,29 @@ fn transcribe_pass(
     new_segments.len()
 }
 
+/// Fewer words than this and no notes typed: no notes are written by themselves.
+const NOTES_MIN_WORDS: usize = 120;
+
 /// After recording: writes the notes if a summary model is there.
 fn finish(app: &AppHandle, meeting: &Arc<Mutex<Meeting>>, settings: &Settings) {
     let c = app.state::<Core>();
     let id = meeting.lock().id.clone();
     let has_speech = !meeting.lock().segments.is_empty();
+    // A sound check or a call cut short: notes would say more than was said. Unless the user typed
+    // notes to build them around; "Write notes" still writes them on request.
+    let too_short = {
+        let m = meeting.lock();
+        word_count(&m.segments) < NOTES_MIN_WORDS && m.notes.trim().is_empty()
+    };
     let model = llm::entry(&settings.summary_model).filter(|e| llm::locate(&c.model_dirs.read().own, e).is_some());
     if !has_speech {
         let mut m = meeting.lock();
         m.status = Status::Done;
         m.error = Some("Nothing was said, so there's nothing to summarise.".into());
+    } else if too_short {
+        let mut m = meeting.lock();
+        m.status = Status::Done;
+        m.error = Some("Too little was said for notes. The transcript has all of it.".into());
     } else if model.is_none() {
         let mut m = meeting.lock();
         m.status = Status::Done;
