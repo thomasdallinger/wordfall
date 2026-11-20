@@ -51,6 +51,7 @@ pub fn clean(raw: &str, opts: &Options) -> Cleaned {
     text = SUBTITLE_CREDIT.replace_all(&text, " ").to_string();
     text = text.replace('\n', " ");
     text = MULTISPACE.replace_all(text.trim(), " ").to_string();
+    text = collapse_repeats(&text);
 
     let lowered = text.to_lowercase();
     if opts.quiet_input && HALLUCINATIONS.contains(&lowered.as_str()) {
@@ -75,6 +76,44 @@ pub fn clean(raw: &str, opts: &Options) -> Cleaned {
     }
 
     Cleaned { text: text.trim().to_string(), dropped_as_hallucination: false }
+}
+
+/// Whisper sometimes gets stuck and writes a sentence again and again ("Okay. Okay. Okay. Okay."
+/// or a whole sentence twice in a row). A sentence of three words or more is kept once per run; a
+/// shorter one at most twice, since "Yes. Yes." or "Thank you. Thank you." is said for real.
+fn collapse_repeats(text: &str) -> String {
+    let mut sentences: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for (i, &(at, c)) in chars.iter().enumerate() {
+        let next_is_space = chars.get(i + 1).is_none_or(|&(_, n)| n.is_whitespace());
+        if matches!(c, '.' | '!' | '?' | '…') && next_is_space {
+            let end = at + c.len_utf8();
+            let sentence = text[start..end].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence);
+            }
+            start = end;
+        }
+    }
+    let rest = text[start..].trim();
+    if !rest.is_empty() {
+        sentences.push(rest);
+    }
+    let key = |s: &str| s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect::<Vec<_>>();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut run = 0;
+    let mut last: Vec<String> = Vec::new();
+    for s in sentences {
+        let k = key(s);
+        run = if !k.is_empty() && k == last { run + 1 } else { 1 };
+        let limit = if k.len() >= 3 { 1 } else { 2 };
+        if run <= limit {
+            kept.push(s);
+        }
+        last = k;
+    }
+    kept.join(" ")
 }
 
 /// Drops filler tokens; sentence-ending punctuation on a dropped filler moves to the previous word,
@@ -170,6 +209,20 @@ pub fn detect_suggestions(text: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapses_whisper_loops() {
+        assert_eq!(collapse_repeats("Okay. Okay. Okay. Okay. Let's start."), "Okay. Okay. Let's start.");
+        assert_eq!(
+            collapse_repeats("We ship it on Monday. We ship it on Monday. We ship it on Monday!"),
+            "We ship it on Monday."
+        );
+        // Said for real: kept.
+        assert_eq!(collapse_repeats("Yes. Yes. That works."), "Yes. Yes. That works.");
+        assert_eq!(collapse_repeats("No, no, no, that's wrong."), "No, no, no, that's wrong.");
+        assert_eq!(collapse_repeats("Version 3.5 is out. It is out"), "Version 3.5 is out. It is out");
+        assert_eq!(collapse_repeats("Wir sind bereit. Wir sind bereit, oder?"), "Wir sind bereit. Wir sind bereit, oder?");
+    }
 
     fn entry(o: &str, r: &str) -> DictEntry {
         DictEntry { id: "x".into(), original: o.into(), replacement: r.into(), created_at: String::new() }
